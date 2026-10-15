@@ -5,6 +5,22 @@ import json
 import os
 import random
 import time
+from flask import Flask
+from threading import Thread
+
+# Flask Web Server to keep Render active
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is live!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -40,7 +56,6 @@ async def on_ready():
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
-
 def build_event_embeds(event_name, event_info):
     start_ts = event_info["start_time"]
     end_ts = event_info["end_time"]
@@ -75,7 +90,6 @@ def build_event_embeds(event_name, event_info):
 
     for idx, chunk in enumerate(chunks, 1):
         embed = discord.Embed(color=color)
-        
         if idx == 1:
             embed.title = f"⚔️  ───  〔 {event_name.upper()} 〕  ───  ⚔️"
             embed.description = (
@@ -98,7 +112,6 @@ def build_event_embeds(event_name, event_info):
 
     return embeds
 
-
 async def active_event_autocomplete(
     interaction: discord.Interaction, 
     current: str
@@ -115,8 +128,6 @@ async def active_event_autocomplete(
             
     return choices[:25]
 
-
-# 1. ADMIN CONFIG COMMAND: Set official event role
 @bot.tree.command(name="set_event_role", description="Set the official event role for reservations (Admins only)")
 @app_commands.describe(role="The role given to participants when they reserve")
 @app_commands.checks.has_permissions(administrator=True)
@@ -126,8 +137,6 @@ async def set_event_role(interaction: discord.Interaction, role: discord.Role):
     save_data(db)
     await interaction.response.send_message(f"✅ Official event role set to {role.mention}!", ephemeral=True)
 
-
-# 2. CREATE EVENT (No role option visible to hosts)
 @bot.tree.command(name="event", description="Create a new event reservation banner")
 @app_commands.describe(
     event_name="Event Name (e.g. Modern Eurasia)",
@@ -170,8 +179,6 @@ async def create_event(
     save_data(db)
     await interaction.response.send_message(f"🎉 Created event **{event_name}** in {target_channel.mention}!", ephemeral=True)
 
-
-# 3. RESERVE (Gives configured event role)
 @bot.tree.command(name="reserve", description="Claim your spot for an event!")
 @app_commands.describe(
     event_name="Event Name",
@@ -211,7 +218,6 @@ async def reserve(
         "discord_id": interaction.user.id
     }
 
-    # Automatically give pre-configured event role if set
     guild_id = str(interaction.guild_id)
     role_id = db["server_config"].get(guild_id)
     if role_id:
@@ -234,8 +240,6 @@ async def reserve(
     save_data(db)
     await interaction.response.send_message(f"🚀 Reserved **{country.title()}** for **{robloxuser}**!", ephemeral=True)
 
-
-# 4. UNRESERVE
 @bot.tree.command(name="unreserve", description="Cancel your reservation for an event")
 @app_commands.describe(event_name="Event Name")
 @app_commands.autocomplete(event_name=active_event_autocomplete)
@@ -282,8 +286,6 @@ async def unreserve(interaction: discord.Interaction, event_name: str):
     save_data(db)
     await interaction.response.send_message(f"🗑️ Removed your reservation for **{target_country}**.", ephemeral=True)
 
-
-# 5. KICK RESERVATION
 @bot.tree.command(name="kick_reservation", description="Force-remove a reservation (Hosts/Admins only)")
 @app_commands.describe(event_name="Event Name", country="Country/Nation to clear")
 @app_commands.autocomplete(event_name=active_event_autocomplete)
@@ -326,8 +328,6 @@ async def kick_reservation(interaction: discord.Interaction, event_name: str, co
     save_data(db)
     await interaction.response.send_message(f"⚡ Cleared reservation for **{c_title}**!", ephemeral=True)
 
-
-# 6. SAFE CLEAR ROLES: Only strips the configured event role!
 @bot.tree.command(name="clearroles", description="Safely strip the configured event role from everyone")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def clear_roles(interaction: discord.Interaction):
@@ -355,4 +355,6 @@ async def clear_roles(interaction: discord.Interaction):
 
     await interaction.followup.send(f"🧹 Successfully removed {role.mention} from **{count}** members!", ephemeral=True)
 
+# Start web server then launch bot
+keep_alive()
 bot.run("MTU2MDE5MDY3MTU2MDc3MzYzMg.GtuBUN.aZFq5hFAMdIGw3_NaJ2eQQCBkyEE0qGk1xtEDs")
