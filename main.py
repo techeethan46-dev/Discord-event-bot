@@ -16,11 +16,12 @@ def home():
     return "Bot is live!"
 
 def run():
-    port = int(os.environ.get("PORT", 8080))
+    # Dynamic port for Render (defaults to 10000)
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run, daemon=True)
     t.start()
 
 intents = discord.Intents.default()
