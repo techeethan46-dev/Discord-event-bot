@@ -16,7 +16,6 @@ def home():
     return "Bot is live!"
 
 def run():
-    # Render assigns a dynamic PORT environment variable (defaults to 8080 if not set)
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -57,6 +56,22 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(f"Error syncing commands: {e}")
+
+# Helper check for host/admin roles
+def is_host_or_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    guild_id = str(interaction.guild_id)
+    config = db["server_config"].get(guild_id, {})
+    host_role_id = config.get("host_role")
+    
+    if host_role_id:
+        user_role_ids = [role.id for role in interaction.user.roles]
+        if host_role_id in user_role_ids:
+            return True
+            
+    return False
 
 def build_event_embeds(event_name, event_info):
     start_ts = event_info["start_time"]
@@ -130,16 +145,29 @@ async def active_event_autocomplete(
             
     return choices[:25]
 
-@bot.tree.command(name="set_event_role", description="Set the official event role for reservations (Admins only)")
-@app_commands.describe(role="The role given to participants when they reserve")
+@bot.tree.command(name="set_event_role", description="Set the role given to event participants (Admins only)")
+@app_commands.describe(role="The role given when someone reserves")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_event_role(interaction: discord.Interaction, role: discord.Role):
     guild_id = str(interaction.guild_id)
-    db["server_config"][guild_id] = role.id
+    if guild_id not in db["server_config"]:
+        db["server_config"][guild_id] = {}
+    db["server_config"][guild_id]["event_role"] = role.id
     save_data(db)
-    await interaction.response.send_message(f"✅ Official event role set to {role.mention}!", ephemeral=True)
+    await interaction.response.send_message(f"✅ Official event participant role set to {role.mention}!", ephemeral=True)
 
-@bot.tree.command(name="event", description="Create a new event reservation banner")
+@bot.tree.command(name="set_host_role", description="Set the role allowed to host/manage events (Admins only)")
+@app_commands.describe(role="The role allowed to create and manage events")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_host_role(interaction: discord.Interaction, role: discord.Role):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in db["server_config"]:
+        db["server_config"][guild_id] = {}
+    db["server_config"][guild_id]["host_role"] = role.id
+    save_data(db)
+    await interaction.response.send_message(f"✅ Official host role set to {role.mention}!", ephemeral=True)
+
+@bot.tree.command(name="event", description="Create a new event reservation banner (Hosts/Admins only)")
 @app_commands.describe(
     event_name="Event Name (e.g. Modern Eurasia)",
     start_time="Start Unix timestamp",
@@ -153,6 +181,10 @@ async def create_event(
     end_time: str, 
     target_channel: discord.TextChannel
 ):
+    if not is_host_or_admin(interaction):
+        await interaction.response.send_message("❌ You do not have the required Host role to create events!", ephemeral=True)
+        return
+
     try:
         start_ts = int(start_time)
         end_ts = int(end_time)
@@ -221,7 +253,9 @@ async def reserve(
     }
 
     guild_id = str(interaction.guild_id)
-    role_id = db["server_config"].get(guild_id)
+    config = db["server_config"].get(guild_id, {})
+    role_id = config.get("event_role") if isinstance(config, dict) else config
+    
     if role_id:
         role = interaction.guild.get_role(role_id)
         if role:
@@ -268,7 +302,9 @@ async def unreserve(interaction: discord.Interaction, event_name: str):
     del event_info["reservations"][target_country]
 
     guild_id = str(interaction.guild_id)
-    role_id = db["server_config"].get(guild_id)
+    config = db["server_config"].get(guild_id, {})
+    role_id = config.get("event_role") if isinstance(config, dict) else config
+    
     if role_id:
         role = interaction.guild.get_role(role_id)
         if role:
@@ -292,6 +328,10 @@ async def unreserve(interaction: discord.Interaction, event_name: str):
 @app_commands.describe(event_name="Event Name", country="Country/Nation to clear")
 @app_commands.autocomplete(event_name=active_event_autocomplete)
 async def kick_reservation(interaction: discord.Interaction, event_name: str, country: str):
+    if not is_host_or_admin(interaction):
+        await interaction.response.send_message("❌ You do not have the required Host role to remove reservations!", ephemeral=True)
+        return
+
     event_key = event_name.lower().strip()
     
     if event_key not in db["events"]:
@@ -309,7 +349,9 @@ async def kick_reservation(interaction: discord.Interaction, event_name: str, co
     del event_info["reservations"][c_title]
 
     guild_id = str(interaction.guild_id)
-    role_id = db["server_config"].get(guild_id)
+    config = db["server_config"].get(guild_id, {})
+    role_id = config.get("event_role") if isinstance(config, dict) else config
+    
     if role_id:
         role = interaction.guild.get_role(role_id)
         member = interaction.guild.get_member(removed_user_id)
@@ -330,11 +372,15 @@ async def kick_reservation(interaction: discord.Interaction, event_name: str, co
     save_data(db)
     await interaction.response.send_message(f"⚡ Cleared reservation for **{c_title}**!", ephemeral=True)
 
-@bot.tree.command(name="clearroles", description="Safely strip the configured event role from everyone")
-@app_commands.checks.has_permissions(manage_roles=True)
+@bot.tree.command(name="clearroles", description="Safely strip the configured event role from everyone (Hosts/Admins only)")
 async def clear_roles(interaction: discord.Interaction):
+    if not is_host_or_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission to clear roles!", ephemeral=True)
+        return
+
     guild_id = str(interaction.guild_id)
-    role_id = db["server_config"].get(guild_id)
+    config = db["server_config"].get(guild_id, {})
+    role_id = config.get("event_role") if isinstance(config, dict) else config
 
     if not role_id:
         await interaction.response.send_message("❌ No event role has been configured yet! Run `/set_event_role` first.", ephemeral=True)
