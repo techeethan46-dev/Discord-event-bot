@@ -16,7 +16,9 @@ def home():
     return "Bot is live!"
 
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    # Render assigns a dynamic PORT environment variable (defaults to 8080 if not set)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
