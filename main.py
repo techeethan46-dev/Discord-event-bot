@@ -961,7 +961,7 @@ async def spawn_leaderboard(interaction: discord.Interaction):
     await update_live_leaderboard(interaction.guild)
     await interaction.response.send_message("✅ Live leaderboard spawned!", ephemeral=True)
 
-token = os.environ.get("BOT_TOKEN")
+token = os.environ.get("MTU2MDE5MDY3MTU2MDc3MzYzMg.G3U1RP.2IDjESesd10Th6sbVe_qVVAuuHJ1mqYf2EvL30")
 if token:
     keep_alive()
     bot.run(token)
