@@ -964,6 +964,6 @@ async def spawn_leaderboard(interaction: discord.Interaction):
 token = os.environ.get("BOT_TOKEN")
 if token:
     keep_alive()
-    bot.run("MTU2MDE5MDY3MTU2MDc3MzYzMg.GtuBUN.aZFq5hFAMdIGw3_NaJ2eQQCBkyEE0qGk1xtEDs")
+    bot.run(token)
 else:
     print("❌ Error: BOT_TOKEN environment variable is not set!")
