@@ -42,7 +42,7 @@ mongo_db = mongo_client["ctw_bot_db"] if mongo_client else None
 collection = mongo_db["bot_data"] if mongo_db is not None else None
 
 def sanitize_keys_for_mongo(d):
-    """Recursively replaces '.' in dictionary keys with a Unicode bullet for MongoDB compatibility."""
+    """Recursively replaces '.' in dictionary keys with '•' for MongoDB compatibility."""
     if isinstance(d, dict):
         new_d = {}
         for k, v in d.items():
@@ -118,12 +118,10 @@ swap_cooldowns = {}
 
 def get_server_config(guild_id) -> dict:
     gid = str(guild_id)
-    config = db["server_config"].get(gid, {})
-    if not isinstance(config, dict):
-        config = {}
-        db["server_config"][gid] = config
+    if gid not in db["server_config"] or not isinstance(db["server_config"][gid], dict):
+        db["server_config"][gid] = {}
         save_data(db)
-    return config
+    return db["server_config"][gid]
 
 def init_host(host_id):
     hid = str(host_id)
@@ -353,7 +351,7 @@ class RateModal(discord.ui.Modal, title="Rate This Event"):
         concluded_at = event_info.get("concluded_at", 0)
 
         if time.time() - concluded_at > 3600:
-            await interaction.response.send_message("❌ The 1-hour rating window for this event has expired!", ephemeral=True)
+            await interaction.response.send_message("❌ The 1-hour rating window for this event has expired! Contact a server host if you need help.", ephemeral=True)
             return
 
         if "voted_users" not in event_info: event_info["voted_users"] = []
@@ -365,7 +363,7 @@ class RateModal(discord.ui.Modal, title="Rate This Event"):
             val = float(self.rating.value)
             if val < 1.0 or val > 5.0: raise ValueError
         except ValueError:
-            await interaction.response.send_message("❌ Please enter a valid number between 1 and 5!", ephemeral=True)
+            await interaction.response.send_message("❌ Invalid rating! Please enter a number between 1.0 and 5.0.", ephemeral=True)
             return
 
         event_info["voted_users"].append(interaction.user.id)
@@ -387,27 +385,27 @@ class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
     async def on_submit(self, interaction: discord.Interaction):
         event_info = db["events"].get(self.event_key)
         if not event_info or event_info.get("concluded", False):
-            await interaction.response.send_message("❌ Event is closed!", ephemeral=True)
+            await interaction.response.send_message("❌ This event has concluded! Please contact a server host for details on upcoming events.", ephemeral=True)
             return
 
         now = time.time()
         if now < event_info["start_time"]:
-            await interaction.response.send_message(f"🔒 Reservations haven't opened yet! Opens <t:{event_info['start_time']}:R>.", ephemeral=True)
+            await interaction.response.send_message(f"🔒 Reservations haven't opened yet! They open <t:{event_info['start_time']}:R>. Please contact a server host if you have questions.", ephemeral=True)
             return
         if now >= event_info["end_time"]:
-            await interaction.response.send_message("🔒 Reservations are closed! The event is already in progress.", ephemeral=True)
+            await interaction.response.send_message("🔒 Reservations are closed! The event is already live in-game. Please contact a server host if you need assistance.", ephemeral=True)
             return
 
         for country_name, u_data in event_info["reservations"].items():
             if u_data["discord_id"] == interaction.user.id:
-                await interaction.response.send_message(f"🚫 You already reserved **{country_name}**!", ephemeral=True)
+                await interaction.response.send_message(f"🚫 You already hold a reservation for **{country_name}**! Leave your current spot or use Swap Nation if you want a different country.", ephemeral=True)
                 return
 
         c_title = self.country.value.title().strip()
         r_user = self.roblox.value.strip()
 
         if interaction.user.id in db["blacklists"].get(str(interaction.guild_id), []):
-            await interaction.response.send_message("🚫 You are blacklisted!", ephemeral=True)
+            await interaction.response.send_message("🚫 You are blacklisted from claiming event spots! Please contact a server administrator to appeal.", ephemeral=True)
             return
 
         if "waitlist" not in event_info: event_info["waitlist"] = []
@@ -419,7 +417,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
         if is_taken or is_full:
             for w in event_info["waitlist"]:
                 if w["discord_id"] == interaction.user.id:
-                    await interaction.response.send_message("🚫 You are already on the waitlist!", ephemeral=True)
+                    await interaction.response.send_message("🚫 You are already on the waitlist for this event! Please wait for a spot to open.", ephemeral=True)
                     return
 
             event_info["waitlist"].append({"discord_id": interaction.user.id, "roblox": r_user, "country": c_title})
@@ -430,12 +428,12 @@ class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
                 await msg.edit(embeds=build_event_embeds(event_info["display_name"], event_info, interaction.guild))
             except Exception: pass
 
-            await interaction.response.send_message(f"⏳ **{c_title}** is currently taken or full! Added to waitlist.", ephemeral=True)
+            await interaction.response.send_message(f"⏳ **{c_title}** is currently taken or full! You were added to the waitlist. Contact a server host if you need help.", ephemeral=True)
             return
 
         matches = difflib.get_close_matches(c_title, list(event_info["reservations"].keys()), cutoff=0.88)
         if matches and matches[0].lower() != c_title.lower():
-            await interaction.response.send_message(f"🚫 Too similar to reserved nation **{matches[0]}**!", ephemeral=True)
+            await interaction.response.send_message(f"🚫 Nation name **{c_title}** is too similar to already reserved nation **{matches[0]}**! Please pick a distinct name or contact a server host.", ephemeral=True)
             return
 
         superpowers_list = [s.title() for s in event_info.get("superpowers", [])]
@@ -446,7 +444,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
             has_sp_role = sp_role_id in [r.id for r in interaction.user.roles] if sp_role_id else False
             is_admin = interaction.user.guild_permissions.administrator
             if not (is_booster or has_sp_role or is_admin):
-                await interaction.response.send_message(f"💎 **{c_title}** is a Superpower! Reserved for Server Boosters & VIPs.", ephemeral=True)
+                await interaction.response.send_message(f"💎 **{c_title}** is a Superpower! Reserved exclusively for Server Boosters & VIPs. Contact a server administrator or host if you believe this is an error.", ephemeral=True)
                 return
 
         event_info["reservations"][c_title] = {"roblox": r_user, "discord_id": interaction.user.id}
@@ -479,28 +477,30 @@ class SwapModal(discord.ui.Modal, title="Propose Nation Swap"):
         user_c = next((c for c, u in event_info["reservations"].items() if u["discord_id"] == interaction.user.id), None)
 
         if not user_c:
-            await interaction.response.send_message("❌ You don't have a nation to swap!", ephemeral=True)
+            await interaction.response.send_message("❌ You do not hold a nation reservation in this event to swap! Claim a spot first or contact a server host.", ephemeral=True)
             return
         if target_c not in event_info["reservations"]:
-            await interaction.response.send_message(f"❌ **{target_c}** isn't reserved by anyone!", ephemeral=True)
+            await interaction.response.send_message(f"❌ **{target_c}** is not reserved by anyone! Claim it directly instead or contact a server host.", ephemeral=True)
             return
         if target_c == user_c:
-            await interaction.response.send_message("❌ Cannot swap with yourself!", ephemeral=True)
+            await interaction.response.send_message("❌ Cannot swap a nation with yourself!", ephemeral=True)
             return
 
         target_user_id = event_info["reservations"][target_c]["discord_id"]
         swap_channel_id = get_server_config(interaction.guild_id).get("swap_channel")
         if not swap_channel_id:
-            await interaction.response.send_message("❌ Swap channel not set up by admins!", ephemeral=True)
+            await interaction.response.send_message("❌ Swap Requests channel has not been configured by admins yet! Please contact a server administrator to configure it using /setup.", ephemeral=True)
             return
             
         swap_channel = interaction.guild.get_channel(swap_channel_id)
-        if not swap_channel: return
+        if not swap_channel:
+            await interaction.response.send_message("❌ The configured Swap channel no longer exists! Please contact a server administrator.", ephemeral=True)
+            return
 
         swap_cooldowns[interaction.user.id] = time.time()
         embed = discord.Embed(title="🔄 Nation Swap Proposal", description=f"<@{interaction.user.id}> wants to swap with <@{target_user_id}>!\n\n• Gives: {get_flag(user_c)} **{user_c}**\n• Gets: {get_flag(target_c)} **{target_c}**", color=0xF1C40F)
         await swap_channel.send(content=f"<@{target_user_id}>", embed=embed, view=SwapAcceptView(self.event_key, interaction.user.id, target_user_id, user_c, target_c))
-        await interaction.response.send_message(f"📨 Swap proposal sent!", ephemeral=True)
+        await interaction.response.send_message(f"📨 Swap proposal sent to <#{swap_channel_id}>!", ephemeral=True)
 
 class SwapAcceptView(discord.ui.View):
     def __init__(self, event_key, sender_id, target_id, sender_c, target_c):
@@ -509,12 +509,14 @@ class SwapAcceptView(discord.ui.View):
 
     @discord.ui.button(label="Accept Swap", style=discord.ButtonStyle.success, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.target_id: return
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("❌ Only the targeted user can accept this swap offer!", ephemeral=True)
+            return
         event_info = db["events"].get(self.event_key)
         res = event_info["reservations"]
 
         if self.sender_c not in res or self.target_c not in res or res[self.sender_c]["discord_id"] != self.sender_id:
-            await interaction.response.send_message("❌ Swap invalid! One of the nations was lost.", ephemeral=True)
+            await interaction.response.send_message("❌ Swap invalid! One of the nations is no longer held by the original owners. Contact a server host if you need help.", ephemeral=True)
             return
 
         res[self.sender_c], res[self.target_c] = res[self.target_c], res[self.sender_c]
@@ -534,7 +536,9 @@ class SwapAcceptView(discord.ui.View):
 
     @discord.ui.button(label="Decline Swap", style=discord.ButtonStyle.danger, emoji="❌")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.target_id: return
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("❌ Only the targeted user can decline this swap offer!", ephemeral=True)
+            return
         for child in self.children: child.disabled = True
         embed = interaction.message.embeds[0]
         embed.color = 0xE74C3C
@@ -589,7 +593,7 @@ class HostActionsView(discord.ui.View):
         role_id = get_server_config(interaction.guild_id).get("event_role")
         role = interaction.guild.get_role(role_id) if role_id else None
         if not role:
-            await interaction.followup.send("❌ No role configured!", ephemeral=True)
+            await interaction.followup.send("❌ Event participant role has not been configured in /setup! Please contact a server administrator.", ephemeral=True)
             return
         
         count = 0
@@ -606,7 +610,7 @@ class HostActionsView(discord.ui.View):
         
         event_info = db["events"].get(self.event_key)
         if event_info.get("concluded"):
-            await interaction.followup.send("❌ Already concluded!", ephemeral=True)
+            await interaction.followup.send("❌ This event has already been concluded!", ephemeral=True)
             return
 
         now = int(time.time())
@@ -678,7 +682,7 @@ class EventButtonsView(discord.ui.View):
         last_time = swap_cooldowns.get(interaction.user.id, 0)
         remaining = 120 - (time.time() - last_time)
         if remaining > 0:
-            await interaction.response.send_message(f"⏳ Please wait **{int(remaining)}s**!", ephemeral=True)
+            await interaction.response.send_message(f"⏳ Swap cooldown active! Please wait **{int(remaining)}s** before sending another request.", ephemeral=True)
             return
         await interaction.response.send_modal(SwapModal(event_key))
 
@@ -721,14 +725,14 @@ class EventButtonsView(discord.ui.View):
             await interaction.followup.send("🗑️ Removed from the waitlist.", ephemeral=True)
             return
 
-        await interaction.followup.send("❌ You don't have a reservation or waitlist spot for this event!", ephemeral=True)
+        await interaction.followup.send("❌ You do not have an active reservation or waitlist spot in this event! Contact a server host if you need help.", ephemeral=True)
 
     @discord.ui.button(label="Host Actions", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="evt_btn_host_actions")
     async def host_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
         event_key, _ = get_event_by_message_id(interaction.message.id)
         if not event_key: return
         if not is_host_or_admin(interaction):
-            await interaction.response.send_message("❌ Host permissions required!", ephemeral=True)
+            await interaction.response.send_message("❌ Host permissions required to manage this event! Please contact a server host if you need assistance.", ephemeral=True)
             return
         await interaction.response.send_message("⚙️ **Host Control Panel**", view=HostActionsView(event_key), ephemeral=True)
 
@@ -808,6 +812,11 @@ async def setup_command(interaction: discord.Interaction):
     embed2 = discord.Embed(title="⚙️ Host Assistant Setup (2/2: Channels)", description=f"Logs: <#{config.get('log_channel')}>\nSwaps: <#{config.get('swap_channel')}>\nStats: <#{config.get('stats_channel')}>", color=0x3498DB)
     await interaction.followup.send(embed=embed2, view=SetupChannelPanel(), ephemeral=True)
 
+@setup_command.error
+async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permissions required to run /setup! Please contact a server administrator.", ephemeral=True)
+
 # ---------------------------------------------------------
 # BOT SLASH COMMANDS, TASKS & BOOTSTRAP
 # ---------------------------------------------------------
@@ -843,11 +852,21 @@ async def prefix_sync(ctx):
     synced = await bot.tree.sync()
     await ctx.send(f"✅ Synced {len(synced)} slash command(s)!")
 
+@prefix_sync.error
+async def prefix_sync_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Administrator permissions to sync commands. Please contact a server administrator.")
+
 @bot.tree.command(name="sync", description="Sync slash commands (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def sync_commands(interaction: discord.Interaction):
     synced = await bot.tree.sync()
     await interaction.response.send_message(f"✅ Synced {len(synced)} command(s)!", ephemeral=True)
+
+@sync_commands.error
+async def sync_commands_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permissions required to sync commands! Please contact a server administrator.", ephemeral=True)
 
 async def active_event_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     choices = []
@@ -868,7 +887,7 @@ async def create_event(interaction: discord.Interaction, event_name: str, starts
     await interaction.response.defer(ephemeral=True)
 
     if not is_host_or_admin(interaction):
-        await interaction.followup.send("❌ You do not have Host permissions!", ephemeral=True)
+        await interaction.followup.send("❌ Host permissions required to create events! Please contact a server host or administrator.", ephemeral=True)
         return
 
     start_offset = parse_duration(starts_in)
@@ -900,11 +919,11 @@ async def create_event(interaction: discord.Interaction, event_name: str, starts
 @app_commands.autocomplete(event_name=active_event_autocomplete)
 async def set_superpowers(interaction: discord.Interaction, event_name: str, nations: str):
     if not is_host_or_admin(interaction): 
-        await interaction.response.send_message("❌ Host permissions required!", ephemeral=True)
+        await interaction.response.send_message("❌ Host permissions required to set superpowers! Please contact a server host.", ephemeral=True)
         return
     event_key = event_name.lower().strip()
     if event_key not in db["events"]: 
-        await interaction.response.send_message("❌ Event not found!", ephemeral=True)
+        await interaction.response.send_message("❌ Could not find an active event with that name! Please contact a server host.", ephemeral=True)
         return
     sp_list = [n.strip().title() for n in nations.split(",") if n.strip()]
     db["events"][event_key]["superpowers"] = sp_list
@@ -919,11 +938,11 @@ async def set_superpowers(interaction: discord.Interaction, event_name: str, nat
 @app_commands.autocomplete(event_name=active_event_autocomplete)
 async def add_cohost(interaction: discord.Interaction, event_name: str, cohost: discord.Member):
     if not is_host_or_admin(interaction): 
-        await interaction.response.send_message("❌ Host permissions required!", ephemeral=True)
+        await interaction.response.send_message("❌ Host permissions required to add co-hosts! Please contact a server host.", ephemeral=True)
         return
     event_key = event_name.lower().strip()
     if event_key not in db["events"]: 
-        await interaction.response.send_message("❌ Event not found!", ephemeral=True)
+        await interaction.response.send_message("❌ Could not find an active event with that name! Please contact a server host.", ephemeral=True)
         return
     db["events"][event_key]["cohost_id"] = cohost.id
     try:
@@ -947,6 +966,11 @@ async def blacklist_command(interaction: discord.Interaction, user: discord.Memb
     save_data(db)
     await interaction.response.send_message(msg, ephemeral=True)
 
+@blacklist_command.error
+async def blacklist_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permissions required to blacklist users! Please contact a server administrator.", ephemeral=True)
+
 @bot.tree.command(name="spawn_leaderboard", description="Spawns the live-updating host leaderboard message")
 @app_commands.checks.has_permissions(administrator=True)
 async def spawn_leaderboard(interaction: discord.Interaction):
@@ -960,6 +984,11 @@ async def spawn_leaderboard(interaction: discord.Interaction):
     
     await update_live_leaderboard(interaction.guild)
     await interaction.response.send_message("✅ Live leaderboard spawned!", ephemeral=True)
+
+@spawn_leaderboard.error
+async def spawn_leaderboard_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permissions required to spawn leaderboards! Please contact a server administrator.", ephemeral=True)
 
 token = os.environ.get("BOT_TOKEN")
 if token:
