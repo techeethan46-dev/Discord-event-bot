@@ -273,7 +273,7 @@ def build_event_embeds(event_name, event_info, guild=None):
         desc_content = desc_content[:3850] + "\n\n*... list truncated due to length limit.*"
 
     embed.description = desc_content
-    embed.set_footer(text=f"Total Joined: {len(reservations)}{f' / {max_players}' if max_players > 0 else ''} Players • OBBY IS GOAT")
+    embed.set_footer(text=f"Total Joined: {len(reservations)}{f' / {max_players}' if max_players > 0 else ''} Players  •  OBBY IS GOAT")
     return [embed]
 
 async def process_waitlist_for_opened_spot(event_info, opened_country, guild, channel):
