@@ -1,3 +1,5 @@
+# Connected Discord-GitHub | Discord: AbyssalNoob1 | Roblox: AbyssalNoob1 
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -10,21 +12,28 @@ import asyncio
 from flask import Flask
 from threading import Thread
 
-# Flask Web Server to keep Render active 24/7
+# ---------------------------------------------------------
+# FLASK HTTP SERVER (Render Web Service Keeping-Alive)
+# ---------------------------------------------------------
+# Web framework instance serving HTTP pings to prevent free-tier container sleep
 app = Flask('')
 
 @app.route('/')
 def home(): 
+    """Endpoint pinged by monitoring services (e.g., UptimeRobot) to verify service health."""
     return "Main Bot is Live!"
 
 def run():
+    """Starts the WSGI server on the environment-allocated port."""
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
+    """Forks the Flask HTTP server into a daemon thread alongside the main asyncio loop."""
     t = Thread(target=run, daemon=True)
     t.start()
 
+# Initialize Discord client with required privileged gateway intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -33,16 +42,15 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DATA_FILE = "events_data.json"
 
 # ---------------------------------------------------------
-# MONGODB & DATA PERSISTENCE
+# DATABASE PERSISTENCE & KEY SANITIZATION (MongoDB Atlas)
 # ---------------------------------------------------------
-
 MONGO_URI = os.environ.get("MONGO_URI")
 mongo_client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
 mongo_db = mongo_client["ctw_bot_db"] if mongo_client else None
 collection = mongo_db["bot_data"] if mongo_db is not None else None
 
 def sanitize_keys_for_mongo(d):
-    """Recursively replaces '.' in dictionary keys with '•' for MongoDB compatibility."""
+    """Recursively converts period characters '.' in dictionary keys to '•' to conform to MongoDB BSON key naming constraints."""
     if isinstance(d, dict):
         new_d = {}
         for k, v in d.items():
@@ -54,7 +62,7 @@ def sanitize_keys_for_mongo(d):
     return d
 
 def desanitize_keys_from_mongo(d):
-    """Recursively restores '.' in dictionary keys when loaded from MongoDB."""
+    """Recursively restores original '.' characters in dictionary keys when fetching stored documents from BSON collections."""
     if isinstance(d, dict):
         new_d = {}
         for k, v in d.items():
@@ -66,13 +74,14 @@ def desanitize_keys_from_mongo(d):
     return d
 
 def load_data():
+    """Retrieves document state from MongoDB Atlas, falling back to local JSON if cloud database connection is offline."""
     if collection is not None:
         try:
             doc = collection.find_one({"_id": "main_data"})
             if doc and "content" in doc:
                 return desanitize_keys_from_mongo(doc["content"])
         except Exception as e:
-            print(f"Error loading from MongoDB: {e}")
+            print(f"MongoDB Load Warning: {e}")
     
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -80,6 +89,7 @@ def load_data():
     return {"server_config": {}, "events": {}, "blacklists": {}, "hosts": {}}
 
 def _save_data_sync(data):
+    """Performs synchronous atomic replace operations on MongoDB documents or writes to disk atomically via temporary file swapping."""
     if collection is not None:
         try:
             sanitized = sanitize_keys_for_mongo(data)
@@ -90,7 +100,7 @@ def _save_data_sync(data):
             )
             return
         except Exception as e:
-            print(f"Error saving to MongoDB: {e}")
+            print(f"MongoDB Save Warning: {e}")
     
     temp_file = f"{DATA_FILE}.tmp"
     with open(temp_file, "w") as f:
@@ -98,12 +108,14 @@ def _save_data_sync(data):
     os.replace(temp_file, DATA_FILE)
 
 def save_data(data):
+    """Dispatches I/O sync tasks off the main asyncio event loop to avoid blocking gateway heartbeats."""
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(asyncio.to_thread(_save_data_sync, data))
     except RuntimeError:
         _save_data_sync(data)
 
+# Load global runtime state dictionary
 db = load_data()
 if "server_config" not in db: db["server_config"] = {}
 if "events" not in db: db["events"] = {}
@@ -113,10 +125,11 @@ if "hosts" not in db: db["hosts"] = {}
 swap_cooldowns = {}
 
 # ---------------------------------------------------------
-# HELPER FUNCTIONS
+# CORE UTILITY & STATE MANAGEMENT HELPERS
 # ---------------------------------------------------------
 
 def get_server_config(guild_id) -> dict:
+    """Fetches guild-specific setting references from global memory, ensuring dict structure persistence in database."""
     gid = str(guild_id)
     if gid not in db["server_config"] or not isinstance(db["server_config"][gid], dict):
         db["server_config"][gid] = {}
@@ -124,12 +137,14 @@ def get_server_config(guild_id) -> dict:
     return db["server_config"][gid]
 
 def init_host(host_id):
+    """Ensures host analytics entry exists for tracking hosted events, player totals, and rating statistics."""
     hid = str(host_id)
     if hid not in db["hosts"]:
         db["hosts"][hid] = {"total_events": 0, "total_players": 0, "ratings": []}
     return hid
 
 def parse_duration(time_str: str) -> int:
+    """Parses user time strings (e.g., '1h30m') into total relative integer seconds."""
     time_str = time_str.lower().replace(" ", "")
     total_seconds = 0
     current_num = ""
@@ -153,15 +168,18 @@ FLAG_MAP = {
 }
 
 def get_flag(country_name):
+    """Maps country name keys to corresponding Unicode flag regional indicator emojis."""
     return FLAG_MAP.get(country_name.lower().strip(), "🏴")
 
 def get_event_by_message_id(msg_id):
+    """Queries global event registry matching Discord channel message IDs."""
     for event_key, event_info in db["events"].items():
         if msg_id in event_info.get("message_ids", []):
             return event_key, event_info
     return None, None
 
 def is_host_or_admin(interaction: discord.Interaction) -> bool:
+    """Validates user authorization using Discord guild permissions and configured Host roles."""
     if interaction.user.guild_permissions.administrator: return True
     config = get_server_config(interaction.guild_id)
     host_role_id = config.get("host_role")
@@ -169,6 +187,7 @@ def is_host_or_admin(interaction: discord.Interaction) -> bool:
     return False
 
 async def send_audit_log(guild, title, description, color=0x3498DB):
+    """Posts formatted embed events into configured admin logging channels."""
     config = get_server_config(guild.id)
     log_channel_id = config.get("log_channel")
     if log_channel_id:
@@ -180,6 +199,7 @@ async def send_audit_log(guild, title, description, color=0x3498DB):
             except Exception: pass
 
 async def update_live_leaderboard(guild: discord.Guild):
+    """Calculates top hosting statistics and dynamically edits the dedicated leaderboard embed."""
     config = get_server_config(guild.id)
     lb_msg_id = config.get("leaderboard_msg_id")
     lb_ch_id = config.get("leaderboard_ch_id")
@@ -208,6 +228,7 @@ async def update_live_leaderboard(guild: discord.Guild):
     await msg.edit(embed=embed)
 
 def build_event_embeds(event_name, event_info, guild=None):
+    """Constructs dynamic Discord Embed components displaying schedules, reserved nations, and booster badges."""
     start_res_ts = event_info["start_time"]
     end_res_ts = event_info["end_time"]
     host_id = event_info["host_id"]
@@ -250,15 +271,15 @@ def build_event_embeds(event_name, event_info, guild=None):
     if is_concluded:
         status_header = "🔒 **[CONCLUDED]**"
         time_status = f"• **Reservations Ended:** <t:{end_res_ts}:f>"
-        embed_color = 0xE74C3C # Red
+        embed_color = 0xE74C3C
     elif is_live:
         status_header = "⚔️ **[EVENT LIVE]**"
         time_status = f"• **Reservations Closed:** <t:{end_res_ts}:f>\n• **Event Elapsed:** <t:{end_res_ts}:R>"
-        embed_color = 0xF1C40F # Gold
+        embed_color = 0xF1C40F
     else:
         status_header = "🚩 **[RESERVATIONS OPEN]**"
         time_status = f"• **Reservations Start:** <t:{start_res_ts}:f>\n• **Reservations End:** <t:{end_res_ts}:f> (<t:{end_res_ts}:R>)"
-        embed_color = 0x2ECC71 # Green
+        embed_color = 0x2ECC71
 
     embed = discord.Embed(color=embed_color)
     embed.title = f"{status_header} {event_name}"
@@ -273,10 +294,11 @@ def build_event_embeds(event_name, event_info, guild=None):
         desc_content = desc_content[:3850] + "\n\n*... list truncated due to length limit.*"
 
     embed.description = desc_content
-    embed.set_footer(text=f"Total Joined: {len(reservations)}{f' / {max_players}' if max_players > 0 else ''} Players  •  OBBY IS GOAT")
+    embed.set_footer(text=f"Total Joined: {len(reservations)}{f' / {max_players}' if max_players > 0 else ''} Players")
     return [embed]
 
 async def process_waitlist_for_opened_spot(event_info, opened_country, guild, channel):
+    """Evaluates queue eligibility and automatically promotes waitlist applicants when reservations open up."""
     waitlist = event_info.get("waitlist", [])
     if not waitlist: return
 
@@ -293,11 +315,8 @@ async def process_waitlist_for_opened_spot(event_info, opened_country, guild, ch
         u_id = item["discord_id"]
         c_title = item["country"].title()
 
-        if u_id in blacklist:
-            waitlist.remove(item)
-            continue
-
-        if c_title in res:
+        if u_id in blacklist or c_title in res:
+            if u_id in blacklist: waitlist.remove(item)
             continue
 
         if c_title in sp_list:
@@ -305,15 +324,13 @@ async def process_waitlist_for_opened_spot(event_info, opened_country, guild, ch
             is_booster = member.premium_since is not None if member else False
             has_sp_role = sp_role_id in [r.id for r in member.roles] if (member and sp_role_id) else False
             is_admin = member.guild_permissions.administrator if member else False
-            if not (is_booster or has_sp_role or is_admin):
-                continue
+            if not (is_booster or has_sp_role or is_admin): continue
 
         candidates.append(item)
 
     if not candidates: return
 
     promoted_user = next((i for i in candidates if i["country"].title() == opened_country.title()), candidates[0])
-
     waitlist.remove(promoted_user)
     c_title = promoted_user["country"].title()
     u_id = promoted_user["discord_id"]
@@ -330,15 +347,15 @@ async def process_waitlist_for_opened_spot(event_info, opened_country, guild, ch
             except Exception: pass
 
     if channel:
-        try:
-            await channel.send(f"🔔 <@{u_id}> **{c_title}** opened up and you automatically claimed it from the waitlist!")
+        try: await channel.send(f"🔔 <@{u_id}> **{c_title}** opened up and you automatically claimed it from the waitlist!")
         except Exception: pass
 
 # ---------------------------------------------------------
-# EVENT MODALS & VIEWS
+# INTERACTIVE MODALS & VIEW HANDLERS
 # ---------------------------------------------------------
 
 class RateModal(discord.ui.Modal, title="Rate This Event"):
+    """Modal UI collecting numerical feedback ratings for host score calculations."""
     rating = discord.ui.TextInput(label="Rating (1 to 5)", placeholder="e.g. 4.5, 5, 3.2", max_length=4)
 
     def __init__(self, host_id, event_key):
@@ -375,6 +392,7 @@ class RateModal(discord.ui.Modal, title="Rate This Event"):
         await interaction.response.send_message(f"⭐ Thank you! You rated the event **{val}/5**.", ephemeral=True)
 
 class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
+    """Modal input form collecting Roblox user details and desired nation selections."""
     country = discord.ui.TextInput(label="Nation", required=True)
     roblox = discord.ui.TextInput(label="Roblox Username", required=True)
 
@@ -465,6 +483,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Reservation"):
         await interaction.response.send_message(f"🚀 Reserved **{c_title}**!", ephemeral=True)
 
 class SwapModal(discord.ui.Modal, title="Propose Nation Swap"):
+    """Modal UI collecting target nation names for p2p reservation swaps."""
     target_nation = discord.ui.TextInput(label="Nation You Want", required=True)
 
     def __init__(self, event_key):
@@ -503,6 +522,7 @@ class SwapModal(discord.ui.Modal, title="Propose Nation Swap"):
         await interaction.response.send_message(f"📨 Swap proposal sent to <#{swap_channel_id}>!", ephemeral=True)
 
 class SwapAcceptView(discord.ui.View):
+    """Action component providing Accept/Decline options for pending nation swaps."""
     def __init__(self, event_key, sender_id, target_id, sender_c, target_c):
         super().__init__(timeout=300)
         self.event_key, self.sender_id, self.target_id, self.sender_c, self.target_c = event_key, sender_id, target_id, sender_c, target_c
@@ -546,10 +566,11 @@ class SwapAcceptView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 # ---------------------------------------------------------
-# HOST PANEL & VIEWS
+# HOST MANAGEMENT CONTROL PANELS
 # ---------------------------------------------------------
 
 class KickSelect(discord.ui.Select):
+    """Dynamic select menu allowing event hosts to select and remove registered players."""
     def __init__(self, event_key, reservations):
         self.event_key = event_key
         opts = [discord.SelectOption(label=f"{get_flag(c)} {c}", value=c) for c in list(reservations.keys())[:25]]
@@ -580,6 +601,7 @@ class KickSelect(discord.ui.Select):
         await interaction.response.send_message(f"⚡ Kicked **{c_title}**!", ephemeral=True)
 
 class HostActionsView(discord.ui.View):
+    """Control panel view providing administrative tools to clear roles and conclude events."""
     def __init__(self, event_key):
         super().__init__(timeout=300)
         self.event_key = event_key
@@ -666,6 +688,7 @@ class HostActionsView(discord.ui.View):
         await interaction.followup.send("🏁 Event successfully concluded, roles cleared, and stats posted!", ephemeral=True)
 
 class EventButtonsView(discord.ui.View):
+    """Persistent component view attached to active event banner messages."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -737,7 +760,7 @@ class EventButtonsView(discord.ui.View):
         await interaction.response.send_message("⚙️ **Host Control Panel**", view=HostActionsView(event_key), ephemeral=True)
 
 # ---------------------------------------------------------
-# UNIFIED SETUP COMMAND 
+# UNIFIED ADMIN SETUP PANEL COMPONENTS
 # ---------------------------------------------------------
 
 class HostRoleSelect(discord.ui.RoleSelect):
@@ -818,11 +841,12 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
         await interaction.response.send_message("❌ Administrator permissions required to run /setup! Please contact a server administrator.", ephemeral=True)
 
 # ---------------------------------------------------------
-# BOT SLASH COMMANDS, TASKS & BOOTSTRAP
+# BOT COMMAND TREE, ASYNC TASKS & CLIENT BOOTSTRAP
 # ---------------------------------------------------------
 
 @tasks.loop(seconds=30)
 async def auto_refresh_banners():
+    """Background task continuously refreshing remaining timer displays on active event embeds."""
     for event_key, event_info in list(db["events"].items()):
         if event_info.get("concluded"): continue
         channel_id = event_info.get("channel_id")
@@ -837,6 +861,7 @@ async def auto_refresh_banners():
         except Exception: pass
 
 async def setup_hook():
+    """Initializes persistent views and background task loops before gateway connection."""
     bot.add_view(EventButtonsView())
     auto_refresh_banners.start()
 
