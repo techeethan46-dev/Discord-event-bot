@@ -5,11 +5,14 @@ import os
 import json
 import time
 import difflib
+import asyncio
 from discord import app_commands
 from discord.ext import commands, tasks
 import pymongo
 from flask import Flask
 from threading import Thread
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
@@ -28,6 +31,29 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ==========================================
+# GEMINI AI & SERVER CHECKS CONFIGURATION
+# ==========================================
+genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+ai_history = {}
+
+BOT_PERSONA = """
+You are a Discord user in a server talking to people.
+STRICT RULES:
+1. NEVER exceed 4 lines of text in a single reply.
+2. Speak strictly like someone from the hood using natural slang (e.g., "bro", "ain't no way", "tf", "nah", "fr", "trippin", "buggin", "bruh").
+3. NEVER sound like an AI assistant. Zero robotic politeness, zero essay responses.
+4. DO NOT just agree with what people say. Disagree, call them out, or push back if they say something weird or dumb.
+5. NEVER give unsolicited advice or preach.
+6. Drop reaction GIF URLs (Tenor/Giphy links) in your replies when reacting to things.
+"""
+
+# Servers that bypass the 200-member requirement (put VIP/Friend server IDs here)
+EXEMPT_GUILD_IDS = [123456789012345678]
+
+# Servers completely blocked from using the bot
+BLACKLISTED_GUILD_IDS = [111122223333444455]
+
 DATA_FILE = "events_data.json"
 
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -35,7 +61,6 @@ client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
 mongo_db = client["ctw_bot_db"] if client else None
 db_col = mongo_db["bot_data"] if mongo_db else None
 
-# loads db state. using json loads/dumps to bypass mongo's annoying dot key errors
 def load_db():
     if db_col is not None:
         try:
@@ -43,19 +68,17 @@ def load_db():
             if doc: 
                 return json.loads(doc["json_data"])
         except:
-            pass # fallback to local file if mongo is down
-            
+            pass
+
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-            
-    # print("creating new db")
+
     return {"server_config": {}, "events": {}, "blacklists": {}, "hosts": {}}
 
 def save_db(data):
     if db_col is not None:
         try:
-            # dumping to string is lazy but it fixes the key format crash
             db_col.replace_one(
                 {"_id": "main"}, 
                 {"_id": "main", "json_data": json.dumps(data)}, 
@@ -63,7 +86,7 @@ def save_db(data):
             )
         except Exception as e:
             print("db save error:", e)
-            
+
     with open(DATA_FILE, "w") as f:
         json.dump(data, f)
 
@@ -144,10 +167,10 @@ async def update_leaderboard(guild):
     ch_id = conf.get("leaderboard_ch_id")
     if not msg_id or not ch_id: 
         return
-    
+
     ch = guild.get_channel(ch_id)
     if not ch: return
-    
+
     try: 
         msg = await ch.fetch_message(msg_id)
     except: 
@@ -159,13 +182,13 @@ async def update_leaderboard(guild):
         scores.append((hid, data["total_events"], data["total_players"], round(avg, 1)))
 
     emb = discord.Embed(title="🏆 Host Leaderboards", description=f"Updated: <t:{int(time.time())}:R>", color=0xF1C40F)
-    
+
     t_ev = sorted(scores, key=lambda x: x[1], reverse=True)[:3]
     emb.add_field(name="🔥 Most Events", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[1]} Events" for i, h in enumerate(t_ev) if h[1] > 0]) or "None", inline=False)
-    
+
     t_pl = sorted(scores, key=lambda x: x[2], reverse=True)[:3]
     emb.add_field(name="👥 Most Players", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[2]} Players" for i, h in enumerate(t_pl) if h[2] > 0]) or "None", inline=False)
-    
+
     t_rt = sorted([h for h in scores if len(db["hosts"][h[0]]["ratings"]) >= 2], key=lambda x: x[3], reverse=True)[:3]
     emb.add_field(name="⭐ Top Rated", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[3]} ⭐" for i, h in enumerate(t_rt)]) or "Not enough data", inline=False)
 
@@ -180,7 +203,7 @@ def build_embed(name, info, guild=None):
     wait = info.get("waitlist", [])
     sps = info.get("superpowers", [])
     max_p = info.get("max_players", 0)
-    
+
     now = int(time.time())
     is_live = now >= end and not info.get("concluded")
 
@@ -194,7 +217,7 @@ def build_embed(name, info, guild=None):
             mem = guild.get_member(uid)
             if mem and (mem.premium_since or (sp_role and sp_role in [r.id for r in mem.roles])):
                 badge = " 💎"
-        
+
         line = f"• {get_flag(country)} **{country}:** `{u_data['roblox']}` (<@{uid}>){badge}"
         if country.title() in [s.title() for s in sps]: 
             sp_lines.append(line)
@@ -235,7 +258,7 @@ def build_embed(name, info, guild=None):
     desc = f"### 🗓️ Schedule\n{tmr}\n• **Host:** {h_str}\n\n─────────────\n\n{sp_sec}### 📋 Reservations\n"
     desc += "\n".join(reg_lines) if reg_lines else "*None*"
     desc += wait_sec
-    
+
     if len(desc) > 3900:
         desc = desc[:3850] + "\n\n*... list cut off due to length.*"
 
@@ -282,7 +305,7 @@ async def process_waitlist(info, opened, guild, channel):
 
     promo = next((i for i in cands if i["country"].title() == opened.title()), cands[0])
     wait.remove(promo)
-    
+
     info["reservations"][promo["country"].title()] = {"roblox": promo["roblox"], "discord_id": promo["discord_id"]}
 
     r_id = get_config(guild.id).get("event_role")
@@ -301,6 +324,67 @@ async def process_waitlist(info, opened, guild, channel):
         except: 
             pass
 
+# ==========================================
+# ON MESSAGE EVENT (AI CHATBOT & GUILD CHECKS)
+# ==========================================
+@bot.event
+async def on_message(msg):
+    if msg.author.bot:
+        return
+
+    # Server checks (Blacklist & 200 Member Limit)
+    if msg.guild:
+        if msg.guild.id in BLACKLISTED_GUILD_IDS:
+            return
+
+        if msg.guild.member_count < 200 and msg.guild.id not in EXEMPT_GUILD_IDS:
+            return
+
+    # AI Chat Trigger (Ping or Reply)
+    pinged = bot.user in msg.mentions
+    is_reply = False
+    if msg.reference and msg.reference.resolved:
+        if msg.reference.resolved.author == bot.user:
+            is_reply = True
+
+    if pinged or is_reply:
+        txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
+
+        if not txt:
+            await msg.reply("tf you want bro?")
+        else:
+            uid = msg.author.id
+            if uid not in ai_history:
+                ai_history[uid] = []
+
+            ai_history[uid].append(f"User: {txt}")
+            ai_history[uid] = ai_history[uid][-6:]
+
+            prompt = "\n".join(ai_history[uid]) + "\nBot:"
+
+            async with msg.channel.typing():
+                try:
+                    res = await asyncio.to_thread(
+                        genai_client.models.generate_content,
+                        model="gemini-3.8-flash",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=BOT_PERSONA
+                        )
+                    )
+                    ans = res.text
+                    ai_history[uid].append(f"Bot: {ans}")
+
+                    if len(ans) > 2000:
+                        ans = ans[:1996] + "..."
+
+                    await msg.reply(ans)
+                except Exception as e:
+                    print("AI Chat Error:", e)
+                    await msg.reply("ain't working right now tf")
+
+    await bot.process_commands(msg)
+
 class RateModal(discord.ui.Modal, title="Rate Event"):
     rating = discord.ui.TextInput(label="Rating (1-5)", placeholder="e.g. 4.5", max_length=4)
 
@@ -311,14 +395,14 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
 
     async def on_submit(self, interaction):
         info = db["events"].get(self.key, {})
-        
+
         if time.time() - info.get("concluded_at", 0) > 3600:
             await interaction.response.send_message("Rating window closed.", ephemeral=True)
             return
 
         if "voted" not in info: 
             info["voted"] = []
-            
+
         if interaction.user.id in info["voted"]:
             await interaction.response.send_message("You already voted.", ephemeral=True)
             return
@@ -356,7 +440,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
         if now < info["start_time"]:
             await interaction.response.send_message("Not open yet.", ephemeral=True)
             return
-            
+
         if now >= info["end_time"]:
             await interaction.response.send_message("Closed.", ephemeral=True)
             return
@@ -375,10 +459,9 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
 
         if "waitlist" not in info: 
             info["waitlist"] = []
-            
+
         max_p = info.get("max_players", 0)
-        
-        # TODO: clean this waitlist stuff up later
+
         if c_title in info["reservations"] or (max_p > 0 and len(info["reservations"]) >= max_p):
             for w in info["waitlist"]:
                 if w["discord_id"] == interaction.user.id:
@@ -422,7 +505,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
             msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
             await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
         except: pass
-        
+
         save_db(db)
         await log_action(interaction.guild, "Spot Claimed", f"<@{interaction.user.id}> reserved **{c_title}**.")
         await interaction.response.send_message(f"Reserved **{c_title}**!", ephemeral=True)
@@ -442,22 +525,22 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
         if not u_c: 
             await interaction.response.send_message("You don't have a spot.", ephemeral=True)
             return
-            
+
         if t_c not in info["reservations"]: 
             await interaction.response.send_message("No one has that spot.", ephemeral=True)
             return
-            
+
         if t_c == u_c: 
             await interaction.response.send_message("Can't swap with yourself.", ephemeral=True)
             return
 
         t_id = info["reservations"][t_c]["discord_id"]
         ch_id = get_config(interaction.guild_id).get("swap_channel")
-        
+
         if not ch_id: 
             await interaction.response.send_message("Swap channel not set up.", ephemeral=True)
             return
-            
+
         swap_ch = interaction.guild.get_channel(ch_id)
         if not swap_ch: 
             await interaction.response.send_message("Swap channel missing.", ephemeral=True)
@@ -482,7 +565,7 @@ class SwapAcceptView(discord.ui.View):
         if interaction.user.id != self.t_id:
             await interaction.response.send_message("Not your swap offer.", ephemeral=True)
             return
-        
+
         info = db["events"].get(self.key)
         res = info["reservations"]
 
@@ -497,11 +580,11 @@ class SwapAcceptView(discord.ui.View):
             await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
         except: 
             pass
-        
+
         save_db(db)
         for child in self.children: 
             child.disabled = True
-            
+
         emb = interaction.message.embeds[0]
         emb.color = 0x2ECC71
         emb.title = "✅ Swap Completed"
@@ -513,10 +596,10 @@ class SwapAcceptView(discord.ui.View):
         if interaction.user.id != self.t_id: 
             await interaction.response.send_message("Not your offer.", ephemeral=True)
             return
-            
+
         for child in self.children: 
             child.disabled = True
-            
+
         emb = interaction.message.embeds[0]
         emb.color = 0xE74C3C
         emb.title = "❌ Swap Declined"
@@ -549,7 +632,7 @@ class KickSelect(discord.ui.Select):
             await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
         except: 
             pass
-        
+
         save_db(db)
         await interaction.response.send_message(f"Kicked **{c_title}**.", ephemeral=True)
 
@@ -566,11 +649,11 @@ class HostActionsView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         r_id = get_config(interaction.guild_id).get("event_role")
         role = interaction.guild.get_role(r_id) if r_id else None
-        
+
         if not role:
             await interaction.followup.send("Event role not setup.", ephemeral=True)
             return
-        
+
         count = 0
         for mem in role.members:
             try: 
@@ -578,14 +661,14 @@ class HostActionsView(discord.ui.View):
                 count += 1
             except: 
                 pass
-                
+
         await interaction.followup.send(f"Removed role from {count} members.", ephemeral=True)
 
     @discord.ui.button(label="Conclude Event", style=discord.ButtonStyle.danger, row=1)
     async def conclude(self, interaction, btn):
         await interaction.response.defer(ephemeral=True)
         info = db["events"].get(self.key)
-        
+
         if info.get("concluded"): 
             await interaction.followup.send("Already ended.", ephemeral=True)
             return
@@ -593,7 +676,7 @@ class HostActionsView(discord.ui.View):
         now = int(time.time())
         info["concluded"] = True
         info["concluded_at"] = now
-        
+
         r_id = get_config(interaction.guild_id).get("event_role")
         role = interaction.guild.get_role(r_id) if r_id else None
         if role:
@@ -609,7 +692,7 @@ class HostActionsView(discord.ui.View):
         dur = round(max(0, now - info["end_time"]) / 3600, 1)
         p_count = len(info["reservations"])
         hid = check_host(info["host_id"])
-        
+
         db["hosts"][hid]["total_events"] += 1
         db["hosts"][hid]["total_players"] += p_count
         save_db(db)
@@ -650,12 +733,12 @@ class EventButtonsView(discord.ui.View):
     async def swap(self, interaction, btn):
         key, _ = find_event(interaction.message.id)
         if not key: return
-        
+
         rem = 120 - (time.time() - swap_cooldowns.get(interaction.user.id, 0))
         if rem > 0:
             await interaction.response.send_message(f"Cooldown active. Wait {int(rem)}s.", ephemeral=True)
             return
-            
+
         await interaction.response.send_modal(SwapModal(key))
 
     @discord.ui.button(label="Leave Event", style=discord.ButtonStyle.danger, custom_id="leave_btn")
@@ -706,7 +789,7 @@ class EventButtonsView(discord.ui.View):
         if not is_admin_or_host(interaction):
             await interaction.response.send_message("Admins or hosts only.", ephemeral=True)
             return
-            
+
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
 
@@ -716,16 +799,16 @@ class SetupRolePanel(discord.ui.View):
         self.add_item(discord.ui.RoleSelect(placeholder="Host Role", custom_id="r1"))
         self.add_item(discord.ui.RoleSelect(placeholder="Event Role", custom_id="r2"))
         self.add_item(discord.ui.RoleSelect(placeholder="VIP Role", custom_id="r3"))
-        
+
     async def interaction_check(self, interaction):
         val = interaction.data["values"][0]
         cid = interaction.data["custom_id"]
         conf = get_config(interaction.guild_id)
-        
+
         if cid == "r1": conf["host_role"] = int(val)
         elif cid == "r2": conf["event_role"] = int(val)
         elif cid == "r3": conf["superpower_role"] = int(val)
-        
+
         save_db(db)
         await interaction.response.send_message("Role saved.", ephemeral=True)
         return True
@@ -741,25 +824,34 @@ class SetupChannelPanel(discord.ui.View):
         val = interaction.data["values"][0]
         cid = interaction.data["custom_id"]
         conf = get_config(interaction.guild_id)
-        
+
         if cid == "c1": conf["log_channel"] = int(val)
         elif cid == "c2": conf["swap_channel"] = int(val)
         elif cid == "c3": conf["stats_channel"] = int(val)
-        
+
         save_db(db)
         await interaction.response.send_message("Channel saved.", ephemeral=True)
         return True
+
+@bot.tree.command(name="clearchat", description="Clears your AI chat history")
+async def clearchat_cmd(interaction: discord.Interaction):
+    uid = interaction.user.id
+    if uid in ai_history:
+        del ai_history[uid]
+        await interaction.response.send_message("AI memory cleared.", ephemeral=True)
+    else:
+        await interaction.response.send_message("No memory to clear.", ephemeral=True)
 
 @bot.tree.command(name="setup", description="Admin setup panel")
 async def setup_cmd(interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-        
+
     conf = get_config(interaction.guild_id)
     e1 = discord.Embed(title="Setup Roles", description=f"Host: <@&{conf.get('host_role')}>\nEvent: <@&{conf.get('event_role')}>\nVIP: <@&{conf.get('superpower_role')}>")
     await interaction.response.send_message(embed=e1, view=SetupRolePanel(), ephemeral=True)
-    
+
     e2 = discord.Embed(title="Setup Channels", description=f"Logs: <#{conf.get('log_channel')}>\nSwaps: <#{conf.get('swap_channel')}>\nStats: <#{conf.get('stats_channel')}>")
     await interaction.followup.send(embed=e2, view=SetupChannelPanel(), ephemeral=True)
 
@@ -787,7 +879,6 @@ bot.setup_hook = setup_hook
 @bot.event
 async def on_ready():
     print(f"Logged in: {bot.user.name}")
-    # print(db)
 
 @bot.command()
 async def sync(ctx):
@@ -831,7 +922,7 @@ async def create_ev(interaction, name: str, starts_in: str, duration: str, targe
     msg = await target.send(embeds=embs, view=EventButtonsView())
     db["events"][key]["message_ids"] = [msg.id]
     save_db(db)
-    
+
     await log_action(interaction.guild, "Event Created", f"**{name}** made by <@{interaction.user.id}>.")
     await interaction.followup.send("Event created.", ephemeral=True)
 
@@ -841,21 +932,21 @@ async def set_sp(interaction, event_name: str, nations: str):
     if not is_admin_or_host(interaction): 
         await interaction.response.send_message("Hosts only.", ephemeral=True)
         return
-    
+
     key = event_name.lower().strip()
     if key not in db["events"]: 
         await interaction.response.send_message("Event not found.", ephemeral=True)
         return
-    
+
     sps = [n.strip().title() for n in nations.split(",") if n.strip()]
     db["events"][key]["superpowers"] = sps
-    
+
     try:
         msg = await bot.get_channel(db["events"][key]["channel_id"]).fetch_message(db["events"][key]["message_ids"][0])
         await msg.edit(embeds=build_embed(db["events"][key]["display_name"], db["events"][key], interaction.guild))
     except: 
         pass
-    
+
     save_db(db)
     await interaction.response.send_message(f"Superpowers set: {', '.join(sps)}", ephemeral=True)
 
@@ -864,18 +955,18 @@ async def blacklist(interaction, user: discord.Member):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-        
+
     gid = str(interaction.guild_id)
     if gid not in db["blacklists"]: 
         db["blacklists"][gid] = []
-    
+
     if user.id in db["blacklists"][gid]:
         db["blacklists"][gid].remove(user.id)
         msg = f"Unblacklisted {user.mention}."
     else:
         db["blacklists"][gid].append(user.id)
         msg = f"Blacklisted {user.mention}."
-    
+
     save_db(db)
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -884,15 +975,15 @@ async def spawn_lb(interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-        
+
     emb = discord.Embed(title="Host Leaderboards", description="Updating...")
     msg = await interaction.channel.send(embed=emb)
-    
+
     conf = get_config(interaction.guild_id)
     conf["leaderboard_msg_id"] = msg.id
     conf["leaderboard_ch_id"] = interaction.channel_id
     save_db(db)
-    
+
     await update_leaderboard(interaction.guild)
     await interaction.response.send_message("Leaderboard spawned.", ephemeral=True)
 
