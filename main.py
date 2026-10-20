@@ -11,8 +11,7 @@ from discord.ext import commands, tasks
 import pymongo
 from flask import Flask
 from threading import Thread
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 
 app = Flask(__name__)
 
@@ -32,15 +31,15 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# GEMINI AI & QUEUE CONFIGURATION
+# GROQ AI & QUEUE CONFIGURATION
 # ==========================================
-genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 ai_history = {}
 user_cooldowns = {}
 ai_queue = asyncio.Queue()
 bot_muted = False
 
-# List of Discord User IDs with special privileges (e.g. mute/unmute control)
+# List of Discord User IDs with special privileges (mute/unmute control)
 BOT_OWNER_IDS = [
     1359263076838539296,  # Your User ID
     # Add other trusted user IDs here, separated by commas
@@ -333,7 +332,7 @@ async def process_waitlist(info, opened, guild, channel):
             pass
 
 # ==========================================
-# BACKGROUND QUEUE WORKER FOR GEMINI
+# BACKGROUND QUEUE WORKER FOR GROQ AI
 # ==========================================
 async def process_ai_queue():
     while True:
@@ -343,22 +342,18 @@ async def process_ai_queue():
                 if uid not in ai_history:
                     ai_history[uid] = []
 
-                ai_history[uid].append(f"User: {txt}")
+                ai_history[uid].append({"role": "user", "content": txt})
                 ai_history[uid] = ai_history[uid][-6:]
 
-                prompt = "\n".join(ai_history[uid]) + "\nBot:"
+                messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
 
-                res = await asyncio.to_thread(
-                    genai_client.models.generate_content,
-                    model="gemini-2.0-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=BOT_PERSONA,
-                        max_output_tokens=500,
-                    )
+                res = await groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    max_tokens=250,
                 )
-                ans = res.text
-                ai_history[uid].append(f"Bot: {ans}")
+                ans = res.choices[0].message.content
+                ai_history[uid].append({"role": "assistant", "content": ans})
 
                 if len(ans) > 2000:
                     ans = ans[:1996] + "..."
@@ -369,8 +364,7 @@ async def process_ai_queue():
             await msg.reply(f"⚠️ **Error:** `{e}`")
         finally:
             ai_queue.task_done()
-            # 4 second delay ensures max 15 requests per minute
-            await asyncio.sleep(4)
+            await asyncio.sleep(2)
 
 # ==========================================
 # ON MESSAGE EVENT (AI CHATBOT & GUILD CHECKS)
@@ -400,13 +394,13 @@ async def on_message(msg):
     if pinged or is_reply:
         txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
 
-        # Mute Command Check (Owner Only)
+        # Mute Command Check (Owner Only - Completely Silent)
         if txt.lower() == "shut up":
             if msg.author.id in BOT_OWNER_IDS:
                 bot_muted = True
             return
 
-        # Unmute Command Check (Owner Only)
+        # When muted: Ignore everyone until Owner says "you can talk again"
         if bot_muted:
             if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
                 bot_muted = False
