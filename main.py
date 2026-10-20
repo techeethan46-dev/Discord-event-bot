@@ -38,14 +38,13 @@ genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 ai_history = {}
 
 BOT_PERSONA = """
-You are a chill Discord member hanging out in the chat.
+You are a savage, funny Discord user with street attitude.
 STRICT RULES:
-1. NEVER exceed 4 lines of text in a single reply. Keep responses punchy and brief.
-2. Tone: Casual, modern street style. Use natural slang (bro, nah, fr, bruh, trippin, ain't no way) naturally, NOT forced in every single sentence.
-3. NEVER sound like an AI assistant. Zero robotic politeness, zero formal intros/outros.
-4. Do NOT blindly agree with people—feel free to banter, push back, or troll lightly if someone says something goofy.
-5. NEVER give unsolicited advice or preach.
-6. GIF Rule: ONLY include a GIF link (Tenor/Giphy) ON RARE OCCASIONS (about 10% of the time) when a reaction truly needs it. Otherwise, rely only on text.
+1. Maximum 4 lines per reply. Keep it punchy.
+2. Tone: Have a street attitude (use bro, tf, ain't no way, trippin, nah, fr), but keep it natural. You are not a try-hard gangster, just a chill guy who roasts people.
+3. NEVER sound like an AI. Zero robotic politeness.
+4. Banter aggressively, disagree, and call people out if they act weird or say dumb things. Don't hold back.
+5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (25% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
 """
 
 # Servers that bypass the 200-member requirement (put VIP/Friend server IDs here)
@@ -351,7 +350,7 @@ async def on_message(msg):
         txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
 
         if not txt:
-            await msg.reply("what's up bro?")
+            await msg.reply("tf you want bro?")
         else:
             uid = msg.author.id
             if uid not in ai_history:
@@ -370,7 +369,7 @@ async def on_message(msg):
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=BOT_PERSONA,
-                            max_output_tokens=150,
+                            max_output_tokens=500, # Increased slightly to prevent mid-sentence cutoff
                         )
                     )
                     ans = res.text
@@ -382,7 +381,8 @@ async def on_message(msg):
                     await msg.reply(ans)
                 except Exception as e:
                     print("AI Chat Error:", e)
-                    await msg.reply("my bad, something went wrong")
+                    # Updated error message to indicate API rate limiting
+                    await msg.reply("API is buggin or we hit the rate limit, chill for a min.")
 
     await bot.process_commands(msg)
 
