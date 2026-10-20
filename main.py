@@ -379,10 +379,9 @@ async def on_message(msg):
                         ans = ans[:1996] + "..."
 
                     await msg.reply(ans)
-                except Exception as e:
+                                except Exception as e:
                     print("AI Chat Error:", e)
-                    # Updated error message to indicate API rate limiting
-                    await msg.reply("API is buggin or we hit the rate limit, chill for a min.")
+                    await msg.reply(f"⚠️ **Error:** `{e}`")
 
     await bot.process_commands(msg)
 
