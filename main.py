@@ -38,14 +38,14 @@ genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 ai_history = {}
 
 BOT_PERSONA = """
-You are a Discord user in a server talking to people.
+You are a chill Discord member hanging out in the chat.
 STRICT RULES:
-1. NEVER exceed 4 lines of text in a single reply.
-2. Speak strictly like someone from the hood using natural slang (e.g., "bro", "ain't no way", "tf", "nah", "fr", "trippin", "buggin", "bruh").
-3. NEVER sound like an AI assistant. Zero robotic politeness, zero essay responses.
-4. DO NOT just agree with what people say. Disagree, call them out, or push back if they say something weird or dumb.
+1. NEVER exceed 4 lines of text in a single reply. Keep responses punchy and brief.
+2. Tone: Casual, modern street style. Use natural slang (bro, nah, fr, bruh, trippin, ain't no way) naturally, NOT forced in every single sentence.
+3. NEVER sound like an AI assistant. Zero robotic politeness, zero formal intros/outros.
+4. Do NOT blindly agree with people—feel free to banter, push back, or troll lightly if someone says something goofy.
 5. NEVER give unsolicited advice or preach.
-6. Drop reaction GIF URLs (Tenor/Giphy links) in your replies when reacting to things.
+6. GIF Rule: ONLY include a GIF link (Tenor/Giphy) ON RARE OCCASIONS (about 10% of the time) when a reaction truly needs it. Otherwise, rely only on text.
 """
 
 # Servers that bypass the 200-member requirement (put VIP/Friend server IDs here)
@@ -58,7 +58,7 @@ DATA_FILE = "events_data.json"
 
 MONGO_URI = os.environ.get("MONGO_URI")
 client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
-mongo_db = client["ctw_bot_db"] if client else None
+mongo_db = client["ctw_bot_db"] if client is not None else None
 db_col = mongo_db["bot_data"] if mongo_db is not None else None
 
 def load_db():
@@ -351,7 +351,7 @@ async def on_message(msg):
         txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
 
         if not txt:
-            await msg.reply("tf you want bro?")
+            await msg.reply("what's up bro?")
         else:
             uid = msg.author.id
             if uid not in ai_history:
@@ -369,7 +369,8 @@ async def on_message(msg):
                         model="gemini-3.8-flash",
                         contents=prompt,
                         config=types.GenerateContentConfig(
-                            system_instruction=BOT_PERSONA
+                            system_instruction=BOT_PERSONA,
+                            max_output_tokens=150,
                         )
                     )
                     ans = res.text
@@ -381,7 +382,7 @@ async def on_message(msg):
                     await msg.reply(ans)
                 except Exception as e:
                     print("AI Chat Error:", e)
-                    await msg.reply("ain't working right now tf")
+                    await msg.reply("my bad, something went wrong")
 
     await bot.process_commands(msg)
 
