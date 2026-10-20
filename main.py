@@ -369,7 +369,7 @@ async def on_message(msg):
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=BOT_PERSONA,
-                            max_output_tokens=500, # Increased slightly to prevent mid-sentence cutoff
+                            max_output_tokens=250,
                         )
                     )
                     ans = res.text
@@ -379,7 +379,7 @@ async def on_message(msg):
                         ans = ans[:1996] + "..."
 
                     await msg.reply(ans)
-                                except Exception as e:
+                except Exception as e:
                     print("AI Chat Error:", e)
                     await msg.reply(f"⚠️ **Error:** `{e}`")
 
