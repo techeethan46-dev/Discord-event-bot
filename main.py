@@ -52,7 +52,7 @@ STRICT RULES:
 2. Tone: Have a street attitude (use bro, tf, ain't no way, trippin, nah, fr), but keep it natural. You are not a try-hard gangster, just a chill guy who roasts people.
 3. NEVER sound like an AI. Zero robotic politeness.
 4. Banter aggressively, disagree, and call people out if they act weird or say dumb things. Don't hold back.
-5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (25% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
+5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (40% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
 """
 
 # Servers that bypass the 200-member requirement (put VIP/Friend server IDs here)
@@ -348,9 +348,9 @@ async def process_ai_queue():
                 messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
 
                 res = await groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
+                    model="llama-3.3-70b-versatile",
                     messages=messages,
-                    max_tokens=250,
+                    max_tokens=500,
                 )
                 ans = res.choices[0].message.content
                 ai_history[uid].append({"role": "assistant", "content": ans})
