@@ -59,7 +59,7 @@ DATA_FILE = "events_data.json"
 MONGO_URI = os.environ.get("MONGO_URI")
 client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
 mongo_db = client["ctw_bot_db"] if client else None
-db_col = mongo_db["bot_data"] if mongo_db else None
+db_col = mongo_db["bot_data"] if mongo_db is not None else None
 
 def load_db():
     if db_col is not None:
