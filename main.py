@@ -365,11 +365,11 @@ async def on_message(msg):
                 try:
                     res = await asyncio.to_thread(
                         genai_client.models.generate_content,
-                        model="gemini-1.5-flash",
+                        model="gemini-flash-latest",
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=BOT_PERSONA,
-                            max_output_tokens=250,
+                            max_output_tokens=500,
                         )
                     )
                     ans = res.text
