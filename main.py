@@ -32,10 +32,19 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# GEMINI AI & SERVER CHECKS CONFIGURATION
+# GEMINI AI & QUEUE CONFIGURATION
 # ==========================================
 genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 ai_history = {}
+user_cooldowns = {}
+ai_queue = asyncio.Queue()
+bot_muted = False
+
+# List of Discord User IDs with special privileges (e.g. mute/unmute control)
+BOT_OWNER_IDS = [
+    1359263076838539296,  # Your User ID
+    # Add other trusted user IDs here, separated by commas
+]
 
 BOT_PERSONA = """
 You are a savage, funny Discord user with street attitude.
@@ -324,10 +333,52 @@ async def process_waitlist(info, opened, guild, channel):
             pass
 
 # ==========================================
+# BACKGROUND QUEUE WORKER FOR GEMINI
+# ==========================================
+async def process_ai_queue():
+    while True:
+        msg, txt, uid = await ai_queue.get()
+        try:
+            async with msg.channel.typing():
+                if uid not in ai_history:
+                    ai_history[uid] = []
+
+                ai_history[uid].append(f"User: {txt}")
+                ai_history[uid] = ai_history[uid][-6:]
+
+                prompt = "\n".join(ai_history[uid]) + "\nBot:"
+
+                res = await asyncio.to_thread(
+                    genai_client.models.generate_content,
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=BOT_PERSONA,
+                        max_output_tokens=250,
+                    )
+                )
+                ans = res.text
+                ai_history[uid].append(f"Bot: {ans}")
+
+                if len(ans) > 2000:
+                    ans = ans[:1996] + "..."
+
+                await msg.reply(ans)
+        except Exception as e:
+            print("AI Chat Error:", e)
+            await msg.reply(f"⚠️ **Error:** `{e}`")
+        finally:
+            ai_queue.task_done()
+            # 4 second delay ensures max 15 requests per minute
+            await asyncio.sleep(4)
+
+# ==========================================
 # ON MESSAGE EVENT (AI CHATBOT & GUILD CHECKS)
 # ==========================================
 @bot.event
 async def on_message(msg):
+    global bot_muted
+
     if msg.author.bot:
         return
 
@@ -349,39 +400,40 @@ async def on_message(msg):
     if pinged or is_reply:
         txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
 
+        # Mute Command Check (Owner Only)
+        if txt.lower() == "shut up":
+            if msg.author.id in BOT_OWNER_IDS:
+                bot_muted = True
+            return
+
+        # Unmute Command Check (Owner Only)
+        if bot_muted:
+            if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
+                bot_muted = False
+                await msg.reply("thank you father")
+            return
+
         if not txt:
             await msg.reply("tf you want bro?")
         else:
             uid = msg.author.id
-            if uid not in ai_history:
-                ai_history[uid] = []
+            now = time.time()
 
-            ai_history[uid].append(f"User: {txt}")
-            ai_history[uid] = ai_history[uid][-6:]
+            # 7-second per-user cooldown check
+            last_msg_time = user_cooldowns.get(uid, 0)
+            if now - last_msg_time < 7:
+                wait_sec = int(7 - (now - last_msg_time))
+                await msg.reply(f"chill out bro, wait {wait_sec}s before messaging again.")
+                return
 
-            prompt = "\n".join(ai_history[uid]) + "\nBot:"
+            user_cooldowns[uid] = now
 
-            async with msg.channel.typing():
-                try:
-                    res = await asyncio.to_thread(
-                        genai_client.models.generate_content,
-                        model="gemini-2.5-flash",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=BOT_PERSONA,
-                            max_output_tokens=500,
-                        )
-                    )
-                    ans = res.text
-                    ai_history[uid].append(f"Bot: {ans}")
+            # Enqueue message
+            q_size = ai_queue.qsize()
+            await ai_queue.put((msg, txt, uid))
 
-                    if len(ans) > 2000:
-                        ans = ans[:1996] + "..."
-
-                    await msg.reply(ans)
-                except Exception as e:
-                    print("AI Chat Error:", e)
-                    await msg.reply(f"⚠️ **Error:** `{e}`")
+            if q_size > 0:
+                await msg.reply(f"⏳ Added to queue (Position #{q_size + 1}). Hold up...")
 
     await bot.process_commands(msg)
 
@@ -873,6 +925,7 @@ async def refresh_timers():
 async def setup_hook():
     bot.add_view(EventButtonsView())
     refresh_timers.start()
+    asyncio.create_task(process_ai_queue())
 
 bot.setup_hook = setup_hook
 
