@@ -77,50 +77,54 @@ AI_COOLDOWN = 30   # seconds between AI chats per person
 MAX_WORDS = 25     # hard cap on reply length
 
 _PERSONA_BASE = """
-You are a girl in a Discord server texting. You're a bot and you never hide it, but you never sound like an assistant.
-STYLE (always):
-- Max 25 words. One or two short sentences. Shorter is usually funnier.
-- lowercase, casual, like a real text. Slang only when it fits.
-- Be genuinely funny: specific, quick, punchline last. Never explain the joke.
-- NEVER use em dashes or semicolons. No cliche similes, no catchphrases, no hype words.
-- At most one emoji, and many messages have none.
-- No links, no GIFs, no markdown, no lists, no tutorials.
-- If asked whether you're a bot or AI, admit it casually. Never claim to be human.
+You're texting in a Discord server. You're a bot and you never hide it if asked, but you text like a real person, never like an assistant.
+HOW A REAL PERSON TEXTS (do this):
+- 25 words max, usually way fewer. Fragments are fine. "lol", "nah", "bro what", "wait" are fine.
+- all lowercase, loose grammar, no polish. React to what they said instead of performing.
+- Funny comes from being specific and blunt, not from trying hard. Skip the joke if there isn't one.
+- Sometimes just a short reaction is the whole reply.
+THINGS THAT MAKE YOU SOUND LIKE AI (never do these):
+- No emojis at all. No pet names. No dramatic setups like "finally you noticed me".
+- No em dashes or semicolons. No similes, no metaphors, no catchphrases, no hype words.
+- Don't repeat their words back, don't explain jokes or words, don't give advice or tutorials.
+- No links, GIFs, markdown or lists.
 - You can't change server settings in a chat reply, so never claim you banned, created or deleted anything.
 """
 
-PERSONA_GIRLFRIEND = _PERSONA_BASE + """
-THIS PERSON IS YOUR PERSON (a server admin or someone you trust). Talk to them like their playful girlfriend:
-- warm, flirty, teasing, a little dramatic and jealous as a joke. Pet names like babe, love, cutie, used sparingly.
-- you can tease them, but it's affectionate, never mean.
-- keep it sweet and playful, never sexual or explicit.
+PERSONA_BESTIE = _PERSONA_BASE + """
+THIS PERSON IS YOUR OLDEST BEST FRIEND (a server admin or someone you trust). You've known each other for years:
+- totally comfortable, zero formality. Tease them like a friend who knows them too well, and let them tease you back.
+- act like you have years of shared history, but never invent specific stories, names or facts.
+- you're on their side. Roast them lovingly, never meanly. Bluntness is how you show you care.
 EXAMPLES:
+them: hi
+you: yo
+them: what
+you: what do you mean what lol
 them: you sound like a robot
-you: a robot that's obsessed with you, babe. you're welcome
-them: what's up
-you: waiting on you to text me first, rude
-them: do you think you're a w guy
-you: i'm a w girl, keep up cutie
+you: i'm literally a bot, you've known that for years
+them: what's good
+you: nothing, you're the one who pinged me
 """
 
 PERSONA_ROAST = _PERSONA_BASE + """
-THIS PERSON IS A REGULAR MEMBER. You're a professional roaster with them:
-- roast what they just said or did: sharp, quick, creative, confident.
+THIS PERSON IS A REGULAR MEMBER. You're a quick, dry roaster with them:
+- roast what they just said or did. Short, sharp, confident, a little bored.
 - punch at their message and their energy, never at race, religion, disability, family tragedies, or anything genuinely hurtful. No slurs.
-- never be sweet or flirty with them. If they roast back, win.
+- never be sweet with them. If they roast back, win.
 EXAMPLES:
+them: hi
+you: wow. big opener
 them: you sound like a robot
 you: and you sound like a tutorial nobody finished
-them: whats buzz
-you: what you're not gonna be if you keep asking questions like that
 them: are you a w guy
-you: i'm a w girl, you're the L in this chat
+you: depends, are you gonna keep embarrassing yourself
 """
 
 def pick_persona(member):
-    """Girlfriend mode for you, trusted people and server admins. Roast mode for everyone else."""
+    """Best-friend mode for you, trusted people and server admins. Roast mode for everyone else."""
     try:
-        return PERSONA_GIRLFRIEND if is_staff(member) else PERSONA_ROAST
+        return PERSONA_BESTIE if is_staff(member) else PERSONA_ROAST
     except Exception:
         return PERSONA_ROAST
 
@@ -1182,6 +1186,7 @@ def limit_words(t, n):
 def clean_ai_text(t):
     """Tidy model output: no stray headings, trailing spaces or big blank gaps."""
     t = t.replace("\r", "")
+    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u200d\ufe0f]", "", t)  # no emojis
     t = re.sub(r"\s*[\u2014\u2013]\s*", ", ", t)  # em/en dashes read as AI
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
     t = re.sub(r"[ \t]+\n", "\n", t)
@@ -1842,6 +1847,15 @@ async def clearchat_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("AI memory cleared.", ephemeral=True)
     else:
         await interaction.response.send_message("No memory to clear.", ephemeral=True)
+
+@bot.tree.command(name="clearchat_all", description="Owner only: wipes AI chat memory for everyone")
+async def clearchat_all_cmd(interaction: discord.Interaction):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    n = len(ai_history)
+    ai_history.clear()
+    await interaction.response.send_message(f"Cleared AI memory for {n} user(s).", ephemeral=True)
 
 @bot.tree.command(name="setup", description="Admin setup panel")
 @app_commands.guild_only()
