@@ -332,9 +332,18 @@ async def process_waitlist(info, opened, guild, channel):
             pass
 
 # ==========================================
-# BACKGROUND QUEUE WORKER FOR GROQ AI
+# BACKGROUND QUEUE WORKER FOR GROQ AI (AUTO-FALLBACK)
 # ==========================================
 async def process_ai_queue():
+    # Priority list of Groq models (if one fails/deprecates, it automatically uses the next)
+    GROQ_MODELS = [
+        "llama3-8b-8192",
+        "llama3-70b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "llama-3.3-70b-versatile"
+    ]
+
     while True:
         msg, txt, uid = await ai_queue.get()
         try:
@@ -347,12 +356,26 @@ async def process_ai_queue():
 
                 messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
 
-                res = await groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=messages,
-                    max_tokens=500,
-                )
-                ans = res.choices[0].message.content
+                ans = None
+                for model_name in GROQ_MODELS:
+                    try:
+                        res = await groq_client.chat.completions.create(
+                            model=model_name,
+                            messages=messages,
+                            max_tokens=250,
+                        )
+                        ans = res.choices[0].message.content
+                        break  # Successfully generated response, break loop
+                    except Exception as err:
+                        # If model is 404 or not found, try next model in list
+                        if "404" in str(err) or "model_not_found" in str(err):
+                            continue
+                        raise err
+
+                if not ans:
+                    await msg.reply("⚠️ All Groq models failed to respond.")
+                    continue
+
                 ai_history[uid].append({"role": "assistant", "content": ans})
 
                 if len(ans) > 2000:
