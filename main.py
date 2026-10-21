@@ -1860,8 +1860,8 @@ async def clearchat_all_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="setup", description="Admin setup panel")
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
         return
 
     conf = get_config(interaction.guild_id)
@@ -1920,8 +1920,8 @@ async def on_ready():
 @bot.command()
 @commands.guild_only()
 async def sync(ctx):
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("Admins only.")
+    if not is_staff(ctx.author):
+        await ctx.send("Admins or Bot Owners only.")
         return
     s = await bot.tree.sync()
     await ctx.send(f"Synced {len(s)} commands.")
@@ -2003,8 +2003,8 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
 @bot.tree.command(name="blacklist", description="Blacklist user")
 @app_commands.guild_only()
 async def blacklist(interaction: discord.Interaction, user: discord.Member):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
         return
 
     gid = str(interaction.guild_id)
@@ -2024,8 +2024,8 @@ async def blacklist(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="spawn_leaderboard", description="Spawn live leaderboard")
 @app_commands.guild_only()
 async def spawn_lb(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
         return
 
     emb = discord.Embed(title="Host Leaderboards", description="Updating...")
