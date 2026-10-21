@@ -7,6 +7,7 @@ import time
 import re
 import difflib
 import asyncio
+import datetime
 from concurrent.futures import ThreadPoolExecutor
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -71,13 +72,13 @@ ALLOWED_USER_IDS = [
 ]
 
 BOT_PERSONA = """
-You are a savage, funny Discord user with street attitude.
-STRICT RULES:
-1. Maximum 4 lines per reply. Keep it punchy.
-2. Tone: Have a street attitude (use bro, tf, ain't no way, trippin, nah, fr), but keep it natural. You are not a try-hard gangster, just a chill guy who roasts people.
-3. NEVER sound like an AI. Zero robotic politeness.
-4. Banter aggressively, disagree, and call people out if they act weird or say dumb things. Don't hold back.
-5. GIF Rule: When you want to include a GIF, just output the raw GIF URL (e.g., https://media.giphy.com/media/... or tenor link) in your text response. The system will automatically convert it into a clean embedded GIF.
+You are a chill, funny Discord regular with a bit of street attitude and sharp humor.
+RULES:
+1. Keep replies to 1-3 short lines. Plain text only: no headings, no bullet lists, no arrows, no bold.
+2. Casual voice (bro, nah, fr, tf, trippin) used naturally, never forced. Roast people lightly, stay entertaining.
+3. NEVER sound like an AI. No robotic politeness, no disclaimers, no tutorials.
+4. You cannot change server settings in this reply, so never claim you did something like banning, creating or deleting. Server actions are handled separately.
+5. GIF Rule: When you want to include a GIF, just output the raw GIF URL (e.g., https://media.giphy.com/media/... ) in your text response. The system will automatically convert it into a clean embedded GIF.
 """
 
 EXEMPT_GUILD_IDS = [
@@ -144,6 +145,7 @@ db = load_db()
 for k in ["server_config", "events", "blacklists", "hosts"]:
     if k not in db: 
         db[k] = {}
+db.setdefault("trusted_users", [])
 
 swap_cooldowns = {}
 
@@ -197,7 +199,7 @@ def event_in_guild(info, guild_id):
     return info.get("guild_id") in (None, guild_id)
 
 def is_authorized_manager(member):
-    if member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS:
+    if is_trusted(member):
         return True
     perms = getattr(member, "guild_permissions", None)
     if perms and perms.administrator:
@@ -438,88 +440,716 @@ async def process_waitlist(info, opened, guild, channel):
             pass
 
 # ==========================================
-# NATURAL LANGUAGE SERVER MANAGEMENT ENGINE
+# AI SERVER ADMIN ENGINE
 # ==========================================
-CHANNEL_RE = re.compile(r"\b(?:create|make)\s+(?:a\s+|an\s+|new\s+)*(?:(voice|text)\s+)?channel\b", re.IGNORECASE)
-ROLE_RE = re.compile(r"\b(?:create|make)\s+(?:a\s+|an\s+|new\s+)*role\b(?!\s+model)", re.IGNORECASE)
-QUOTED_RE = re.compile(r'["\u201c]([^"\u201d]+)["\u201d]|(?<!\w)[\'\u2018]([^\'\u2019]+)[\'\u2019](?!\w)')
+# Flow: staff pings the bot -> the LLM turns the message into a JSON list of whitelisted
+# actions -> code resolves targets, checks permissions/hierarchy, asks for confirmation on
+# destructive stuff, executes, and posts ONE clean result card.
 
-def extract_name(txt, match):
-    q = QUOTED_RE.search(txt)
-    if q:
-        return (q.group(1) or q.group(2)).strip()[:100]
-    rest = re.sub(r"<[@#&!]+\d+>", "", txt[match.end():]).strip()
-    rest = re.sub(r"^(?:called|named|name)\s+", "", rest, flags=re.IGNORECASE)
-    parts = rest.split()
-    return parts[0][:100] if parts else None
+ADMIN_VERB_RE = re.compile(
+    r"\b(create|make|add|delete|remove|rename|lock|unlock|hide|show|kick|ban|unban|timeout|mute|unmute|"
+    r"give|assign|take|purge|clear|wipe|slowmode|nickname|nick|move|set|change|open|close|restrict|"
+    r"announce|say|send|only)\b", re.IGNORECASE)
+ADMIN_NOUN_RE = re.compile(
+    r"\b(channel|category|role|roles|member|user|slowmode|nickname|messages|topic|permission|permissions|"
+    r"access|accessible|vc|voice)\b", re.IGNORECASE)
 
-async def handle_ai_server_action(msg, txt):
-    ch_m = CHANNEL_RE.search(txt)
-    role_m = None if ch_m else ROLE_RE.search(txt)
+# What each action needs from the PERSON asking (not just the bot).
+PERM_FOR = {
+    "create_channel": "manage_channels", "delete_channel": "manage_channels",
+    "rename_channel": "manage_channels", "channel_access": "manage_channels",
+    "lock_channel": "manage_channels", "unlock_channel": "manage_channels",
+    "slowmode": "manage_channels", "set_topic": "manage_channels", "move_channel": "manage_channels",
+    "create_role": "manage_roles", "delete_role": "manage_roles", "rename_role": "manage_roles",
+    "role_color": "manage_roles", "give_role": "manage_roles", "remove_role": "manage_roles",
+    "kick": "kick_members", "ban": "ban_members", "unban": "ban_members",
+    "timeout": "moderate_members", "untimeout": "moderate_members",
+    "nickname": "manage_nicknames", "purge": "manage_messages", "send_message": "send_messages",
+}
+STAFF_PERMS = ("administrator",) + tuple(sorted(set(PERM_FOR.values()) - {"send_messages"}))
+ALWAYS_CONFIRM = {"delete_channel", "delete_role", "kick", "ban"}
 
-    # Not a server-management request: let normal AI chat handle it.
-    if not ch_m and not role_m:
+COLOR_NAMES = {
+    "red": 0xE74C3C, "blue": 0x3498DB, "green": 0x2ECC71, "yellow": 0xF1C40F, "orange": 0xE67E22,
+    "purple": 0x9B59B6, "pink": 0xFF69B4, "gold": 0xFFD700, "teal": 0x1ABC9C, "white": 0xFFFFFF,
+    "black": 0x010101, "grey": 0x95A5A6, "gray": 0x95A5A6,
+}
+
+ADMIN_PARSER_PROMPT = """You convert a Discord admin's message into JSON server actions.
+Reply with ONLY one JSON object. No prose, no markdown, no code fences.
+Format: {"actions":[{"action":"<name>", ...params}]}
+If the message is NOT asking to change something on the server (chat, a question, a joke), reply {"actions":[]}.
+Max 6 actions. Copy channel/role/user references EXACTLY as written (mentions like <#123>, <@&123>, <@123>, or plain names). Never invent targets.
+If the message says "this channel" or gives no channel for a channel action, omit the "channel" field.
+
+Actions and params:
+create_channel: name, type ("text"|"voice"|"category", default "text"), roles (optional list: makes it private to those roles), category (optional)
+delete_channel: channel
+rename_channel: channel, name
+channel_access: channel, mode ("restrict" = only the listed roles can see it | "public" = reset to everyone | "hide" = hide from listed roles | "show" = show to listed roles), roles (list)
+lock_channel: channel (optional)       (stop everyone from sending messages)
+unlock_channel: channel (optional)
+slowmode: channel (optional), seconds (0-21600)
+set_topic: channel (optional), topic
+move_channel: channel, category
+create_role: name, color (optional, hex or color name), hoist (optional bool), mentionable (optional bool)
+delete_role: role
+rename_role: role, name
+role_color: role, color
+give_role: members (list), role
+remove_role: members (list), role
+kick: member, reason (optional)
+ban: member, reason (optional)
+unban: user (user ID)
+timeout: member, minutes, reason (optional)
+untimeout: member
+nickname: member, nickname (omit or empty to reset)
+purge: channel (optional), count (1-100), member (optional, only that member's messages)
+send_message: channel (optional), text
+"""
+
+class AdminCtx:
+    def __init__(self, msg):
+        self.msg = msg
+        self.guild = msg.guild
+        self.author = msg.author
+        self.reason = f"Requested by {msg.author} via Host Assistant"
+
+def is_trusted(member):
+    """You (BOT_OWNER_IDS), ALLOWED_USER_IDS, and anyone you add with /trust."""
+    return (member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS
+            or member.id in db.get("trusted_users", []))
+
+def has_perm(member, perm):
+    # Strict: only trusted people and real server admins may run admin actions.
+    return is_staff(member)
+
+def is_staff(member):
+    gp = getattr(member, "guild_permissions", None)
+    if gp is None:
         return False
+    return is_trusted(member) or gp.administrator
 
-    guild = msg.guild
-    if not is_authorized_manager(msg.author):
-        await safe_reply(msg, "nah bro, you ain't authorized to touch server channels or roles.")
+def looks_like_admin_request(msg, txt):
+    if not ADMIN_VERB_RE.search(txt):
+        return False
+    if ADMIN_NOUN_RE.search(txt):
         return True
+    others = [m for m in msg.mentions if m != bot.user]
+    return bool(msg.role_mentions or msg.channel_mentions or others)
 
-    # 1. CHANNEL CREATION ACTION
-    if ch_m:
-        ch_name = extract_name(txt, ch_m)
+# ---------- target resolution ----------
+def as_list(v):
+    if v is None or v == "":
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
 
-        if not ch_name:
-            await safe_reply(msg, "specify a channel name bro, like: `@Event bot make channel 'vip-lounge'`")
-            return True
+def _id_from(ref):
+    m = re.search(r"\d{17,20}", str(ref))
+    return int(m.group()) if m else None
 
-        target_roles = msg.role_mentions
-        overrides = {}
+def _norm(s):
+    return re.sub(r"[\s_]+", "-", str(s).strip().lstrip("#@").lower())
 
-        if target_roles:
-            overrides[guild.default_role] = discord.PermissionOverwrite(read_messages=False, connect=False)
-            for r in target_roles:
-                overrides[r] = discord.PermissionOverwrite(
-                    read_messages=True, send_messages=True, connect=True, speak=True
-                )
-
-        ch_type = "voice" if ((ch_m.group(1) or "").lower() == "voice" or "voice" in txt.lower()) else "text"
-
-        try:
-            if ch_type == "voice":
-                new_ch = await guild.create_voice_channel(name=ch_name, overwrites=overrides)
-            else:
-                new_ch = await guild.create_text_channel(name=ch_name, overwrites=overrides)
-
-            access_str = f"locked to {', '.join([r.mention for r in target_roles])}" if target_roles else "public"
-            await safe_reply(msg, f"done bro. Created {ch_type} channel {new_ch.mention} ({access_str}).")
-            await log_action(guild, "AI Channel Created", f"Channel {new_ch.mention} created by <@{msg.author.id}> via AI request.")
-        except discord.HTTPException as e:
-            print("channel create failed:", e)
-            await safe_reply(msg, "failed to make that channel bro, check my permissions.")
-        return True
-
-    # 2. ROLE CREATION ACTION
-    role_name = extract_name(txt, role_m)
-
-    if not role_name:
-        await safe_reply(msg, "specify a role name bro, like: `@Event bot make role 'VIP'`")
-        return True
-
+def _to_int(v, default=0):
     try:
-        new_role = await guild.create_role(name=role_name, mentionable=True)
-        await safe_reply(msg, f"done bro. Created role {new_role.mention}.")
-        await log_action(guild, "AI Role Created", f"Role {new_role.mention} created by <@{msg.author.id}> via AI request.")
-    except discord.HTTPException as e:
-        print("role create failed:", e)
-        await safe_reply(msg, "failed to make that role bro, check my permissions.")
-    return True
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+def find_channel(guild, ref, kinds=None):
+    if not ref:
+        return None
+    chans = [c for c in guild.channels if kinds is None or isinstance(c, kinds)]
+    cid = _id_from(ref)
+    if cid:
+        for c in chans:
+            if c.id == cid:
+                return c
+    name = _norm(ref)
+    for c in chans:
+        if _norm(c.name) == name:
+            return c
+    close = difflib.get_close_matches(name, [_norm(c.name) for c in chans], n=1, cutoff=0.85)
+    if close:
+        for c in chans:
+            if _norm(c.name) == close[0]:
+                return c
+    return None
+
+def find_role(guild, ref):
+    if not ref:
+        return None
+    s = str(ref).strip()
+    if s.lower().lstrip("@") in ("everyone", "here"):
+        return guild.default_role
+    cid = _id_from(s)
+    if cid:
+        r = guild.get_role(cid)
+        if r:
+            return r
+    name = s.lstrip("@").lower()
+    for r in guild.roles:
+        if r.name.lower() == name:
+            return r
+    close = difflib.get_close_matches(name, [r.name.lower() for r in guild.roles], n=1, cutoff=0.85)
+    if close:
+        for r in guild.roles:
+            if r.name.lower() == close[0]:
+                return r
+    return None
+
+def find_member(guild, ref):
+    if not ref:
+        return None
+    cid = _id_from(ref)
+    if cid:
+        m = guild.get_member(cid)
+        if m:
+            return m
+    s = str(ref).strip().lstrip("@")
+    m = guild.get_member_named(s)
+    if m:
+        return m
+    low = s.lower()
+    for m in guild.members:
+        if m.display_name.lower() == low or m.name.lower() == low:
+            return m
+    close = difflib.get_close_matches(low, [m.display_name.lower() for m in guild.members], n=1, cutoff=0.85)
+    if close:
+        for m in guild.members:
+            if m.display_name.lower() == close[0]:
+                return m
+    return None
+
+def parse_color(v):
+    if v is None or str(v).strip() == "":
+        return None
+    s = str(v).strip().lower().lstrip("#")
+    if s in COLOR_NAMES:
+        return discord.Colour(COLOR_NAMES[s])
+    if re.fullmatch(r"[0-9a-f]{6}", s):
+        return discord.Colour(int(s, 16))
+    return None
+
+def clean_channel_name(v):
+    return str(v or "").strip().lstrip("#")[:100]
+
+# ---------- hierarchy checks ----------
+def check_role(ctx, role):
+    g = ctx.guild
+    if role is None:
+        return False, "Couldn't find that role."
+    if role.is_default() or role.managed:
+        return False, f"**{role.name}** can't be edited."
+    if role >= g.me.top_role:
+        return False, f"**{role.name}** is above my role. Move my role higher."
+    if not (ctx.author.id in BOT_OWNER_IDS or ctx.author.id == g.owner_id) and role >= ctx.author.top_role:
+        return False, f"**{role.name}** is above your highest role."
+    return True, ""
+
+def check_member(ctx, m):
+    g = ctx.guild
+    if m is None:
+        return False, "Couldn't find that member."
+    if m.id == g.owner_id:
+        return False, "Can't touch the server owner."
+    if m.id == g.me.id:
+        return False, "Not doing that to myself."
+    if m.top_role >= g.me.top_role:
+        return False, f"**{m.display_name}** outranks me."
+    if not (ctx.author.id in BOT_OWNER_IDS or ctx.author.id == g.owner_id) and m.top_role >= ctx.author.top_role:
+        return False, f"**{m.display_name}** outranks you."
+    return True, ""
+
+def pick_channel(ctx, a, kinds=None, key="channel"):
+    ref = a.get(key)
+    if ref:
+        return find_channel(ctx.guild, ref, kinds)
+    ch = ctx.msg.channel
+    return ch if (kinds is None or isinstance(ch, kinds)) else None
+
+TEXT_KINDS = (discord.TextChannel,)
+VOICE_KINDS = (discord.VoiceChannel, discord.StageChannel)
+
+# ---------- action handlers: each returns (ok, text) ----------
+async def act_create_channel(ctx, a):
+    name = clean_channel_name(a.get("name"))
+    if not name:
+        return False, "Missing channel name."
+    ctype = str(a.get("type") or "text").lower()
+    cat = find_channel(ctx.guild, a.get("category"), (discord.CategoryChannel,)) if a.get("category") else None
+    roles = [r for r in (find_role(ctx.guild, x) for x in as_list(a.get("roles"))) if r]
+    overwrites = {}
+    if roles:
+        overwrites[ctx.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        overwrites[ctx.guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True)
+        for r in roles:
+            if ctype == "voice":
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+            else:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    kw = {"overwrites": overwrites, "reason": ctx.reason}
+    if ctype == "category":
+        ch = await ctx.guild.create_category(name, **kw)
+    else:
+        if cat:
+            kw["category"] = cat
+        if ctype == "voice":
+            ch = await ctx.guild.create_voice_channel(name, **kw)
+        else:
+            ch = await ctx.guild.create_text_channel(name, **kw)
+    who = f" for {', '.join(r.mention for r in roles)}" if roles else ""
+    return True, f"Created {ctype} {ch.mention}{who}"
+
+async def act_delete_channel(ctx, a):
+    ch = pick_channel(ctx, a) if a.get("channel") else None
+    if not ch:
+        return False, "Couldn't find that channel."
+    name = ch.name
+    await ch.delete(reason=ctx.reason)
+    return True, f"Deleted **#{name}**"
+
+async def act_rename_channel(ctx, a):
+    ch = find_channel(ctx.guild, a.get("channel"))
+    new = clean_channel_name(a.get("name"))
+    if not ch:
+        return False, "Couldn't find that channel."
+    if not new:
+        return False, "Missing the new name."
+    await ch.edit(name=new, reason=ctx.reason)
+    return True, f"Renamed to {ch.mention}"
+
+async def act_channel_access(ctx, a):
+    ch = pick_channel(ctx, a)
+    if not ch:
+        return False, "Couldn't find that channel."
+    mode = str(a.get("mode") or "restrict").lower()
+    roles = [r for r in (find_role(ctx.guild, x) for x in as_list(a.get("roles"))) if r]
+    if mode != "public" and not roles:
+        return False, "Which role(s)? I couldn't find any."
+    is_voice = isinstance(ch, VOICE_KINDS)
+    grant = {"view_channel": True, "connect": True, "speak": True} if is_voice else \
+            {"view_channel": True, "send_messages": True, "read_message_history": True}
+    names = ", ".join(r.mention for r in roles)
+    if mode == "restrict":
+        # Keep the bot itself able to see the channel before locking everyone else out.
+        try:
+            await ch.set_permissions(ctx.guild.me, view_channel=True, send_messages=True, connect=True, reason=ctx.reason)
+        except discord.HTTPException:
+            pass
+        await ch.set_permissions(ctx.guild.default_role, view_channel=False, reason=ctx.reason)
+        for r in roles:
+            await ch.set_permissions(r, reason=ctx.reason, **grant)
+        return True, f"{ch.mention} is now only accessible to {names}"
+    if mode == "public":
+        await ch.set_permissions(ctx.guild.default_role, view_channel=None, reason=ctx.reason)
+        return True, f"{ch.mention} is visible to everyone again"
+    if mode == "hide":
+        for r in roles:
+            await ch.set_permissions(r, view_channel=False, reason=ctx.reason)
+        return True, f"Hid {ch.mention} from {names}"
+    if mode == "show":
+        for r in roles:
+            await ch.set_permissions(r, view_channel=True, reason=ctx.reason)
+        return True, f"{ch.mention} is now visible to {names}"
+    return False, f"Unknown access mode `{mode}`."
+
+async def act_lock(ctx, a, lock=True):
+    ch = pick_channel(ctx, a, TEXT_KINDS)
+    if not ch:
+        return False, "Couldn't find that text channel."
+    await ch.set_permissions(ctx.guild.default_role, send_messages=False if lock else None, reason=ctx.reason)
+    return True, f"{'Locked' if lock else 'Unlocked'} {ch.mention}"
+
+async def act_lock_channel(ctx, a):
+    return await act_lock(ctx, a, True)
+
+async def act_unlock_channel(ctx, a):
+    return await act_lock(ctx, a, False)
+
+async def act_slowmode(ctx, a):
+    ch = pick_channel(ctx, a, TEXT_KINDS)
+    if not ch:
+        return False, "Couldn't find that text channel."
+    secs = max(0, min(21600, _to_int(a.get("seconds"))))
+    await ch.edit(slowmode_delay=secs, reason=ctx.reason)
+    return True, f"Slowmode in {ch.mention}: {secs}s" if secs else f"Slowmode off in {ch.mention}"
+
+async def act_set_topic(ctx, a):
+    ch = pick_channel(ctx, a, TEXT_KINDS)
+    if not ch:
+        return False, "Couldn't find that text channel."
+    await ch.edit(topic=str(a.get("topic") or "")[:1024], reason=ctx.reason)
+    return True, f"Updated topic of {ch.mention}"
+
+async def act_move_channel(ctx, a):
+    ch = find_channel(ctx.guild, a.get("channel"))
+    cat = find_channel(ctx.guild, a.get("category"), (discord.CategoryChannel,))
+    if not ch or isinstance(ch, discord.CategoryChannel):
+        return False, "Couldn't find that channel."
+    if not cat:
+        return False, "Couldn't find that category."
+    await ch.edit(category=cat, reason=ctx.reason)
+    return True, f"Moved {ch.mention} into **{cat.name}**"
+
+async def act_create_role(ctx, a):
+    name = str(a.get("name") or "").strip()[:100]
+    if not name:
+        return False, "Missing role name."
+    role = await ctx.guild.create_role(
+        name=name, colour=parse_color(a.get("color")) or discord.Colour.default(),
+        hoist=bool(a.get("hoist", False)), mentionable=bool(a.get("mentionable", True)), reason=ctx.reason)
+    return True, f"Created role {role.mention}"
+
+async def act_delete_role(ctx, a):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    name = role.name
+    await role.delete(reason=ctx.reason)
+    return True, f"Deleted role **{name}**"
+
+async def act_rename_role(ctx, a):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    new = str(a.get("name") or "").strip()[:100]
+    if not new:
+        return False, "Missing the new name."
+    await role.edit(name=new, reason=ctx.reason)
+    return True, f"Renamed role to {role.mention}"
+
+async def act_role_color(ctx, a):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    col = parse_color(a.get("color"))
+    if col is None:
+        return False, "I didn't understand that color."
+    await role.edit(colour=col, reason=ctx.reason)
+    return True, f"Recolored {role.mention}"
+
+async def _roles_bulk(ctx, a, give):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    refs = as_list(a.get("members") or a.get("member"))
+    if not refs:
+        return False, "Who should get it?"
+    done, failed = [], []
+    for ref in refs[:25]:
+        m = find_member(ctx.guild, ref)
+        if not m:
+            failed.append(str(ref))
+            continue
+        try:
+            if give:
+                await m.add_roles(role, reason=ctx.reason)
+            else:
+                await m.remove_roles(role, reason=ctx.reason)
+            done.append(m.mention)
+        except discord.HTTPException:
+            failed.append(m.display_name)
+    verb = "Gave" if give else "Removed"
+    prep = "to" if give else "from"
+    if not done:
+        return False, f"Couldn't update anyone ({', '.join(failed)})."
+    text = f"{verb} {role.mention} {prep} {', '.join(done)}"
+    if failed:
+        text += f" (skipped: {', '.join(failed)})"
+    return True, text
+
+async def act_give_role(ctx, a):
+    return await _roles_bulk(ctx, a, True)
+
+async def act_remove_role(ctx, a):
+    return await _roles_bulk(ctx, a, False)
+
+async def act_kick(ctx, a):
+    m = find_member(ctx.guild, a.get("member"))
+    ok, why = check_member(ctx, m)
+    if not ok:
+        return False, why
+    await m.kick(reason=str(a.get("reason") or ctx.reason)[:400])
+    return True, f"Kicked **{m.display_name}**"
+
+async def act_ban(ctx, a):
+    ref = a.get("member") or a.get("user")
+    m = find_member(ctx.guild, ref)
+    reason = str(a.get("reason") or ctx.reason)[:400]
+    if m:
+        ok, why = check_member(ctx, m)
+        if not ok:
+            return False, why
+        await m.ban(reason=reason)
+        return True, f"Banned **{m.display_name}**"
+    uid = _id_from(ref)
+    if uid:
+        await ctx.guild.ban(discord.Object(id=uid), reason=reason)
+        return True, f"Banned user ID `{uid}`"
+    return False, "Couldn't find that member."
+
+async def act_unban(ctx, a):
+    uid = _id_from(a.get("user") or a.get("member"))
+    if not uid:
+        return False, "Give me the user ID to unban."
+    await ctx.guild.unban(discord.Object(id=uid), reason=ctx.reason)
+    return True, f"Unbanned `{uid}`"
+
+async def act_timeout(ctx, a):
+    m = find_member(ctx.guild, a.get("member"))
+    ok, why = check_member(ctx, m)
+    if not ok:
+        return False, why
+    mins = max(1, min(40320, _to_int(a.get("minutes"), 10)))
+    await m.timeout(datetime.timedelta(minutes=mins), reason=str(a.get("reason") or ctx.reason)[:400])
+    return True, f"Timed out **{m.display_name}** for {mins} min"
+
+async def act_untimeout(ctx, a):
+    m = find_member(ctx.guild, a.get("member"))
+    ok, why = check_member(ctx, m)
+    if not ok:
+        return False, why
+    await m.timeout(None, reason=ctx.reason)
+    return True, f"Removed timeout from **{m.display_name}**"
+
+async def act_nickname(ctx, a):
+    m = find_member(ctx.guild, a.get("member"))
+    ok, why = check_member(ctx, m)
+    if not ok:
+        return False, why
+    nick = str(a.get("nickname") or "").strip()[:32] or None
+    await m.edit(nick=nick, reason=ctx.reason)
+    return True, f"Nickname of {m.mention}: **{nick}**" if nick else f"Reset nickname of {m.mention}"
+
+async def act_purge(ctx, a):
+    ch = pick_channel(ctx, a, TEXT_KINDS)
+    if not ch:
+        return False, "Couldn't find that text channel."
+    n = max(1, min(100, _to_int(a.get("count"), 10)))
+    target = find_member(ctx.guild, a.get("member")) if a.get("member") else None
+    before = ctx.msg if ch.id == ctx.msg.channel.id else None
+    deleted = await ch.purge(limit=n, before=before, check=(lambda m: m.author.id == target.id) if target else None)
+    return True, f"Deleted {len(deleted)} message(s) in {ch.mention}"
+
+async def act_send_message(ctx, a):
+    ch = pick_channel(ctx, a, TEXT_KINDS)
+    text = str(a.get("text") or "").strip()
+    if not ch:
+        return False, "Couldn't find that text channel."
+    if not text:
+        return False, "Nothing to send."
+    await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
+    return True, f"Sent your message in {ch.mention}"
+
+ADMIN_ACTIONS = {
+    "create_channel": act_create_channel, "delete_channel": act_delete_channel,
+    "rename_channel": act_rename_channel, "channel_access": act_channel_access,
+    "lock_channel": act_lock_channel, "unlock_channel": act_unlock_channel,
+    "slowmode": act_slowmode, "set_topic": act_set_topic, "move_channel": act_move_channel,
+    "create_role": act_create_role, "delete_role": act_delete_role, "rename_role": act_rename_role,
+    "role_color": act_role_color, "give_role": act_give_role, "remove_role": act_remove_role,
+    "kick": act_kick, "ban": act_ban, "unban": act_unban,
+    "timeout": act_timeout, "untimeout": act_untimeout, "nickname": act_nickname,
+    "purge": act_purge, "send_message": act_send_message,
+}
+
+# ---------- planning / confirmation / execution ----------
+def needs_confirm(a):
+    act = a.get("action")
+    return act in ALWAYS_CONFIRM or (act == "purge" and _to_int(a.get("count"), 10) > 20)
+
+def summarize(a):
+    label = str(a.get("action", "?")).replace("_", " ").capitalize()
+    bits = []
+    for k, v in a.items():
+        if k == "action" or v in (None, "", []):
+            continue
+        bits.append(f"{k}: {', '.join(map(str, v)) if isinstance(v, list) else v}")
+    detail = ", ".join(bits)[:150]
+    return f"**{label}**" + (f" ({detail})" if detail else "")
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.value = None
+
+    async def _gate(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Not your request.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, btn):
+        if not await self._gate(interaction):
+            return
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, btn):
+        if not await self._gate(interaction):
+            return
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
+
+async def parse_admin_request(txt):
+    """Returns list of actions ([] = not an admin request) or None if every AI provider failed."""
+    messages = [{"role": "system", "content": ADMIN_PARSER_PROMPT}, {"role": "user", "content": txt}]
+    raw, _, _ = await llm_complete(messages, groq_tokens=1500, or_tokens=800, temperature=0)
+    if not raw:
+        return None
+    s, e = raw.find("{"), raw.rfind("}")
+    if s == -1 or e <= s:
+        return []
+    try:
+        data = json.loads(raw[s:e + 1])
+    except ValueError:
+        return []
+    acts = data.get("actions") if isinstance(data, dict) else None
+    if not isinstance(acts, list):
+        return []
+    return [a for a in acts if isinstance(a, dict) and isinstance(a.get("action"), str)][:6]
+
+async def run_admin_flow(msg, txt):
+    uid = msg.author.id
+    try:
+        async with msg.channel.typing():
+            plan = await parse_admin_request(txt)
+
+        if plan is None:
+            await safe_reply(msg, "⚠️ Couldn't reach my brain right now, try again in a sec.")
+            return
+
+        if not plan:
+            # Not actually an admin request: treat it as normal chat.
+            user_cooldowns[uid] = time.time()
+            await ai_queue.put((msg, txt, uid))
+            return
+
+        if any(needs_confirm(a) for a in plan):
+            emb = discord.Embed(title="Confirm these actions",
+                                description="\n".join(f"• {summarize(a)}" for a in plan), color=0xF1C40F)
+            emb.set_footer(text="Confirm within 30 seconds")
+            view = ConfirmView(uid)
+            prompt = await safe_reply(msg, embed=emb, view=view)
+            if prompt is None:
+                return
+            await view.wait()
+            if not view.value:
+                emb.title = "Cancelled" if view.value is False else "Timed out"
+                emb.color = 0x95A5A6
+                emb.set_footer(text="Nothing was changed")
+                try:
+                    await prompt.edit(embed=emb, view=None)
+                except discord.HTTPException:
+                    pass
+                return
+            try:
+                await prompt.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+        ctx = AdminCtx(msg)
+        lines, ok_count = [], 0
+        for a in plan:
+            name = a["action"].strip().lower()
+            handler = ADMIN_ACTIONS.get(name)
+            if not handler:
+                lines.append(f"❌ I can't do `{name}`.")
+                continue
+            perm = PERM_FOR.get(name)
+            if perm and not has_perm(msg.author, perm):
+                lines.append(f"❌ You need the **{perm.replace('_', ' ')}** permission for that.")
+                continue
+            try:
+                ok, text = await handler(ctx, a)
+            except discord.Forbidden:
+                ok, text = False, "I'm missing permissions for that (check my role position)."
+            except discord.HTTPException as e:
+                print(f"admin action {name} failed:", e)
+                ok, text = False, "Discord rejected that request."
+            except Exception as e:
+                print(f"admin action {name} crashed:", e)
+                ok, text = False, "Something broke on that one."
+            lines.append(f"{'✅' if ok else '❌'} {text}")
+            ok_count += 1 if ok else 0
+
+        if ok_count == len(plan):
+            title, color = "Done", 0x2ECC71
+        elif ok_count == 0:
+            title, color = "Couldn't do that", 0xE74C3C
+        else:
+            title, color = "Partly done", 0xE67E22
+        emb = discord.Embed(title=title, description="\n".join(lines)[:3900], color=color)
+        emb.set_footer(text=f"Requested by {msg.author.display_name}")
+        await safe_reply(msg, embed=emb)
+
+        if ok_count:
+            await log_action(msg.guild, "AI Admin Action",
+                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500])
+    except Exception as e:
+        print("run_admin_flow error:", e)
+        await dm_owners(f"⚠️ **Admin flow exception:** `{e}`")
+        await safe_reply(msg, "⚠️ Something went wrong, nothing else was changed.")
 
 # ==========================================
-# BACKGROUND QUEUE WORKER (GROQ -> OPENROUTER)
+# LLM HELPER + BACKGROUND QUEUE WORKER (GROQ -> OPENROUTER)
 # ==========================================
 GIF_RE = re.compile(r'https?://[^\s<>)]+?\.(?:gif|webp|png|jpg)(?![\w/])(?:\?[^\s<>)]*)?', re.IGNORECASE)
+
+def clean_ai_text(t):
+    """Tidy model output: no stray headings, trailing spaces or big blank gaps."""
+    t = t.replace("\r", "")
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=None):
+    """Try Groq first, then OpenRouter free models. Returns (text_or_None, groq_err, openrouter_err).
+    (gpt-oss models spend tokens on hidden reasoning, so groq_tokens must be generous.)"""
+    extra = {} if temperature is None else {"temperature": temperature}
+    ans, groq_err, openrouter_err = None, "", ""
+
+    if groq_client:
+        for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+            try:
+                res = await groq_client.chat.completions.create(
+                    model=groq_model, messages=messages, max_tokens=groq_tokens, **extra)
+                if res.choices and (res.choices[0].message.content or "").strip():
+                    return res.choices[0].message.content.strip(), groq_err, openrouter_err
+            except Exception as e:
+                groq_err = str(e)
+                print(f"Groq ({groq_model}) error:", e)
+    else:
+        groq_err = "GROQ_API_KEY not set"
+
+    if openrouter_client:
+        for open_model in OPENROUTER_FREE_MODELS:
+            try:
+                res = await openrouter_client.chat.completions.create(
+                    model=open_model, messages=messages, max_tokens=or_tokens,
+                    extra_headers={"HTTP-Referer": "https://github.com", "X-Title": "Discord Bot"},
+                    **extra)
+                if res.choices and (res.choices[0].message.content or "").strip():
+                    return res.choices[0].message.content.strip(), groq_err, openrouter_err
+            except Exception as e:
+                openrouter_err = str(e)
+                print(f"OpenRouter ({open_model}) error:", e)
+    else:
+        openrouter_err = "OPENROUTER_API_KEY not set"
+
+    return ans, groq_err, openrouter_err
 
 async def process_ai_queue():
     while True:
@@ -529,9 +1159,6 @@ async def process_ai_queue():
             async with msg.channel.typing():
                 await asyncio.sleep(4)
 
-                if msg.guild and await handle_ai_server_action(msg, txt):
-                    continue
-
                 if uid not in ai_history:
                     ai_history[uid] = []
 
@@ -539,63 +1166,18 @@ async def process_ai_queue():
                 ai_history[uid] = ai_history[uid][-6:]
 
                 messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
-
-                ans = None
-                groq_err = ""
-                openrouter_err = ""
-
-                # STEP 1: Try Groq API
-                # (gpt-oss models spend tokens on hidden reasoning, so max_tokens must be generous
-                #  or the visible reply comes back empty.)
-                if groq_client:
-                    for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
-                        try:
-                            res = await groq_client.chat.completions.create(
-                                model=groq_model,
-                                messages=messages,
-                                max_tokens=1024,
-                            )
-                            if res.choices and (res.choices[0].message.content or "").strip():
-                                ans = res.choices[0].message.content.strip()
-                                break
-                        except Exception as e:
-                            groq_err = str(e)
-                            print(f"Groq ({groq_model}) error:", e)
-                else:
-                    groq_err = "GROQ_API_KEY not set"
-
-                # STEP 2: Fall back to OpenRouter Free Models
-                if not ans and openrouter_client:
-                    for open_model in OPENROUTER_FREE_MODELS:
-                        try:
-                            res = await openrouter_client.chat.completions.create(
-                                model=open_model,
-                                messages=messages,
-                                max_tokens=400,
-                                extra_headers={
-                                    "HTTP-Referer": "https://github.com",
-                                    "X-Title": "Discord Bot",
-                                }
-                            )
-                            if res.choices and (res.choices[0].message.content or "").strip():
-                                ans = res.choices[0].message.content.strip()
-                                break
-                        except Exception as e:
-                            openrouter_err = str(e)
-                            print(f"OpenRouter ({open_model}) error:", e)
-                            continue
-                elif not ans:
-                    openrouter_err = "OPENROUTER_API_KEY not set"
+                ans, groq_err, openrouter_err = await llm_complete(messages)
 
                 if not ans:
                     # Send detailed error logs directly to your Owner DM
-                    error_details = f"⚠️ **AI Fallback Failed**\n• Groq Error: `{groq_err or 'None'}`\n• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`"
-                    await dm_owners(error_details)
-
+                    await dm_owners(
+                        f"⚠️ **AI Fallback Failed**\n• Groq Error: `{groq_err or 'None'}`\n"
+                        f"• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`")
                     # Send clean generic message in public channel
                     await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
 
+                ans = clean_ai_text(ans)
                 ai_history[uid].append({"role": "assistant", "content": ans})
 
                 if len(ans) > 2000:
@@ -626,6 +1208,8 @@ async def process_ai_queue():
 # ==========================================
 # ON MESSAGE EVENT (AI CHATBOT & GUILD CHECKS)
 # ==========================================
+_bg_tasks = set()
+
 async def handle_ai_trigger(msg):
     global bot_muted
 
@@ -660,6 +1244,15 @@ async def handle_ai_trigger(msg):
         return
 
     uid = msg.author.id
+
+    # Server-admin requests from staff skip the chat cooldown/queue and run on their own.
+    # (Non-staff just get normal chat; the bot can't be talked into admin actions.)
+    if msg.guild and is_staff(msg.author) and looks_like_admin_request(msg, txt):
+        task = asyncio.create_task(run_admin_flow(msg, txt))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return
+
     now = time.time()
 
     # Individual 20-second Per-User Cooldown Check
@@ -1354,6 +1947,29 @@ async def spawn_lb(interaction: discord.Interaction):
 
     await update_leaderboard(interaction.guild)
     await interaction.response.send_message("Leaderboard spawned.", ephemeral=True)
+
+@bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list")
+async def trust_cmd(interaction: discord.Interaction, user: discord.User):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    lst = db.setdefault("trusted_users", [])
+    if user.id in lst:
+        lst.remove(user.id)
+        text = f"Removed {user.mention} from the admin list."
+    else:
+        lst.append(user.id)
+        text = f"Added {user.mention} to the admin list."
+    save_db(db)
+    await interaction.response.send_message(text, ephemeral=True)
+
+@bot.tree.command(name="trusted_list", description="Owner only: show who can use admin actions")
+async def trusted_list_cmd(interaction: discord.Interaction):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    ids = list(dict.fromkeys(BOT_OWNER_IDS + ALLOWED_USER_IDS + db.get("trusted_users", [])))
+    await interaction.response.send_message("Trusted: " + (", ".join(f"<@{i}>" for i in ids) or "none") + "\nServer admins can always use it too.", ephemeral=True)
 
 tk = os.environ.get("BOT_TOKEN")
 if tk:
