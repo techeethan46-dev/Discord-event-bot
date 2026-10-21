@@ -361,8 +361,10 @@ async def process_ai_queue():
                 messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
 
                 ans = None
+                groq_err = ""
+                openrouter_err = ""
 
-                # STEP 1: Try Groq API first (1,000 Daily Requests)
+                # STEP 1: Try Groq API (Primary - openai/gpt-oss-20b)
                 try:
                     res = await groq_client.chat.completions.create(
                         model="openai/gpt-oss-20b",
@@ -371,9 +373,10 @@ async def process_ai_queue():
                     )
                     ans = res.choices[0].message.content
                 except Exception as e:
-                    print("Groq Fallback Triggered:", e)
+                    groq_err = str(e)
+                    print("Groq Error:", e)
 
-                # STEP 2: Fall back to OpenRouter Free Models (200+ Daily Requests)
+                # STEP 2: Fall back to OpenRouter Free Models
                 if not ans:
                     for model_name in OPENROUTER_FREE_MODELS:
                         try:
@@ -381,16 +384,21 @@ async def process_ai_queue():
                                 model=model_name,
                                 messages=messages,
                                 max_tokens=250,
+                                extra_headers={
+                                    "HTTP-Referer": "https://github.com",
+                                    "X-Title": "Discord Bot",
+                                }
                             )
                             ans = res.choices[0].message.content
                             if ans:
                                 break
                         except Exception as e:
-                            print(f"OpenRouter ({model_name}) Fallback Triggered:", e)
+                            openrouter_err = str(e)
+                            print(f"OpenRouter ({model_name}) error:", e)
                             continue
 
                 if not ans:
-                    await msg.reply("⚠️ All free AI services are temporarily on cooldown. Try again in a bit!")
+                    await msg.reply(f"⚠️ **AI Error:** Groq: `{groq_err or 'No response'}` | OpenRouter: `{openrouter_err or 'No response'}`")
                     continue
 
                 ai_history[uid].append({"role": "assistant", "content": ans})
