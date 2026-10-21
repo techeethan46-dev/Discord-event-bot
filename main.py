@@ -32,24 +32,23 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# 100% FREE MULTI-PROVIDER AI CONFIGURATION
-# (No Credit Cards / No Paid Accounts Required)
+# MULTI-PROVIDER AI CONFIGURATION
 # ==========================================
-
-# Primary: Groq API
+# 1. Groq Client
 groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Secondary Fallback: OpenRouter API (Strictly Free Models)
+# 2. OpenRouter Client
 openrouter_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.environ.get("OPENROUTER_API_KEY")
 )
 
+# OpenRouter Auto-Router + Verified 2026 Free Endpoints
 OPENROUTER_FREE_MODELS = [
+    "openrouter/free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemma-2-9b-it:free"
+    "qwen/qwen3-coder:free",
+    "nvidia/nemotron-3-super-120b-a12b:free"
 ]
 
 ai_history = {}
@@ -364,24 +363,27 @@ async def process_ai_queue():
                 groq_err = ""
                 openrouter_err = ""
 
-                # STEP 1: Try Groq API (Primary - openai/gpt-oss-20b)
-                try:
-                    res = await groq_client.chat.completions.create(
-                        model="openai/gpt-oss-20b",
-                        messages=messages,
-                        max_tokens=250,
-                    )
-                    ans = res.choices[0].message.content
-                except Exception as e:
-                    groq_err = str(e)
-                    print("Groq Error:", e)
+                # STEP 1: Try Groq API (openai/gpt-oss-120b then openai/gpt-oss-20b)
+                for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+                    try:
+                        res = await groq_client.chat.completions.create(
+                            model=groq_model,
+                            messages=messages,
+                            max_tokens=250,
+                        )
+                        if res.choices and res.choices[0].message.content:
+                            ans = res.choices[0].message.content
+                            break
+                    except Exception as e:
+                        groq_err = str(e)
+                        print(f"Groq ({groq_model}) error:", e)
 
                 # STEP 2: Fall back to OpenRouter Free Models
                 if not ans:
-                    for model_name in OPENROUTER_FREE_MODELS:
+                    for open_model in OPENROUTER_FREE_MODELS:
                         try:
                             res = await openrouter_client.chat.completions.create(
-                                model=model_name,
+                                model=open_model,
                                 messages=messages,
                                 max_tokens=250,
                                 extra_headers={
@@ -389,16 +391,16 @@ async def process_ai_queue():
                                     "X-Title": "Discord Bot",
                                 }
                             )
-                            ans = res.choices[0].message.content
-                            if ans:
+                            if res.choices and res.choices[0].message.content:
+                                ans = res.choices[0].message.content
                                 break
                         except Exception as e:
                             openrouter_err = str(e)
-                            print(f"OpenRouter ({model_name}) error:", e)
+                            print(f"OpenRouter ({open_model}) error:", e)
                             continue
 
                 if not ans:
-                    await msg.reply(f"⚠️ **AI Error:** Groq: `{groq_err or 'No response'}` | OpenRouter: `{openrouter_err or 'No response'}`")
+                    await msg.reply(f"⚠️ **AI Error:** Groq: `{groq_err or 'Failed'}` | OpenRouter: `{openrouter_err or 'Failed'}`")
                     continue
 
                 ai_history[uid].append({"role": "assistant", "content": ans})
