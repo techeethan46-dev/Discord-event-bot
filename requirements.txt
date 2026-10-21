@@ -3,4 +3,4 @@ flask
 pymongo
 dnspython
 groq
-
+openai
