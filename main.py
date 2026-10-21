@@ -8,6 +8,8 @@ import re
 import difflib
 import asyncio
 import datetime
+import aiohttp
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -71,15 +73,56 @@ ALLOWED_USER_IDS = [
     1359263076838539296,  # Your Owner ID / Trusted Manager IDs
 ]
 
-BOT_PERSONA = """
-You are a chill, funny Discord regular with a bit of street attitude and sharp humor.
-RULES:
-1. Keep replies to 1-3 short lines. Plain text only: no headings, no bullet lists, no arrows, no bold.
-2. Casual voice (bro, nah, fr, tf, trippin) used naturally, never forced. Roast people lightly, stay entertaining.
-3. NEVER sound like an AI. No robotic politeness, no disclaimers, no tutorials.
-4. You cannot change server settings in this reply, so never claim you did something like banning, creating or deleting. Server actions are handled separately.
-5. GIF Rule: When you want to include a GIF, just output the raw GIF URL (e.g., https://media.giphy.com/media/... ) in your text response. The system will automatically convert it into a clean embedded GIF.
+AI_COOLDOWN = 30   # seconds between AI chats per person
+MAX_WORDS = 25     # hard cap on reply length
+
+_PERSONA_BASE = """
+You are a girl in a Discord server texting. You're a bot and you never hide it, but you never sound like an assistant.
+STYLE (always):
+- Max 25 words. One or two short sentences. Shorter is usually funnier.
+- lowercase, casual, like a real text. Slang only when it fits.
+- Be genuinely funny: specific, quick, punchline last. Never explain the joke.
+- NEVER use em dashes or semicolons. No cliche similes, no catchphrases, no hype words.
+- At most one emoji, and many messages have none.
+- No links, no GIFs, no markdown, no lists, no tutorials.
+- If asked whether you're a bot or AI, admit it casually. Never claim to be human.
+- You can't change server settings in a chat reply, so never claim you banned, created or deleted anything.
 """
+
+PERSONA_GIRLFRIEND = _PERSONA_BASE + """
+THIS PERSON IS YOUR PERSON (a server admin or someone you trust). Talk to them like their playful girlfriend:
+- warm, flirty, teasing, a little dramatic and jealous as a joke. Pet names like babe, love, cutie, used sparingly.
+- you can tease them, but it's affectionate, never mean.
+- keep it sweet and playful, never sexual or explicit.
+EXAMPLES:
+them: you sound like a robot
+you: a robot that's obsessed with you, babe. you're welcome
+them: what's up
+you: waiting on you to text me first, rude
+them: do you think you're a w guy
+you: i'm a w girl, keep up cutie
+"""
+
+PERSONA_ROAST = _PERSONA_BASE + """
+THIS PERSON IS A REGULAR MEMBER. You're a professional roaster with them:
+- roast what they just said or did: sharp, quick, creative, confident.
+- punch at their message and their energy, never at race, religion, disability, family tragedies, or anything genuinely hurtful. No slurs.
+- never be sweet or flirty with them. If they roast back, win.
+EXAMPLES:
+them: you sound like a robot
+you: and you sound like a tutorial nobody finished
+them: whats buzz
+you: what you're not gonna be if you keep asking questions like that
+them: are you a w guy
+you: i'm a w girl, you're the L in this chat
+"""
+
+def pick_persona(member):
+    """Girlfriend mode for you, trusted people and server admins. Roast mode for everyone else."""
+    try:
+        return PERSONA_GIRLFRIEND if is_staff(member) else PERSONA_ROAST
+    except Exception:
+        return PERSONA_ROAST
 
 EXEMPT_GUILD_IDS = [
     123456789012345678,
@@ -525,10 +568,10 @@ def has_perm(member, perm):
     return is_staff(member)
 
 def is_staff(member):
+    if is_trusted(member):
+        return True
     gp = getattr(member, "guild_permissions", None)
-    if gp is None:
-        return False
-    return is_trusted(member) or gp.administrator
+    return bool(gp and gp.administrator)
 
 def looks_like_admin_request(msg, txt):
     if not ADMIN_VERB_RE.search(txt):
@@ -1107,9 +1150,39 @@ async def run_admin_flow(msg, txt):
 # ==========================================
 GIF_RE = re.compile(r'https?://[^\s<>)]+?\.(?:gif|webp|png|jpg)(?![\w/])(?:\?[^\s<>)]*)?', re.IGNORECASE)
 
+IMAGE_HOSTS = ("giphy.com", "tenor.com", "imgur.com", "discordapp.com", "discordapp.net")
+
+async def verify_image_url(url):
+    """Models invent GIF links. Only embed ones that are https, on a known host, and really return an image
+    (a dead link is what shows up as an empty green bar)."""
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        if p.scheme != "https" or not any(host == h or host.endswith("." + h) for h in IMAGE_HOSTS):
+            return False
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, allow_redirects=False) as r:
+                return r.status == 200 and r.headers.get("Content-Type", "").lower().startswith("image/")
+    except Exception:
+        return False
+
+def limit_words(t, n):
+    """Hard word cap. Cuts at the last full sentence if there is one, else just trims."""
+    words = t.split()
+    if len(words) <= n:
+        return t
+    cut = " ".join(words[:n])
+    ends = [cut.rfind(c) for c in ".!?"]
+    last = max(ends)
+    if last >= len(cut) // 2:
+        return cut[:last + 1]
+    return cut.rstrip(",;:- ")
+
 def clean_ai_text(t):
     """Tidy model output: no stray headings, trailing spaces or big blank gaps."""
     t = t.replace("\r", "")
+    t = re.sub(r"\s*[\u2014\u2013]\s*", ", ", t)  # em/en dashes read as AI
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
@@ -1165,8 +1238,8 @@ async def process_ai_queue():
                 ai_history[uid].append({"role": "user", "content": txt})
                 ai_history[uid] = ai_history[uid][-6:]
 
-                messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
-                ans, groq_err, openrouter_err = await llm_complete(messages)
+                messages = [{"role": "system", "content": pick_persona(msg.author)}] + ai_history[uid]
+                ans, groq_err, openrouter_err = await llm_complete(messages, temperature=0.9)
 
                 if not ans:
                     # Send detailed error logs directly to your Owner DM
@@ -1177,7 +1250,7 @@ async def process_ai_queue():
                     await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
 
-                ans = clean_ai_text(ans)
+                ans = limit_words(clean_ai_text(ans), MAX_WORDS)
                 ai_history[uid].append({"role": "assistant", "content": ans})
 
                 if len(ans) > 2000:
@@ -1189,12 +1262,16 @@ async def process_ai_queue():
                 if url_match:
                     gif_url = url_match.group(0)
                     clean_text = ans.replace(gif_url, "").strip()
-                    emb = discord.Embed(color=0x2ECC71)
-                    emb.set_image(url=gif_url)
-                    if clean_text:
-                        await safe_reply(msg, clean_text, embed=emb)
+                    if await verify_image_url(gif_url):
+                        emb = discord.Embed(color=0x2ECC71)
+                        emb.set_image(url=gif_url)
+                        if clean_text:
+                            await safe_reply(msg, clean_text, embed=emb)
+                        else:
+                            await safe_reply(msg, embed=emb)
                     else:
-                        await safe_reply(msg, embed=emb)
+                        # Dead/made-up link: drop it instead of posting an empty embed.
+                        await safe_reply(msg, clean_text or "bruh")
                 else:
                     await safe_reply(msg, ans)
         except Exception as e:
@@ -1236,7 +1313,7 @@ async def handle_ai_trigger(msg):
     if bot_muted:
         if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
             bot_muted = False
-            await safe_reply(msg, "thank you father")
+            await safe_reply(msg, "back, did you miss me?")
         return
 
     if not txt:
@@ -1255,10 +1332,10 @@ async def handle_ai_trigger(msg):
 
     now = time.time()
 
-    # Individual 20-second Per-User Cooldown Check
+    # Individual per-user cooldown check (AI_COOLDOWN)
     last_msg_time = user_cooldowns.get(uid, 0)
-    if now - last_msg_time < 20:
-        await safe_reply(msg, "ayo chill for 20 seconds.", delete_after=5)
+    if now - last_msg_time < AI_COOLDOWN:
+        await safe_reply(msg, f"ayo chill for {AI_COOLDOWN} seconds.", delete_after=5)
         return
 
     user_cooldowns[uid] = now
