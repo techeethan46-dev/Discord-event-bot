@@ -4,8 +4,10 @@ import discord
 import os
 import json
 import time
+import re
 import difflib
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from discord import app_commands
 from discord.ext import commands, tasks
 import pymongo
@@ -21,7 +23,7 @@ def home():
     return "ok"
 
 def run_server():
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def keep_alive():
     Thread(target=run_server, daemon=True).start()
@@ -31,33 +33,41 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Never let AI text (or a prompt injection) ping @everyone / roles / random users.
+SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True)
+
 # ==========================================
 # MULTI-PROVIDER AI CONFIGURATION
 # ==========================================
-# 1. Groq Client
-groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-# 2. OpenRouter Client
+# Clients are only built if the key exists, so a missing key can't crash startup.
+groq_client = AsyncGroq(api_key=GROQ_KEY) if GROQ_KEY else None
 openrouter_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY")
-)
+    api_key=OPENROUTER_KEY
+) if OPENROUTER_KEY else None
 
-# OpenRouter Auto-Router + Verified 2026 Free Endpoints
 OPENROUTER_FREE_MODELS = [
     "openrouter/free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen3-coder:free",
-    "nvidia/nemotron-3-super-120b-a12b:free"
+    "qwen/qwen-2.5-72b-instruct:free",
+    "mistralai/mistral-7b-instruct:free"
 ]
 
 ai_history = {}
 user_cooldowns = {}
 ai_queue = asyncio.Queue()
 bot_muted = False
+ai_worker_task = None
 
 BOT_OWNER_IDS = [
     1359263076838539296,  # Your User ID
+]
+
+ALLOWED_USER_IDS = [
+    1359263076838539296,  # Your Owner ID / Trusted Manager IDs
 ]
 
 BOT_PERSONA = """
@@ -67,10 +77,13 @@ STRICT RULES:
 2. Tone: Have a street attitude (use bro, tf, ain't no way, trippin, nah, fr), but keep it natural. You are not a try-hard gangster, just a chill guy who roasts people.
 3. NEVER sound like an AI. Zero robotic politeness.
 4. Banter aggressively, disagree, and call people out if they act weird or say dumb things. Don't hold back.
-5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (25% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
+5. GIF Rule: When you want to include a GIF, just output the raw GIF URL (e.g., https://media.giphy.com/media/... or tenor link) in your text response. The system will automatically convert it into a clean embedded GIF.
 """
 
-EXEMPT_GUILD_IDS = [123456789012345678]
+EXEMPT_GUILD_IDS = [
+    123456789012345678,
+    1360298446937919711   # Exempt server ID
+]
 BLACKLISTED_GUILD_IDS = [111122223333444455]
 
 DATA_FILE = "events_data.json"
@@ -86,8 +99,10 @@ def load_db():
             doc = db_col.find_one({"_id": "main"})
             if doc: 
                 return json.loads(doc["json_data"])
-        except:
-            pass
+        except Exception as e:
+            # If Mongo is configured but unreachable, DO NOT fall back to an empty DB:
+            # the next save would overwrite your real data with an empty one.
+            raise RuntimeError(f"Mongo load failed, refusing to start so data isn't overwritten: {e}")
 
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -95,19 +110,35 @@ def load_db():
 
     return {"server_config": {}, "events": {}, "blacklists": {}, "hosts": {}}
 
-def save_db(data):
+# Single worker thread: writes never block the event loop and always land in order.
+_db_executor = ThreadPoolExecutor(max_workers=1)
+
+def _write_db(payload):
     if db_col is not None:
         try:
             db_col.replace_one(
                 {"_id": "main"}, 
-                {"_id": "main", "json_data": json.dumps(data)}, 
+                {"_id": "main", "json_data": payload}, 
                 upsert=True
             )
         except Exception as e:
             print("db save error:", e)
+    try:
+        with open(DATA_FILE, "w") as f:
+            f.write(payload)
+    except Exception as e:
+        print("file save error:", e)
 
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+def save_db(data):
+    # Serialize on the calling thread (fast, and safe from concurrent mutation),
+    # then hand the slow network/disk write to the worker thread.
+    payload = json.dumps(data)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _write_db(payload)
+        return
+    _db_executor.submit(_write_db, payload)
 
 db = load_db()
 for k in ["server_config", "events", "blacklists", "hosts"]:
@@ -161,13 +192,83 @@ def find_event(msg_id):
             return key, info
     return None, None
 
-def is_admin_or_host(interaction):
-    if interaction.user.guild_permissions.administrator: 
+def event_in_guild(info, guild_id):
+    # Old events have no guild_id saved, so they stay visible everywhere (as before).
+    return info.get("guild_id") in (None, guild_id)
+
+def is_authorized_manager(member):
+    if member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS:
         return True
-    role_id = get_config(interaction.guild_id).get("host_role")
-    if role_id and role_id in [r.id for r in interaction.user.roles]:
+    perms = getattr(member, "guild_permissions", None)
+    if perms and perms.administrator:
         return True
+    guild = getattr(member, "guild", None)
+    if guild:
+        host_role = get_config(guild.id).get("host_role")
+        if host_role and any(r.id == host_role for r in getattr(member, "roles", [])):
+            return True
     return False
+
+def is_vip(member, guild_id):
+    """Booster, VIP role, or admin: may hold Superpower nations."""
+    if member is None:
+        return False
+    if member.premium_since or member.guild_permissions.administrator:
+        return True
+    sp_role = get_config(guild_id).get("superpower_role")
+    return bool(sp_role) and any(r.id == sp_role for r in member.roles)
+
+async def safe_reply(msg, content=None, **kwargs):
+    """Reply without ever raising (a dead worker = a dead AI chat) and without live pings."""
+    kwargs.setdefault("allowed_mentions", SAFE_MENTIONS)
+    try:
+        return await msg.reply(content, **kwargs)
+    except discord.HTTPException:
+        try:
+            return await msg.channel.send(content, **kwargs)
+        except discord.HTTPException as e:
+            print("safe_reply failed:", e)
+            return None
+
+async def refresh_event_message(info, guild=None, remove_view=False):
+    ch = bot.get_channel(info.get("channel_id"))
+    ids = info.get("message_ids") or []
+    if not ch or not ids:
+        return False
+    try:
+        msg = await ch.fetch_message(ids[0])
+        kwargs = {"embeds": build_embed(info["display_name"], info, guild or ch.guild)}
+        if remove_view:
+            kwargs["view"] = None
+        await msg.edit(**kwargs)
+        return True
+    except discord.HTTPException as e:
+        print("refresh_event_message failed:", e)
+        return False
+
+async def add_event_role(guild, uid):
+    r_id = get_config(guild.id).get("event_role")
+    role = guild.get_role(r_id) if r_id else None
+    mem = guild.get_member(uid)
+    if role and mem:
+        try: await mem.add_roles(role)
+        except discord.HTTPException: pass
+
+async def remove_event_role(guild, uid):
+    r_id = get_config(guild.id).get("event_role")
+    role = guild.get_role(r_id) if r_id else None
+    mem = guild.get_member(uid)
+    if role and mem:
+        try: await mem.remove_roles(role)
+        except discord.HTTPException: pass
+
+async def dm_owners(text):
+    for owner_id in BOT_OWNER_IDS:
+        try:
+            owner = await bot.fetch_user(owner_id)
+            await owner.send(text[:1900])
+        except Exception as e:
+            print("Failed to DM owner:", e)
 
 async def log_action(guild, title, desc, color=0x3498DB):
     log_id = get_config(guild.id).get("log_channel")
@@ -177,7 +278,7 @@ async def log_action(guild, title, desc, color=0x3498DB):
         emb = discord.Embed(title=f"📝 {title}", description=desc, color=color)
         try: 
             await channel.send(embed=emb)
-        except: 
+        except discord.HTTPException: 
             pass
 
 async def update_leaderboard(guild):
@@ -192,7 +293,7 @@ async def update_leaderboard(guild):
 
     try: 
         msg = await ch.fetch_message(msg_id)
-    except: 
+    except discord.HTTPException: 
         return
 
     scores = []
@@ -211,7 +312,10 @@ async def update_leaderboard(guild):
     t_rt = sorted([h for h in scores if len(db["hosts"][h[0]]["ratings"]) >= 2], key=lambda x: x[3], reverse=True)[:3]
     emb.add_field(name="⭐ Top Rated", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[3]} ⭐" for i, h in enumerate(t_rt)]) or "Not enough data", inline=False)
 
-    await msg.edit(embed=emb)
+    try:
+        await msg.edit(embed=emb)
+    except discord.HTTPException as e:
+        print("leaderboard edit failed:", e)
 
 def build_embed(name, info, guild=None):
     start = info["start_time"]
@@ -297,25 +401,23 @@ async def process_waitlist(info, opened, guild, channel):
 
     banned = db["blacklists"].get(str(guild.id), [])
     sp_list = [s.title() for s in info.get("superpowers", [])]
-    sp_role = get_config(guild.id).get("superpower_role")
+    holders = {u["discord_id"] for u in res.values()}
 
     cands = []
     for w in list(wait):
         uid = w["discord_id"]
         c_name = w["country"].title()
 
-        if uid in banned or c_name in res:
-            if uid in banned: 
-                wait.remove(w)
+        # Drop banned users and anyone who already holds a spot (prevents double spots).
+        if uid in banned or uid in holders:
+            wait.remove(w)
             continue
 
-        if c_name in sp_list:
-            mem = guild.get_member(uid)
-            is_boost = mem.premium_since is not None if mem else False
-            has_role = sp_role in [r.id for r in mem.roles] if (mem and sp_role) else False
-            is_adm = mem.guild_permissions.administrator if mem else False
-            if not (is_boost or has_role or is_adm): 
-                continue
+        if c_name in res:
+            continue
+
+        if c_name in sp_list and not is_vip(guild.get_member(uid), guild.id):
+            continue
 
         cands.append(w)
 
@@ -327,30 +429,109 @@ async def process_waitlist(info, opened, guild, channel):
 
     info["reservations"][promo["country"].title()] = {"roblox": promo["roblox"], "discord_id": promo["discord_id"]}
 
-    r_id = get_config(guild.id).get("event_role")
-    if r_id:
-        role = guild.get_role(r_id)
-        mem = guild.get_member(promo["discord_id"])
-        if role and mem:
-            try: 
-                await mem.add_roles(role)
-            except: 
-                pass
+    await add_event_role(guild, promo["discord_id"])
 
     if channel:
         try: 
             await channel.send(f"🔔 <@{promo['discord_id']}> **{promo['country'].title()}** opened up and you got it!")
-        except: 
+        except discord.HTTPException: 
             pass
+
+# ==========================================
+# NATURAL LANGUAGE SERVER MANAGEMENT ENGINE
+# ==========================================
+CHANNEL_RE = re.compile(r"\b(?:create|make)\s+(?:a\s+|an\s+|new\s+)*(?:(voice|text)\s+)?channel\b", re.IGNORECASE)
+ROLE_RE = re.compile(r"\b(?:create|make)\s+(?:a\s+|an\s+|new\s+)*role\b(?!\s+model)", re.IGNORECASE)
+QUOTED_RE = re.compile(r'["\u201c]([^"\u201d]+)["\u201d]|(?<!\w)[\'\u2018]([^\'\u2019]+)[\'\u2019](?!\w)')
+
+def extract_name(txt, match):
+    q = QUOTED_RE.search(txt)
+    if q:
+        return (q.group(1) or q.group(2)).strip()[:100]
+    rest = re.sub(r"<[@#&!]+\d+>", "", txt[match.end():]).strip()
+    rest = re.sub(r"^(?:called|named|name)\s+", "", rest, flags=re.IGNORECASE)
+    parts = rest.split()
+    return parts[0][:100] if parts else None
+
+async def handle_ai_server_action(msg, txt):
+    ch_m = CHANNEL_RE.search(txt)
+    role_m = None if ch_m else ROLE_RE.search(txt)
+
+    # Not a server-management request: let normal AI chat handle it.
+    if not ch_m and not role_m:
+        return False
+
+    guild = msg.guild
+    if not is_authorized_manager(msg.author):
+        await safe_reply(msg, "nah bro, you ain't authorized to touch server channels or roles.")
+        return True
+
+    # 1. CHANNEL CREATION ACTION
+    if ch_m:
+        ch_name = extract_name(txt, ch_m)
+
+        if not ch_name:
+            await safe_reply(msg, "specify a channel name bro, like: `@Event bot make channel 'vip-lounge'`")
+            return True
+
+        target_roles = msg.role_mentions
+        overrides = {}
+
+        if target_roles:
+            overrides[guild.default_role] = discord.PermissionOverwrite(read_messages=False, connect=False)
+            for r in target_roles:
+                overrides[r] = discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True, connect=True, speak=True
+                )
+
+        ch_type = "voice" if ((ch_m.group(1) or "").lower() == "voice" or "voice" in txt.lower()) else "text"
+
+        try:
+            if ch_type == "voice":
+                new_ch = await guild.create_voice_channel(name=ch_name, overwrites=overrides)
+            else:
+                new_ch = await guild.create_text_channel(name=ch_name, overwrites=overrides)
+
+            access_str = f"locked to {', '.join([r.mention for r in target_roles])}" if target_roles else "public"
+            await safe_reply(msg, f"done bro. Created {ch_type} channel {new_ch.mention} ({access_str}).")
+            await log_action(guild, "AI Channel Created", f"Channel {new_ch.mention} created by <@{msg.author.id}> via AI request.")
+        except discord.HTTPException as e:
+            print("channel create failed:", e)
+            await safe_reply(msg, "failed to make that channel bro, check my permissions.")
+        return True
+
+    # 2. ROLE CREATION ACTION
+    role_name = extract_name(txt, role_m)
+
+    if not role_name:
+        await safe_reply(msg, "specify a role name bro, like: `@Event bot make role 'VIP'`")
+        return True
+
+    try:
+        new_role = await guild.create_role(name=role_name, mentionable=True)
+        await safe_reply(msg, f"done bro. Created role {new_role.mention}.")
+        await log_action(guild, "AI Role Created", f"Role {new_role.mention} created by <@{msg.author.id}> via AI request.")
+    except discord.HTTPException as e:
+        print("role create failed:", e)
+        await safe_reply(msg, "failed to make that role bro, check my permissions.")
+    return True
 
 # ==========================================
 # BACKGROUND QUEUE WORKER (GROQ -> OPENROUTER)
 # ==========================================
+GIF_RE = re.compile(r'https?://[^\s<>)]+?\.(?:gif|webp|png|jpg)(?![\w/])(?:\?[^\s<>)]*)?', re.IGNORECASE)
+
 async def process_ai_queue():
     while True:
         msg, txt, uid = await ai_queue.get()
         try:
+            # 4-Second Artificial Typing Delay
             async with msg.channel.typing():
+                await asyncio.sleep(4)
+
+                if msg.guild and await handle_ai_server_action(msg, txt):
+                    continue
+
                 if uid not in ai_history:
                     ai_history[uid] = []
 
@@ -363,44 +544,56 @@ async def process_ai_queue():
                 groq_err = ""
                 openrouter_err = ""
 
-                # STEP 1: Try Groq API (openai/gpt-oss-120b then openai/gpt-oss-20b)
-                for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
-                    try:
-                        res = await groq_client.chat.completions.create(
-                            model=groq_model,
-                            messages=messages,
-                            max_tokens=250,
-                        )
-                        if res.choices and res.choices[0].message.content:
-                            ans = res.choices[0].message.content
-                            break
-                    except Exception as e:
-                        groq_err = str(e)
-                        print(f"Groq ({groq_model}) error:", e)
+                # STEP 1: Try Groq API
+                # (gpt-oss models spend tokens on hidden reasoning, so max_tokens must be generous
+                #  or the visible reply comes back empty.)
+                if groq_client:
+                    for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+                        try:
+                            res = await groq_client.chat.completions.create(
+                                model=groq_model,
+                                messages=messages,
+                                max_tokens=1024,
+                            )
+                            if res.choices and (res.choices[0].message.content or "").strip():
+                                ans = res.choices[0].message.content.strip()
+                                break
+                        except Exception as e:
+                            groq_err = str(e)
+                            print(f"Groq ({groq_model}) error:", e)
+                else:
+                    groq_err = "GROQ_API_KEY not set"
 
                 # STEP 2: Fall back to OpenRouter Free Models
-                if not ans:
+                if not ans and openrouter_client:
                     for open_model in OPENROUTER_FREE_MODELS:
                         try:
                             res = await openrouter_client.chat.completions.create(
                                 model=open_model,
                                 messages=messages,
-                                max_tokens=250,
+                                max_tokens=400,
                                 extra_headers={
                                     "HTTP-Referer": "https://github.com",
                                     "X-Title": "Discord Bot",
                                 }
                             )
-                            if res.choices and res.choices[0].message.content:
-                                ans = res.choices[0].message.content
+                            if res.choices and (res.choices[0].message.content or "").strip():
+                                ans = res.choices[0].message.content.strip()
                                 break
                         except Exception as e:
                             openrouter_err = str(e)
                             print(f"OpenRouter ({open_model}) error:", e)
                             continue
+                elif not ans:
+                    openrouter_err = "OPENROUTER_API_KEY not set"
 
                 if not ans:
-                    await msg.reply(f"⚠️ **AI Error:** Groq: `{groq_err or 'Failed'}` | OpenRouter: `{openrouter_err or 'Failed'}`")
+                    # Send detailed error logs directly to your Owner DM
+                    error_details = f"⚠️ **AI Fallback Failed**\n• Groq Error: `{groq_err or 'None'}`\n• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`"
+                    await dm_owners(error_details)
+
+                    # Send clean generic message in public channel
+                    await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
 
                 ai_history[uid].append({"role": "assistant", "content": ans})
@@ -408,10 +601,24 @@ async def process_ai_queue():
                 if len(ans) > 2000:
                     ans = ans[:1996] + "..."
 
-                await msg.reply(ans)
+                # Direct image/GIF links get embedded cleanly. (Giphy/Tenor page links are
+                # left as-is: Discord unfurls those into GIFs by itself.)
+                url_match = GIF_RE.search(ans)
+                if url_match:
+                    gif_url = url_match.group(0)
+                    clean_text = ans.replace(gif_url, "").strip()
+                    emb = discord.Embed(color=0x2ECC71)
+                    emb.set_image(url=gif_url)
+                    if clean_text:
+                        await safe_reply(msg, clean_text, embed=emb)
+                    else:
+                        await safe_reply(msg, embed=emb)
+                else:
+                    await safe_reply(msg, ans)
         except Exception as e:
             print("AI Chat Error:", e)
-            await msg.reply(f"⚠️ **Error:** `{e}`")
+            await dm_owners(f"⚠️ **Critical AI Exception:** `{e}`")
+            await safe_reply(msg, "⚠️ Something went wrong, my bad bro.")
         finally:
             ai_queue.task_done()
             await asyncio.sleep(2)
@@ -419,66 +626,70 @@ async def process_ai_queue():
 # ==========================================
 # ON MESSAGE EVENT (AI CHATBOT & GUILD CHECKS)
 # ==========================================
-@bot.event
-async def on_message(msg):
+async def handle_ai_trigger(msg):
     global bot_muted
 
-    if msg.author.bot:
+    # AI chat is disabled in small, non-exempt servers (commands still work there).
+    if msg.guild and (msg.guild.member_count or 0) < 200 and msg.guild.id not in EXEMPT_GUILD_IDS:
         return
-
-    # Server checks (Blacklist & 200 Member Limit)
-    if msg.guild:
-        if msg.guild.id in BLACKLISTED_GUILD_IDS:
-            return
-
-        if msg.guild.member_count < 200 and msg.guild.id not in EXEMPT_GUILD_IDS:
-            return
 
     # AI Chat Trigger (Ping or Reply)
     pinged = bot.user in msg.mentions
-    is_reply = False
-    if msg.reference and msg.reference.resolved:
-        if msg.reference.resolved.author == bot.user:
-            is_reply = True
+    ref = msg.reference.resolved if msg.reference else None
+    is_reply = isinstance(ref, discord.Message) and ref.author == bot.user
 
-    if pinged or is_reply:
-        txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
+    if not (pinged or is_reply):
+        return
 
-        # Mute Command Check (Owner Only - Silent Mute)
-        if txt.lower() == "shut up":
-            if msg.author.id in BOT_OWNER_IDS:
-                bot_muted = True
-            return
+    txt = re.sub(rf"<@!?{bot.user.id}>", "", msg.content).strip()
 
-        # Muted state: Completely ignore everyone until Owner speaks
-        if bot_muted:
-            if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
-                bot_muted = False
-                await msg.reply("thank you father")
-            return
+    # Mute Command Check (Owner Only)
+    if txt.lower() == "shut up":
+        if msg.author.id in BOT_OWNER_IDS:
+            bot_muted = True
+        return
 
-        if not txt:
-            await msg.reply("tf you want bro?")
-        else:
-            uid = msg.author.id
-            now = time.time()
+    if bot_muted:
+        if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
+            bot_muted = False
+            await safe_reply(msg, "thank you father")
+        return
 
-            # 7-second per-user cooldown check
-            last_msg_time = user_cooldowns.get(uid, 0)
-            if now - last_msg_time < 7:
-                wait_sec = int(7 - (now - last_msg_time))
-                await msg.reply(f"chill out bro, wait {wait_sec}s before messaging again.")
-                return
+    if not txt:
+        await safe_reply(msg, "tf you want bro?")
+        return
 
-            user_cooldowns[uid] = now
+    uid = msg.author.id
+    now = time.time()
 
-            # Enqueue message
-            q_size = ai_queue.qsize()
-            await ai_queue.put((msg, txt, uid))
+    # Individual 20-second Per-User Cooldown Check
+    last_msg_time = user_cooldowns.get(uid, 0)
+    if now - last_msg_time < 20:
+        await safe_reply(msg, "ayo chill for 20 seconds.", delete_after=5)
+        return
 
-            if q_size > 0:
-                await msg.reply(f"⏳ Added to queue (Position #{q_size + 1}). Hold up...")
+    user_cooldowns[uid] = now
 
+    q_size = ai_queue.qsize()
+    await ai_queue.put((msg, txt, uid))
+
+    if q_size > 0:
+        await safe_reply(msg, f"⏳ Added to queue (Position #{q_size + 1}). Hold up...")
+
+@bot.event
+async def on_message(msg):
+    if msg.author.bot:
+        return
+
+    if msg.guild and msg.guild.id in BLACKLISTED_GUILD_IDS:
+        return
+
+    try:
+        await handle_ai_trigger(msg)
+    except Exception as e:
+        print("on_message AI error:", e)
+
+    # Always reached now, so prefix commands (!sync) work regardless of AI state.
     await bot.process_commands(msg)
 
 class RateModal(discord.ui.Modal, title="Rate Event"):
@@ -490,10 +701,24 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
         self.key = key
 
     async def on_submit(self, interaction):
-        info = db["events"].get(self.key, {})
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.send_message("Event not found.", ephemeral=True)
+            return
 
         if time.time() - info.get("concluded_at", 0) > 3600:
             await interaction.response.send_message("Rating window closed.", ephemeral=True)
+            return
+
+        if interaction.user.id == info.get("host_id"):
+            await interaction.response.send_message("You can't rate your own event.", ephemeral=True)
+            return
+
+        # Only players who actually joined can rate (events concluded before this
+        # update have no participant list, so they stay open to everyone).
+        participants = info.get("participants")
+        if participants is not None and interaction.user.id not in participants:
+            await interaction.response.send_message("Only players who joined this event can rate it.", ephemeral=True)
             return
 
         if "voted" not in info: 
@@ -506,7 +731,7 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
         try:
             val = float(self.rating.value)
             if not (1.0 <= val <= 5.0): raise ValueError
-        except:
+        except ValueError:
             await interaction.response.send_message("Invalid rating.", ephemeral=True)
             return
 
@@ -515,12 +740,12 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
         db["hosts"][self.host_id]["ratings"].append(val)
         save_db(db)
 
-        await update_leaderboard(interaction.guild)
         await interaction.response.send_message(f"Rated **{val}/5**!", ephemeral=True)
+        await update_leaderboard(interaction.guild)
 
 class ClaimModal(discord.ui.Modal, title="Claim Spot"):
-    country = discord.ui.TextInput(label="Nation", required=True)
-    roblox = discord.ui.TextInput(label="Roblox Username", required=True)
+    country = discord.ui.TextInput(label="Nation", required=True, max_length=40)
+    roblox = discord.ui.TextInput(label="Roblox Username", required=True, max_length=40)
 
     def __init__(self, key):
         super().__init__()
@@ -567,12 +792,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
             info["waitlist"].append({"discord_id": interaction.user.id, "roblox": r_user, "country": c_title})
             save_db(db)
 
-            try:
-                msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
-                await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-            except: 
-                pass
-
+            await refresh_event_message(info, interaction.guild)
             await interaction.response.send_message(f"Spot taken/full! Added to waitlist for {c_title}.", ephemeral=True)
             return
 
@@ -582,32 +802,22 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
             return
 
         sps = [s.title() for s in info.get("superpowers", [])]
-        if c_title in sps:
-            sp_role = get_config(interaction.guild_id).get("superpower_role")
-            has_role = sp_role in [r.id for r in interaction.user.roles] if sp_role else False
-            if not (interaction.user.premium_since or has_role or interaction.user.guild_permissions.administrator):
-                await interaction.response.send_message("That nation is a VIP Superpower.", ephemeral=True)
-                return
+        if c_title in sps and not is_vip(interaction.user, interaction.guild_id):
+            await interaction.response.send_message("That nation is a VIP Superpower.", ephemeral=True)
+            return
 
         info["reservations"][c_title] = {"roblox": r_user, "discord_id": interaction.user.id}
-        r_id = get_config(interaction.guild_id).get("event_role")
-        if r_id:
-            role = interaction.guild.get_role(r_id)
-            if role:
-                try: await interaction.user.add_roles(role)
-                except: pass
-
-        try:
-            msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
-            await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-        except: pass
-
+        # They have a spot now, so any waitlist entry of theirs must go (no double spots).
+        info["waitlist"] = [w for w in info["waitlist"] if w["discord_id"] != interaction.user.id]
         save_db(db)
+
+        await add_event_role(interaction.guild, interaction.user.id)
+        await refresh_event_message(info, interaction.guild)
         await log_action(interaction.guild, "Spot Claimed", f"<@{interaction.user.id}> reserved **{c_title}**.")
         await interaction.response.send_message(f"Reserved **{c_title}**!", ephemeral=True)
 
 class SwapModal(discord.ui.Modal, title="Propose Swap"):
-    target = discord.ui.TextInput(label="Nation You Want", required=True)
+    target = discord.ui.TextInput(label="Nation You Want", required=True, max_length=40)
 
     def __init__(self, key):
         super().__init__()
@@ -615,6 +825,10 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
 
     async def on_submit(self, interaction):
         info = db["events"].get(self.key)
+        if not info or info.get("concluded"):
+            await interaction.response.send_message("Event is over.", ephemeral=True)
+            return
+
         t_c = self.target.value.title().strip()
         u_c = next((c for c, u in info["reservations"].items() if u["discord_id"] == interaction.user.id), None)
 
@@ -628,6 +842,11 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
 
         if t_c == u_c: 
             await interaction.response.send_message("Can't swap with yourself.", ephemeral=True)
+            return
+
+        sps = [s.title() for s in info.get("superpowers", [])]
+        if t_c in sps and not is_vip(interaction.user, interaction.guild_id):
+            await interaction.response.send_message("That nation is a VIP Superpower.", ephemeral=True)
             return
 
         t_id = info["reservations"][t_c]["discord_id"]
@@ -663,21 +882,27 @@ class SwapAcceptView(discord.ui.View):
             return
 
         info = db["events"].get(self.key)
+        if not info or info.get("concluded"):
+            await interaction.response.send_message("Event is over.", ephemeral=True)
+            return
+
         res = info["reservations"]
 
-        if self.s_c not in res or self.t_c not in res or res[self.s_c]["discord_id"] != self.s_id:
+        if self.s_c not in res or self.t_c not in res or res[self.s_c]["discord_id"] != self.s_id or res[self.t_c]["discord_id"] != self.t_id:
             await interaction.response.send_message("Swap invalid now.", ephemeral=True)
             return
 
+        # Re-check VIP rules for BOTH sides at accept time.
+        sps = [s.title() for s in info.get("superpowers", [])]
+        s_mem = interaction.guild.get_member(self.s_id)
+        if (self.t_c in sps and not is_vip(s_mem, interaction.guild_id)) or \
+           (self.s_c in sps and not is_vip(interaction.user, interaction.guild_id)):
+            await interaction.response.send_message("Swap blocked: a VIP Superpower can only be held by VIPs.", ephemeral=True)
+            return
+
         res[self.s_c], res[self.t_c] = res[self.t_c], res[self.s_c]
-
-        try:
-            msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
-            await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-        except: 
-            pass
-
         save_db(db)
+
         for child in self.children: 
             child.disabled = True
 
@@ -685,6 +910,7 @@ class SwapAcceptView(discord.ui.View):
         emb.color = 0x2ECC71
         emb.title = "✅ Swap Completed"
         await interaction.response.edit_message(embed=emb, view=self)
+        await refresh_event_message(info, interaction.guild)
         await log_action(interaction.guild, "Swap", f"<@{self.s_id}> and <@{self.t_id}> swapped spots.")
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
@@ -708,29 +934,35 @@ class KickSelect(discord.ui.Select):
         super().__init__(placeholder="Select player to kick...", options=opts)
 
     async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         info = db["events"].get(self.key)
         c_title = self.values[0]
+
+        if not info or c_title not in info["reservations"]:
+            await interaction.followup.send("That spot is already gone.", ephemeral=True)
+            return
+
         uid = info["reservations"][c_title]["discord_id"]
         del info["reservations"][c_title]
 
-        r_id = get_config(interaction.guild_id).get("event_role")
-        if r_id:
-            role = interaction.guild.get_role(r_id)
-            if role:
-                try: await interaction.guild.get_member(uid).remove_roles(role)
-                except: pass
+        await remove_event_role(interaction.guild, uid)
 
         ch = bot.get_channel(info["channel_id"])
         await process_waitlist(info, c_title, interaction.guild, ch)
 
-        try:
-            msg = await ch.fetch_message(info["message_ids"][0])
-            await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-        except: 
-            pass
-
         save_db(db)
-        await interaction.response.send_message(f"Kicked **{c_title}**.", ephemeral=True)
+        await refresh_event_message(info, interaction.guild)
+        await log_action(interaction.guild, "Player Kicked", f"<@{interaction.user.id}> removed **{c_title}** (<@{uid}>).")
+        await interaction.followup.send(f"Kicked **{c_title}**.", ephemeral=True)
+
+class RateBtnView(discord.ui.View):
+    def __init__(self, h_id, e_key):
+        super().__init__(timeout=3600)
+        self.h_id, self.e_key = h_id, e_key
+
+    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success)
+    async def rate(self, i, b):
+        await i.response.send_modal(RateModal(self.h_id, self.e_key))
 
 class HostActionsView(discord.ui.View):
     def __init__(self, key):
@@ -739,6 +971,12 @@ class HostActionsView(discord.ui.View):
         info = db["events"].get(key)
         if info and info["reservations"]:
             self.add_item(KickSelect(key, info["reservations"]))
+
+    async def interaction_check(self, interaction):
+        if is_authorized_manager(interaction.user):
+            return True
+        await interaction.response.send_message("Admins or managers only.", ephemeral=True)
+        return False
 
     @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=1)
     async def clear_roles(self, interaction, btn):
@@ -751,11 +989,11 @@ class HostActionsView(discord.ui.View):
             return
 
         count = 0
-        for mem in role.members:
+        for mem in list(role.members):
             try: 
                 await mem.remove_roles(role)
                 count += 1
-            except: 
+            except discord.HTTPException: 
                 pass
 
         await interaction.followup.send(f"Removed role from {count} members.", ephemeral=True)
@@ -765,6 +1003,10 @@ class HostActionsView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         info = db["events"].get(self.key)
 
+        if not info:
+            await interaction.followup.send("Event not found.", ephemeral=True)
+            return
+
         if info.get("concluded"): 
             await interaction.followup.send("Already ended.", ephemeral=True)
             return
@@ -772,19 +1014,19 @@ class HostActionsView(discord.ui.View):
         now = int(time.time())
         info["concluded"] = True
         info["concluded_at"] = now
+        # Remember who played, so only they can rate the host.
+        info["participants"] = [u["discord_id"] for u in info["reservations"].values()]
 
         r_id = get_config(interaction.guild_id).get("event_role")
         role = interaction.guild.get_role(r_id) if r_id else None
         if role:
-            for mem in role.members:
+            for mem in list(role.members):
                 try: await mem.remove_roles(role)
-                except: pass
+                except discord.HTTPException: pass
 
-        try:
-            msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
-            await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild), view=None)
-        except: pass
+        await refresh_event_message(info, interaction.guild, remove_view=True)
 
+        # Time the event ran live after reservations closed (unchanged behaviour).
         dur = round(max(0, now - info["end_time"]) / 3600, 1)
         p_count = len(info["reservations"])
         hid = check_host(info["host_id"])
@@ -803,15 +1045,10 @@ class HostActionsView(discord.ui.View):
                 emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
                 emb.add_field(name="Players", value=f"{p_count}", inline=True)
 
-                class RateBtnView(discord.ui.View):
-                    def __init__(self, h_id, e_key):
-                        super().__init__(timeout=3600)
-                        self.h_id, self.e_key = h_id, e_key
-                    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success)
-                    async def rate(self, i, b):
-                        await i.response.send_modal(RateModal(self.h_id, self.e_key))
-
-                await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
+                try:
+                    await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
+                except discord.HTTPException as e:
+                    print("stats post failed:", e)
 
         await update_leaderboard(interaction.guild)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
@@ -823,12 +1060,17 @@ class EventButtonsView(discord.ui.View):
     @discord.ui.button(label="Claim Spot", style=discord.ButtonStyle.success, custom_id="claim_btn")
     async def claim(self, interaction, btn):
         key, _ = find_event(interaction.message.id)
-        if key: await interaction.response.send_modal(ClaimModal(key))
+        if not key:
+            await interaction.response.send_message("This event no longer exists.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ClaimModal(key))
 
     @discord.ui.button(label="Swap Nation", style=discord.ButtonStyle.primary, custom_id="swap_btn")
     async def swap(self, interaction, btn):
         key, _ = find_event(interaction.message.id)
-        if not key: return
+        if not key:
+            await interaction.response.send_message("This event no longer exists.", ephemeral=True)
+            return
 
         rem = 120 - (time.time() - swap_cooldowns.get(interaction.user.id, 0))
         if rem > 0:
@@ -841,25 +1083,20 @@ class EventButtonsView(discord.ui.View):
     async def leave(self, interaction, btn):
         await interaction.response.defer(ephemeral=True)
         key, info = find_event(interaction.message.id)
-        if not key: return
+        if not key:
+            await interaction.followup.send("This event no longer exists.", ephemeral=True)
+            return
 
         tgt = next((c for c, u in info["reservations"].items() if u["discord_id"] == interaction.user.id), None)
         if tgt:
             del info["reservations"][tgt]
-            r_id = get_config(interaction.guild_id).get("event_role")
-            if r_id:
-                try: await interaction.user.remove_roles(interaction.guild.get_role(r_id))
-                except: pass
+            await remove_event_role(interaction.guild, interaction.user.id)
 
             ch = bot.get_channel(info["channel_id"])
             await process_waitlist(info, tgt, interaction.guild, ch)
 
-            try:
-                msg = await ch.fetch_message(info["message_ids"][0])
-                await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-            except: pass
-
             save_db(db)
+            await refresh_event_message(info, interaction.guild)
             await log_action(interaction.guild, "Spot Left", f"<@{interaction.user.id}> left {tgt}.")
             await interaction.followup.send("Spot removed.", ephemeral=True)
             return
@@ -868,11 +1105,8 @@ class EventButtonsView(discord.ui.View):
         w_ent = next((w for w in wait if w["discord_id"] == interaction.user.id), None)
         if w_ent:
             wait.remove(w_ent)
-            try:
-                msg = await bot.get_channel(info["channel_id"]).fetch_message(info["message_ids"][0])
-                await msg.edit(embeds=build_embed(info["display_name"], info, interaction.guild))
-            except: pass
             save_db(db)
+            await refresh_event_message(info, interaction.guild)
             await interaction.followup.send("Removed from waitlist.", ephemeral=True)
             return
 
@@ -881,13 +1115,14 @@ class EventButtonsView(discord.ui.View):
     @discord.ui.button(label="Host Actions", style=discord.ButtonStyle.secondary, custom_id="host_btn")
     async def host_menu(self, interaction, btn):
         key, _ = find_event(interaction.message.id)
-        if not key: return
-        if not is_admin_or_host(interaction):
-            await interaction.response.send_message("Admins or hosts only.", ephemeral=True)
+        if not key:
+            await interaction.response.send_message("This event no longer exists.", ephemeral=True)
+            return
+        if not is_authorized_manager(interaction.user):
+            await interaction.response.send_message("Admins or managers only.", ephemeral=True)
             return
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
-
 
 class SetupRolePanel(discord.ui.View):
     def __init__(self):
@@ -939,7 +1174,8 @@ async def clearchat_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("No memory to clear.", ephemeral=True)
 
 @bot.tree.command(name="setup", description="Admin setup panel")
-async def setup_cmd(interaction):
+@app_commands.guild_only()
+async def setup_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
@@ -951,25 +1187,45 @@ async def setup_cmd(interaction):
     e2 = discord.Embed(title="Setup Channels", description=f"Logs: <#{conf.get('log_channel')}>\nSwaps: <#{conf.get('swap_channel')}>\nStats: <#{conf.get('stats_channel')}>")
     await interaction.followup.send(embed=e2, view=SetupChannelPanel(), ephemeral=True)
 
+# Last phase ("open"/"live") we rendered per event, so we only edit when it flips.
+event_phase = {}
+
 @tasks.loop(seconds=30)
 async def refresh_timers():
+    now = int(time.time())
+
     for key, info in list(db["events"].items()):
-        if info.get("concluded"): continue
-        ch_id = info.get("channel_id")
-        m_ids = info.get("message_ids", [])
-        if not ch_id or not m_ids: continue
-        ch = bot.get_channel(ch_id)
-        if not ch: continue
         try:
-            msg = await ch.fetch_message(m_ids[0])
-            await msg.edit(embeds=build_embed(info["display_name"], info, ch.guild))
-        except: 
-            pass
+            if info.get("concluded"):
+                event_phase.pop(key, None)
+                continue
+
+            phase = "live" if now >= info["end_time"] else "open"
+            if event_phase.get(key) == phase:
+                continue  # Countdown timestamps update client-side; nothing to edit.
+
+            if await refresh_event_message(info):
+                event_phase[key] = phase
+        except Exception as e:
+            print("refresh_timers error:", e)
+
+    # Housekeeping so these dicts don't grow forever.
+    cutoff = time.time() - 3600
+    for d in (user_cooldowns, swap_cooldowns):
+        for k in [k for k, v in d.items() if v < cutoff]:
+            del d[k]
+    while len(ai_history) > 500:
+        ai_history.pop(next(iter(ai_history)))
+
+@refresh_timers.before_loop
+async def before_refresh_timers():
+    await bot.wait_until_ready()
 
 async def setup_hook():
+    global ai_worker_task
     bot.add_view(EventButtonsView())
     refresh_timers.start()
-    asyncio.create_task(process_ai_queue())
+    ai_worker_task = asyncio.create_task(process_ai_queue())
 
 bot.setup_hook = setup_hook
 
@@ -978,6 +1234,7 @@ async def on_ready():
     print(f"Logged in: {bot.user.name}")
 
 @bot.command()
+@commands.guild_only()
 async def sync(ctx):
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("Admins only.")
@@ -985,38 +1242,53 @@ async def sync(ctx):
     s = await bot.tree.sync()
     await ctx.send(f"Synced {len(s)} commands.")
 
-async def ev_autocomplete(interaction, curr):
+async def ev_autocomplete(interaction: discord.Interaction, curr: str):
     ch = []
     for k, v in db["events"].items():
-        if not v.get("concluded") and curr.lower() in v["display_name"].lower():
-            ch.append(app_commands.Choice(name=v["display_name"], value=v["display_name"]))
+        if v.get("concluded") or not event_in_guild(v, interaction.guild_id):
+            continue
+        if curr.lower() in v["display_name"].lower():
+            ch.append(app_commands.Choice(name=v["display_name"][:100], value=v["display_name"][:100]))
     return ch[:25]
 
 @bot.tree.command(name="event", description="Create event banner")
-async def create_ev(interaction, name: str, starts_in: str, duration: str, target: discord.TextChannel, max_p: int = 0):
+@app_commands.guild_only()
+async def create_ev(interaction: discord.Interaction, name: str, starts_in: str, duration: str, target: discord.TextChannel, max_p: int = 0):
     await interaction.response.defer(ephemeral=True)
 
-    if not is_admin_or_host(interaction):
-        await interaction.followup.send("Hosts only.", ephemeral=True)
+    if not is_authorized_manager(interaction.user):
+        await interaction.followup.send("Managers only.", ephemeral=True)
+        return
+
+    key = name.lower().strip()
+    existing = db["events"].get(key)
+    if existing and not existing.get("concluded"):
+        await interaction.followup.send("An active event with that name already exists.", ephemeral=True)
         return
 
     s_off = parse_time(starts_in)
     d_sec = parse_time(duration)
-    if d_sec == 0 and s_off == 0: d_sec = 1800
+    if d_sec <= 0: d_sec = 1800
 
     s_ts = int(time.time()) + s_off
     e_ts = s_ts + d_sec
-    key = name.lower().strip()
 
     db["events"][key] = {
         "display_name": name, "start_time": s_ts, "end_time": e_ts,
-        "host_id": interaction.user.id, "channel_id": target.id,
+        "host_id": interaction.user.id, "channel_id": target.id, "guild_id": interaction.guild_id,
         "message_ids": [], "superpowers": [], "reservations": {}, "waitlist": [],
         "voted": [], "max_players": max_p, "concluded": False
     }
 
     embs = build_embed(name, db["events"][key], interaction.guild)
-    msg = await target.send(embeds=embs, view=EventButtonsView())
+    try:
+        msg = await target.send(embeds=embs, view=EventButtonsView())
+    except discord.HTTPException as e:
+        del db["events"][key]
+        print("event post failed:", e)
+        await interaction.followup.send("I can't post in that channel (check my permissions).", ephemeral=True)
+        return
+
     db["events"][key]["message_ids"] = [msg.id]
     save_db(db)
 
@@ -1024,31 +1296,29 @@ async def create_ev(interaction, name: str, starts_in: str, duration: str, targe
     await interaction.followup.send("Event created.", ephemeral=True)
 
 @bot.tree.command(name="set_superpowers", description="Set superpowers")
+@app_commands.guild_only()
 @app_commands.autocomplete(event_name=ev_autocomplete)
-async def set_sp(interaction, event_name: str, nations: str):
-    if not is_admin_or_host(interaction): 
-        await interaction.response.send_message("Hosts only.", ephemeral=True)
+async def set_sp(interaction: discord.Interaction, event_name: str, nations: str):
+    if not is_authorized_manager(interaction.user): 
+        await interaction.response.send_message("Managers only.", ephemeral=True)
         return
 
     key = event_name.lower().strip()
-    if key not in db["events"]: 
+    info = db["events"].get(key)
+    if not info or not event_in_guild(info, interaction.guild_id): 
         await interaction.response.send_message("Event not found.", ephemeral=True)
         return
 
     sps = [n.strip().title() for n in nations.split(",") if n.strip()]
-    db["events"][key]["superpowers"] = sps
-
-    try:
-        msg = await bot.get_channel(db["events"][key]["channel_id"]).fetch_message(db["events"][key]["message_ids"][0])
-        await msg.edit(embeds=build_embed(db["events"][key]["display_name"], db["events"][key], interaction.guild))
-    except: 
-        pass
-
+    info["superpowers"] = sps
     save_db(db)
+
+    await refresh_event_message(info, interaction.guild)
     await interaction.response.send_message(f"Superpowers set: {', '.join(sps)}", ephemeral=True)
 
 @bot.tree.command(name="blacklist", description="Blacklist user")
-async def blacklist(interaction, user: discord.Member):
+@app_commands.guild_only()
+async def blacklist(interaction: discord.Interaction, user: discord.Member):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
@@ -1068,7 +1338,8 @@ async def blacklist(interaction, user: discord.Member):
     await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="spawn_leaderboard", description="Spawn live leaderboard")
-async def spawn_lb(interaction):
+@app_commands.guild_only()
+async def spawn_lb(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
