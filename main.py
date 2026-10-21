@@ -12,6 +12,7 @@ import pymongo
 from flask import Flask
 from threading import Thread
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 app = Flask(__name__)
 
@@ -31,18 +32,33 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# GROQ AI & QUEUE CONFIGURATION
+# 100% FREE MULTI-PROVIDER AI CONFIGURATION
+# (No Credit Cards / No Paid Accounts Required)
 # ==========================================
+
+# Primary: Groq API
 groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# Secondary Fallback: OpenRouter API (Strictly Free Models)
+openrouter_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY")
+)
+
+OPENROUTER_FREE_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-2-9b-it:free"
+]
+
 ai_history = {}
 user_cooldowns = {}
 ai_queue = asyncio.Queue()
 bot_muted = False
 
-# List of Discord User IDs with special privileges (mute/unmute control)
 BOT_OWNER_IDS = [
     1359263076838539296,  # Your User ID
-    # Add other trusted user IDs here, separated by commas
 ]
 
 BOT_PERSONA = """
@@ -52,13 +68,10 @@ STRICT RULES:
 2. Tone: Have a street attitude (use bro, tf, ain't no way, trippin, nah, fr), but keep it natural. You are not a try-hard gangster, just a chill guy who roasts people.
 3. NEVER sound like an AI. Zero robotic politeness.
 4. Banter aggressively, disagree, and call people out if they act weird or say dumb things. Don't hold back.
-5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (40% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
+5. GIF Rule: Use a Tenor/Giphy GIF link in about 1 out of every 4 messages (25% of the time). Don't spam them constantly, but use them enough to be funny when reacting.
 """
 
-# Servers that bypass the 200-member requirement (put VIP/Friend server IDs here)
 EXEMPT_GUILD_IDS = [123456789012345678]
-
-# Servers completely blocked from using the bot
 BLACKLISTED_GUILD_IDS = [111122223333444455]
 
 DATA_FILE = "events_data.json"
@@ -332,18 +345,9 @@ async def process_waitlist(info, opened, guild, channel):
             pass
 
 # ==========================================
-# BACKGROUND QUEUE WORKER FOR GROQ AI (AUTO-FALLBACK)
+# BACKGROUND QUEUE WORKER (GROQ -> OPENROUTER)
 # ==========================================
 async def process_ai_queue():
-    # Priority list of Groq models (if one fails/deprecates, it automatically uses the next)
-    GROQ_MODELS = [
-        "llama3-8b-8192",
-        "llama3-70b-8192",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
-        "llama-3.3-70b-versatile"
-    ]
-
     while True:
         msg, txt, uid = await ai_queue.get()
         try:
@@ -357,23 +361,36 @@ async def process_ai_queue():
                 messages = [{"role": "system", "content": BOT_PERSONA}] + ai_history[uid]
 
                 ans = None
-                for model_name in GROQ_MODELS:
-                    try:
-                        res = await groq_client.chat.completions.create(
-                            model=model_name,
-                            messages=messages,
-                            max_tokens=250,
-                        )
-                        ans = res.choices[0].message.content
-                        break  # Successfully generated response, break loop
-                    except Exception as err:
-                        # If model is 404 or not found, try next model in list
-                        if "404" in str(err) or "model_not_found" in str(err):
+
+                # STEP 1: Try Groq API first (1,000 Daily Requests)
+                try:
+                    res = await groq_client.chat.completions.create(
+                        model="openai/gpt-oss-20b",
+                        messages=messages,
+                        max_tokens=250,
+                    )
+                    ans = res.choices[0].message.content
+                except Exception as e:
+                    print("Groq Fallback Triggered:", e)
+
+                # STEP 2: Fall back to OpenRouter Free Models (200+ Daily Requests)
+                if not ans:
+                    for model_name in OPENROUTER_FREE_MODELS:
+                        try:
+                            res = await openrouter_client.chat.completions.create(
+                                model=model_name,
+                                messages=messages,
+                                max_tokens=250,
+                            )
+                            ans = res.choices[0].message.content
+                            if ans:
+                                break
+                        except Exception as e:
+                            print(f"OpenRouter ({model_name}) Fallback Triggered:", e)
                             continue
-                        raise err
 
                 if not ans:
-                    await msg.reply("⚠️ All Groq models failed to respond.")
+                    await msg.reply("⚠️ All free AI services are temporarily on cooldown. Try again in a bit!")
                     continue
 
                 ai_history[uid].append({"role": "assistant", "content": ans})
@@ -417,13 +434,13 @@ async def on_message(msg):
     if pinged or is_reply:
         txt = msg.content.replace(f"<@{bot.user.id}>", "").strip()
 
-        # Mute Command Check (Owner Only - Completely Silent)
+        # Mute Command Check (Owner Only - Silent Mute)
         if txt.lower() == "shut up":
             if msg.author.id in BOT_OWNER_IDS:
                 bot_muted = True
             return
 
-        # When muted: Ignore everyone until Owner says "you can talk again"
+        # Muted state: Completely ignore everyone until Owner speaks
         if bot_muted:
             if txt.lower() == "you can talk again" and msg.author.id in BOT_OWNER_IDS:
                 bot_muted = False
