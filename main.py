@@ -498,10 +498,12 @@ async def process_waitlist(info, opened, guild, channel):
 ADMIN_VERB_RE = re.compile(
     r"\b(create|make|add|delete|remove|rename|lock|unlock|hide|show|kick|ban|unban|timeout|mute|unmute|"
     r"give|assign|take|purge|clear|wipe|slowmode|nickname|nick|move|set|change|open|close|restrict|"
-    r"announce|say|send|only)\b", re.IGNORECASE)
+    r"announce|say|send|only|turn|toggle|enable|disable|switch|allow|grant|deny|revoke|let|stop|put|place|"
+    r"update|edit|reset|display|mention|hoist|style|colou?r|swap|raise|lower)\b", re.IGNORECASE)
 ADMIN_NOUN_RE = re.compile(
     r"\b(channel|category|role|roles|member|user|slowmode|nickname|messages|topic|permission|permissions|"
-    r"access|accessible|vc|voice)\b", re.IGNORECASE)
+    r"access|accessible|vc|voice|display|separately|mentionable|hoist|gradient|holographic|style|colou?r|"
+    r"position|hierarchy|above|below|images?|emojis?|reactions?|embeds?)\b", re.IGNORECASE)
 
 # What each action needs from the PERSON asking (not just the bot).
 PERM_FOR = {
@@ -636,24 +638,26 @@ def find_channel(guild, ref, kinds=None):
                 return c
     return None
 
-def find_role(guild, ref):
+def find_role(guild, ref, roles=None):
+    """Look a role up by mention/ID/name. Pass a freshly fetched `roles` list to avoid stale cache."""
     if not ref:
         return None
+    pool = roles if roles is not None else guild.roles
     s = str(ref).strip()
     if s.lower().lstrip("@") in ("everyone", "here"):
         return guild.default_role
     cid = _id_from(s)
     if cid:
-        r = guild.get_role(cid)
-        if r:
-            return r
+        for r in pool:
+            if r.id == cid:
+                return r
     name = s.lstrip("@").lower()
-    for r in guild.roles:
+    for r in pool:
         if r.name.lower() == name:
             return r
-    close = difflib.get_close_matches(name, [r.name.lower() for r in guild.roles], n=1, cutoff=0.85)
+    close = difflib.get_close_matches(name, [r.name.lower() for r in pool], n=1, cutoff=0.85)
     if close:
-        for r in guild.roles:
+        for r in pool:
             if r.name.lower() == close[0]:
                 return r
     return None
@@ -1118,28 +1122,59 @@ def norm_perms(v):
 
 async def act_move_role(ctx, a):
     g = ctx.guild
-    role = find_role(g, a.get("role"))
-    ok, why = check_role(ctx, role)
-    if not ok:
-        return False, why
+    # Cached role positions go stale (e.g. right after a role is created), so always read fresh ones.
+    fresh = sorted(await g.fetch_roles(), key=lambda r: r.position)
+    role = find_role(g, a.get("role"), fresh)
+    if role is None:
+        return False, "Couldn't find that role."
+    if role.is_default() or role.managed:
+        return False, f"**{role.name}** can't be moved."
     above_ref, below_ref = a.get("above"), a.get("below")
-    target = find_role(g, above_ref or below_ref)
+    target = find_role(g, above_ref or below_ref, fresh)
     if not target or target.is_default():
         return False, "Couldn't find the role to place it next to."
     if target.id == role.id:
         return False, "That's the same role."
-    tp = target.position
-    if above_ref:
-        new = tp if role.position < tp else tp + 1
-    else:
-        new = tp if role.position > tp else tp - 1
-    new = max(1, new)
-    if new >= g.me.top_role.position:
+
+    me_ids = {r.id for r in g.me.roles}
+    bot_top = max((r for r in fresh if r.id in me_ids), key=lambda r: r.position)
+    if role.position >= bot_top.position:
+        return False, f"**{role.name}** is above my role. Move my role higher first."
+    privileged = ctx.author.id in BOT_OWNER_IDS or ctx.author.id == g.owner_id
+    author_ids = {r.id for r in ctx.author.roles}
+    author_top = max((r for r in fresh if r.id in author_ids), key=lambda r: r.position)
+    if not privileged and role.position >= author_top.position:
+        return False, f"**{role.name}** is above your highest role."
+
+    word = "above" if above_ref else "below"
+    if (above_ref and role.position > target.position) or (below_ref and role.position < target.position):
+        return True, f"{role.mention} is already {word} {target.mention}"
+
+    old_idx = next(i for i, r in enumerate(fresh) if r.id == role.id)
+    order = [r for r in fresh if r.id != role.id]
+    t_idx = next(i for i, r in enumerate(order) if r.id == target.id)
+    order.insert(t_idx + 1 if above_ref else t_idx, role)
+    new_idx = next(i for i, r in enumerate(order) if r.id == role.id)
+    bot_idx = next(i for i, r in enumerate(order) if r.id == bot_top.id)
+    if new_idx >= bot_idx:
         return False, "That spot is above my own role. Move my role higher first."
-    if not (ctx.author.id in BOT_OWNER_IDS or ctx.author.id == g.owner_id) and new >= ctx.author.top_role.position:
-        return False, "You can only place roles below your own highest role."
-    await role.edit(position=new, reason=ctx.reason)
-    return True, f"Moved {role.mention} {'above' if above_ref else 'below'} {target.mention}"
+    if not privileged:
+        auth_idx = next(i for i, r in enumerate(order) if r.id == author_top.id)
+        if new_idx >= auth_idx:
+            return False, "You can only place roles below your own highest role."
+
+    lo, hi = sorted((old_idx, new_idx))
+    changes = [{"id": order[i].id, "position": i} for i in range(lo, hi + 1) if order[i].position != i]
+    if changes:
+        route = Route("PATCH", "/guilds/{guild_id}/roles", guild_id=g.id)
+        await bot.http.request(route, json=changes, reason=ctx.reason)
+
+    # Don't trust the request: read the order back and confirm it really changed.
+    after = {r.id: r.position for r in await g.fetch_roles()}
+    ok = after.get(role.id, -1) > after.get(target.id, 0) if above_ref else after.get(role.id, 99999) < after.get(target.id, 0)
+    if not ok:
+        return False, "Discord didn't apply that move. Make sure my role is above both roles."
+    return True, f"Moved {role.mention} {word} {target.mention}"
 
 async def act_role_permissions(ctx, a):
     g = ctx.guild
