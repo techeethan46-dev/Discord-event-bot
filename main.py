@@ -8,6 +8,7 @@ import re
 import difflib
 import asyncio
 import datetime
+import colorsys
 import aiohttp
 from discord.http import Route
 from urllib.parse import urlparse
@@ -523,11 +524,21 @@ PERM_FOR = {
 STAFF_PERMS = ("administrator",) + tuple(sorted(set(PERM_FOR.values()) - {"send_messages"}))
 ALWAYS_CONFIRM = {"delete_channel", "delete_role", "kick", "ban"}
 
-COLOR_NAMES = {
+BASE_COLORS = {
     "red": 0xE74C3C, "blue": 0x3498DB, "green": 0x2ECC71, "yellow": 0xF1C40F, "orange": 0xE67E22,
     "purple": 0x9B59B6, "pink": 0xFF69B4, "gold": 0xFFD700, "teal": 0x1ABC9C, "white": 0xFFFFFF,
-    "black": 0x010101, "grey": 0x95A5A6, "gray": 0x95A5A6,
+    "black": 0x010101, "grey": 0x95A5A6, "gray": 0x95A5A6, "silver": 0xC0C0C0,
+    "lime": 0x32CD32, "cyan": 0x00BCD4, "magenta": 0xFF00FF, "brown": 0x8B5A2B, "maroon": 0x800000,
+    "navy": 0x001F7F, "olive": 0x808000, "turquoise": 0x40E0D0, "indigo": 0x4B0082, "violet": 0xEE82EE,
+    "coral": 0xFF7F50, "salmon": 0xFA8072, "crimson": 0xDC143C, "mint": 0x3EB489, "lavender": 0xB57EDC,
+    "beige": 0xF5F5DC, "peach": 0xFFB07C, "skyblue": 0x87CEEB, "emerald": 0x50C878, "forestgreen": 0x228B22,
+    "bloodred": 0x8A0303, "burgundy": 0x800020, "rose": 0xFF007F, "amber": 0xFFBF00, "bronze": 0xCD7F32,
+    "sand": 0xE6D5A8, "cream": 0xFFFDD0, "blurple": 0x5865F2,
 }
+DARK_WORDS = {"dark", "darker", "deep", "dim", "dull"}
+LIGHT_WORDS = {"light", "lighter", "pale", "pastel", "soft"}
+BRIGHT_WORDS = {"bright", "neon", "vivid"}
+STRONG_WORDS = {"very", "extra", "super", "ultra", "really"}
 
 ADMIN_PARSER_PROMPT = """You convert a Discord admin's message into JSON server actions.
 Reply with ONLY one JSON object. No prose, no markdown, no code fences.
@@ -546,7 +557,7 @@ unlock_channel: channel (optional)
 slowmode: channel (optional), seconds (0-21600)
 set_topic: channel (optional), topic
 move_channel: channel, category
-create_role: name, style (optional: "solid"|"gradient"|"holographic", default solid; use gradient when two colors are asked for), color (optional, hex or color name), color2 (optional, second color for gradient), hoist (optional bool), mentionable (optional bool)
+create_role: name, style (optional: "solid"|"gradient"|"holographic", default solid; use gradient when two colors are asked for), color (optional: hex or any color name, shades allowed like \"dark green\", \"light blue\", \"neon pink\"), color2 (optional, second color for gradient), hoist (optional bool), mentionable (optional bool)
 delete_role: role
 rename_role: role, name
 role_color: role, color
@@ -687,14 +698,41 @@ def find_member(guild, ref):
     return None
 
 def parse_color(v):
+    """Hex (#rrggbb, #rgb), rgb(r,g,b), or a color name with optional shades:
+    'dark green', 'very light blue', 'neon pink', 'sky blue'. Returns None if not understood."""
     if v is None or str(v).strip() == "":
         return None
-    s = str(v).strip().lower().lstrip("#")
-    if s in COLOR_NAMES:
-        return discord.Colour(COLOR_NAMES[s])
-    if re.fullmatch(r"[0-9a-f]{6}", s):
-        return discord.Colour(int(s, 16))
-    return None
+    s = str(v).strip().lower().replace("-", " ").replace("_", " ")
+    h = s.lstrip("#")
+    if h.startswith("0x"):
+        h = h[2:]
+    if re.fullmatch(r"[0-9a-f]{3}", h):
+        h = "".join(c * 2 for c in h)
+    if re.fullmatch(r"[0-9a-f]{6}", h) and (s.startswith(("#", "0x")) or not h.isalpha()):
+        return discord.Colour(int(h, 16) or 0x010101)
+    m = re.fullmatch(r"rgb\(?\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})\s*\)?", s)
+    if m:
+        r, g, b = (min(255, int(x)) for x in m.groups())
+        return discord.Colour(((r << 16) | (g << 8) | b) or 0x010101)
+
+    words = s.split()
+    strong = any(w in STRONG_WORDS for w in words)
+    dark = any(w in DARK_WORDS for w in words)
+    light = any(w in LIGHT_WORDS for w in words)
+    bright = any(w in BRIGHT_WORDS for w in words)
+    rest = [w for w in words if w not in DARK_WORDS | LIGHT_WORDS | BRIGHT_WORDS | STRONG_WORDS]
+    base = BASE_COLORS.get("".join(rest)) or (BASE_COLORS.get(rest[-1]) if rest else None)
+    if base is None:
+        return None
+    hh, ll, ss = colorsys.rgb_to_hls((base >> 16 & 255) / 255, (base >> 8 & 255) / 255, (base & 255) / 255)
+    if dark:
+        ll *= 0.25 if strong else 0.5
+    if light:
+        ll += (1 - ll) * (0.75 if strong else 0.5)
+    if bright:
+        ss, ll = 1.0, 0.5
+    r, g, b = (round(x * 255) for x in colorsys.hls_to_rgb(hh, max(0.0, min(1.0, ll)), ss))
+    return discord.Colour(((r << 16) | (g << 8) | b) or 0x010101)
 
 def clean_channel_name(v):
     return str(v or "").strip().lstrip("#")[:100]
