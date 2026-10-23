@@ -262,6 +262,10 @@ def is_authorized_manager(member):
             return True
     return False
 
+def is_server_admin(member):
+    """Server admins, plus the bot owners in ANY server (so you can run /setup etc. everywhere)."""
+    return member.id in BOT_OWNER_IDS or member.guild_permissions.administrator
+
 def is_vip(member, guild_id):
     """Booster, VIP role, or admin: may hold Superpower nations."""
     if member is None:
@@ -2136,7 +2140,7 @@ async def clearchat_all_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="setup", description="Admin setup panel")
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
@@ -2196,7 +2200,7 @@ async def on_ready():
 @bot.command()
 @commands.guild_only()
 async def sync(ctx):
-    if not ctx.author.guild_permissions.administrator:
+    if not is_server_admin(ctx.author):
         await ctx.send("Admins only.")
         return
     s = await bot.tree.sync()
@@ -2279,7 +2283,7 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
 @bot.tree.command(name="blacklist", description="Blacklist user")
 @app_commands.guild_only()
 async def blacklist(interaction: discord.Interaction, user: discord.Member):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
@@ -2300,7 +2304,7 @@ async def blacklist(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="spawn_leaderboard", description="Spawn live leaderboard")
 @app_commands.guild_only()
 async def spawn_lb(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
