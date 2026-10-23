@@ -9,6 +9,7 @@ import difflib
 import asyncio
 import datetime
 import aiohttp
+from discord.http import Route
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from discord import app_commands
@@ -192,7 +193,8 @@ db = load_db()
 for k in ["server_config", "events", "blacklists", "hosts"]:
     if k not in db: 
         db[k] = {}
-db.setdefault("trusted_users", [])
+if not isinstance(db.get("trusted_users"), dict):
+    db["trusted_users"] = {}  # old global list is dropped: re-add people per server with /trust
 
 swap_cooldowns = {}
 
@@ -509,6 +511,8 @@ PERM_FOR = {
     "slowmode": "manage_channels", "set_topic": "manage_channels", "move_channel": "manage_channels",
     "create_role": "manage_roles", "delete_role": "manage_roles", "rename_role": "manage_roles",
     "role_color": "manage_roles", "give_role": "manage_roles", "remove_role": "manage_roles",
+    "move_role": "manage_roles", "role_permissions": "manage_roles",
+    "role_style": "manage_roles", "role_display": "manage_roles",
     "kick": "kick_members", "ban": "ban_members", "unban": "ban_members",
     "timeout": "moderate_members", "untimeout": "moderate_members",
     "nickname": "manage_nicknames", "purge": "manage_messages", "send_message": "send_messages",
@@ -539,10 +543,14 @@ unlock_channel: channel (optional)
 slowmode: channel (optional), seconds (0-21600)
 set_topic: channel (optional), topic
 move_channel: channel, category
-create_role: name, color (optional, hex or color name), hoist (optional bool), mentionable (optional bool)
+create_role: name, style (optional: "solid"|"gradient"|"holographic", default solid; use gradient when two colors are asked for), color (optional, hex or color name), color2 (optional, second color for gradient), hoist (optional bool), mentionable (optional bool)
 delete_role: role
 rename_role: role, name
 role_color: role, color
+role_style: role, style ("solid"|"gradient"|"holographic"), color (optional), color2 (needed for gradient)
+role_display: role, hoist (optional bool: true = "display role members separately"), mentionable (optional bool: true = "allow anyone to @mention this role")
+move_role: role, above (a role) OR below (a role)    (puts the role right above/below that role in the hierarchy)
+role_permissions: role, allow (list), deny (list)    (use Discord permission names in snake_case, e.g. attach_files for images, embed_links, add_reactions, use_external_emojis, send_messages)
 give_role: members (list), role
 remove_role: members (list), role
 kick: member, reason (optional)
@@ -563,9 +571,13 @@ class AdminCtx:
         self.reason = f"Requested by {msg.author} via Host Assistant"
 
 def is_trusted(member):
-    """You (BOT_OWNER_IDS), ALLOWED_USER_IDS, and anyone you add with /trust."""
-    return (member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS
-            or member.id in db.get("trusted_users", []))
+    """Hardcoded IDs work everywhere. People added with /trust only count in the server where you added them."""
+    if member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS:
+        return True
+    guild = getattr(member, "guild", None)
+    if guild is None:
+        return False
+    return member.id in db.get("trusted_users", {}).get(str(guild.id), [])
 
 def has_perm(member, perm):
     # Strict: only trusted people and real server admins may run admin actions.
@@ -840,14 +852,95 @@ async def act_move_channel(ctx, a):
     await ch.edit(category=cat, reason=ctx.reason)
     return True, f"Moved {ch.mention} into **{cat.name}**"
 
+def _to_bool(v, default=None):
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "yes", "on", "1", "y")
+
+HOLO_COLORS = (11127295, 16759788, 16761760)  # Discord's fixed holographic palette
+
+async def _patch_role_colors(ctx, role, primary, secondary=None, tertiary=None):
+    """Role gradient/holographic styles are set through the API's `colors` object."""
+    route = Route("PATCH", "/guilds/{guild_id}/roles/{role_id}", guild_id=ctx.guild.id, role_id=role.id)
+    payload = {"colors": {"primary_color": primary, "secondary_color": secondary, "tertiary_color": tertiary}}
+    await bot.http.request(route, json=payload, reason=ctx.reason)
+
+async def apply_role_style(ctx, role, style, c1, c2):
+    """Returns (style_actually_applied, note). Falls back to solid if the server hasn't unlocked the style."""
+    if style == "solid":
+        base = c1 or role.colour
+        try:
+            await _patch_role_colors(ctx, role, base.value)
+        except discord.HTTPException:
+            await role.edit(colour=base, reason=ctx.reason)
+        return "solid", ""
+    colors = HOLO_COLORS if style == "holographic" else (c1.value, c2.value, None)
+    try:
+        await _patch_role_colors(ctx, role, *colors)
+        return style, ""
+    except discord.HTTPException as e:
+        print(f"role style {style} failed:", e)
+        fallback = c1 or discord.Colour(HOLO_COLORS[0])
+        try:
+            await role.edit(colour=fallback, reason=ctx.reason)
+        except discord.HTTPException:
+            pass
+        return "solid", f" ({style} isn't unlocked here, the server probably needs more boosts, so I used a solid color)"
+
 async def act_create_role(ctx, a):
     name = str(a.get("name") or "").strip()[:100]
     if not name:
         return False, "Missing role name."
+    style = str(a.get("style") or "solid").lower()
+    if style not in ("solid", "gradient", "holographic"):
+        style = "solid"
+    c1, c2 = parse_color(a.get("color")), parse_color(a.get("color2"))
+    if style == "gradient" and not (c1 and c2):
+        return False, "A gradient needs two colors."
     role = await ctx.guild.create_role(
-        name=name, colour=parse_color(a.get("color")) or discord.Colour.default(),
-        hoist=bool(a.get("hoist", False)), mentionable=bool(a.get("mentionable", True)), reason=ctx.reason)
-    return True, f"Created role {role.mention}"
+        name=name, colour=c1 or discord.Colour.default(),
+        hoist=bool(_to_bool(a.get("hoist"), False)), mentionable=bool(_to_bool(a.get("mentionable"), True)),
+        reason=ctx.reason)
+    note = ""
+    if style != "solid":
+        style, note = await apply_role_style(ctx, role, style, c1, c2)
+    label = f" ({style})" if style != "solid" else ""
+    return True, f"Created role {role.mention}{label}{note}"
+
+async def act_role_style(ctx, a):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    style = str(a.get("style") or "").lower()
+    if style not in ("solid", "gradient", "holographic"):
+        return False, "Style must be solid, gradient or holographic."
+    c1, c2 = parse_color(a.get("color")), parse_color(a.get("color2"))
+    if style == "gradient" and not (c1 and c2):
+        return False, "A gradient needs two colors."
+    applied, note = await apply_role_style(ctx, role, style, c1, c2)
+    return True, f"{role.mention} is now {applied}{note}"
+
+async def act_role_display(ctx, a):
+    role = find_role(ctx.guild, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    hoist, ment = _to_bool(a.get("hoist")), _to_bool(a.get("mentionable"))
+    if hoist is None and ment is None:
+        return False, "Tell me what to change: display separately and/or mentionable."
+    kw = {}
+    bits = []
+    if hoist is not None:
+        kw["hoist"] = hoist
+        bits.append(f"display separately {'on' if hoist else 'off'}")
+    if ment is not None:
+        kw["mentionable"] = ment
+        bits.append(f"mentionable {'on' if ment else 'off'}")
+    await role.edit(reason=ctx.reason, **kw)
+    return True, f"{role.mention}: " + ", ".join(bits)
 
 async def act_delete_role(ctx, a):
     role = find_role(ctx.guild, a.get("role"))
@@ -994,6 +1087,98 @@ async def act_send_message(ctx, a):
     await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
     return True, f"Sent your message in {ch.mention}"
 
+# ---------- role hierarchy + role permissions ----------
+PERM_ALIASES = {
+    "images": "attach_files", "image": "attach_files", "send_images": "attach_files", "files": "attach_files",
+    "attach_images": "attach_files", "upload_files": "attach_files", "embeds": "embed_links", "links": "embed_links",
+    "send_links": "embed_links", "reactions": "add_reactions", "emojis": "use_external_emojis",
+    "external_emojis": "use_external_emojis", "stickers": "use_external_stickers",
+    "external_stickers": "use_external_stickers", "send": "send_messages", "talk": "speak", "voice": "connect",
+    "history": "read_message_history", "view": "view_channel", "threads": "send_messages_in_threads",
+}
+# Only the bot owner may GRANT these (and it always needs a Confirm click).
+DANGEROUS_PERMS = {
+    "administrator", "manage_guild", "manage_roles", "manage_channels", "ban_members", "kick_members",
+    "manage_webhooks", "mention_everyone", "moderate_members", "manage_messages", "manage_nicknames",
+    "view_audit_log", "manage_expressions", "manage_emojis_and_stickers", "manage_threads", "manage_events",
+}
+
+def norm_perm(name):
+    n = re.sub(r"[\s\-]+", "_", str(name).strip().lower())
+    n = PERM_ALIASES.get(n, n)
+    return n if n in discord.Permissions.VALID_FLAGS else None
+
+def norm_perms(v):
+    out = []
+    for x in as_list(v):
+        n = norm_perm(x)
+        if n and n not in out:
+            out.append(n)
+    return out
+
+async def act_move_role(ctx, a):
+    g = ctx.guild
+    role = find_role(g, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    above_ref, below_ref = a.get("above"), a.get("below")
+    target = find_role(g, above_ref or below_ref)
+    if not target or target.is_default():
+        return False, "Couldn't find the role to place it next to."
+    if target.id == role.id:
+        return False, "That's the same role."
+    tp = target.position
+    if above_ref:
+        new = tp if role.position < tp else tp + 1
+    else:
+        new = tp if role.position > tp else tp - 1
+    new = max(1, new)
+    if new >= g.me.top_role.position:
+        return False, "That spot is above my own role. Move my role higher first."
+    if not (ctx.author.id in BOT_OWNER_IDS or ctx.author.id == g.owner_id) and new >= ctx.author.top_role.position:
+        return False, "You can only place roles below your own highest role."
+    await role.edit(position=new, reason=ctx.reason)
+    return True, f"Moved {role.mention} {'above' if above_ref else 'below'} {target.mention}"
+
+async def act_role_permissions(ctx, a):
+    g = ctx.guild
+    role = find_role(g, a.get("role"))
+    ok, why = check_role(ctx, role)
+    if not ok:
+        return False, why
+    allow_raw, deny_raw = as_list(a.get("allow")), as_list(a.get("deny"))
+    allow, deny = norm_perms(allow_raw), norm_perms(deny_raw)
+    unknown = [str(x) for x in allow_raw + deny_raw if not norm_perm(x)]
+    if not allow and not deny:
+        return False, "I didn't recognise any of those permissions."
+    if set(allow) & set(deny):
+        return False, "Same permission in both allow and deny."
+    is_owner = ctx.author.id in BOT_OWNER_IDS
+    bad = [p for p in allow if p in DANGEROUS_PERMS]
+    if bad and not is_owner:
+        return False, "Only the bot owner can grant: " + ", ".join(p.replace("_", " ") for p in bad)
+    mep = g.me.guild_permissions
+    for p in allow:
+        if not (mep.administrator or getattr(mep, p, False)):
+            return False, f"I don't have **{p.replace('_', ' ')}** myself, so I can't grant it."
+        if not (is_owner or ctx.author.id == g.owner_id):
+            ap = ctx.author.guild_permissions
+            if not (ap.administrator or getattr(ap, p, False)):
+                return False, f"You don't have **{p.replace('_', ' ')}** yourself."
+    perms = discord.Permissions(role.permissions.value)
+    perms.update(**{**{p: True for p in allow}, **{p: False for p in deny}})
+    await role.edit(permissions=perms, reason=ctx.reason)
+    bits = []
+    if allow:
+        bits.append("allowed " + ", ".join(p.replace("_", " ") for p in allow))
+    if deny:
+        bits.append("denied " + ", ".join(p.replace("_", " ") for p in deny))
+    text = f"Updated {role.mention}: " + "; ".join(bits)
+    if unknown:
+        text += f" (ignored: {', '.join(unknown)})"
+    return True, text
+
 ADMIN_ACTIONS = {
     "create_channel": act_create_channel, "delete_channel": act_delete_channel,
     "rename_channel": act_rename_channel, "channel_access": act_channel_access,
@@ -1001,6 +1186,8 @@ ADMIN_ACTIONS = {
     "slowmode": act_slowmode, "set_topic": act_set_topic, "move_channel": act_move_channel,
     "create_role": act_create_role, "delete_role": act_delete_role, "rename_role": act_rename_role,
     "role_color": act_role_color, "give_role": act_give_role, "remove_role": act_remove_role,
+    "move_role": act_move_role, "role_permissions": act_role_permissions,
+    "role_style": act_role_style, "role_display": act_role_display,
     "kick": act_kick, "ban": act_ban, "unban": act_unban,
     "timeout": act_timeout, "untimeout": act_untimeout, "nickname": act_nickname,
     "purge": act_purge, "send_message": act_send_message,
@@ -1009,6 +1196,8 @@ ADMIN_ACTIONS = {
 # ---------- planning / confirmation / execution ----------
 def needs_confirm(a):
     act = a.get("action")
+    if act == "role_permissions" and any(p in DANGEROUS_PERMS for p in norm_perms(a.get("allow"))):
+        return True
     return act in ALWAYS_CONFIRM or (act == "purge" and _to_int(a.get("count"), 10) > 20)
 
 def summarize(a):
@@ -1183,6 +1372,19 @@ def limit_words(t, n):
         return cut[:last + 1]
     return cut.rstrip(",;:- ")
 
+def dedupe_sentences(t):
+    """Models sometimes loop and repeat a sentence. Fix glued punctuation, then drop repeats."""
+    t = re.sub(r"([?!])(?=[A-Za-z])", r"\1 ", t)
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    seen, out = set(), []
+    for p in parts:
+        key = re.sub(r"[^a-z0-9]+", " ", p.lower()).strip()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return " ".join(out)
+
 def clean_ai_text(t):
     """Tidy model output: no stray headings, trailing spaces or big blank gaps."""
     t = t.replace("\r", "")
@@ -1244,7 +1446,7 @@ async def process_ai_queue():
                 ai_history[uid] = ai_history[uid][-6:]
 
                 messages = [{"role": "system", "content": pick_persona(msg.author)}] + ai_history[uid]
-                ans, groq_err, openrouter_err = await llm_complete(messages, temperature=0.9)
+                ans, groq_err, openrouter_err = await llm_complete(messages, temperature=0.8)
 
                 if not ans:
                     # Send detailed error logs directly to your Owner DM
@@ -1255,7 +1457,7 @@ async def process_ai_queue():
                     await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
 
-                ans = limit_words(clean_ai_text(ans), MAX_WORDS)
+                ans = limit_words(dedupe_sentences(clean_ai_text(ans)), MAX_WORDS)
                 ai_history[uid].append({"role": "assistant", "content": ans})
 
                 if len(ans) > 2000:
@@ -1860,8 +2062,8 @@ async def clearchat_all_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="setup", description="Admin setup panel")
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
     conf = get_config(interaction.guild_id)
@@ -1920,8 +2122,8 @@ async def on_ready():
 @bot.command()
 @commands.guild_only()
 async def sync(ctx):
-    if not is_staff(ctx.author):
-        await ctx.send("Admins or Bot Owners only.")
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("Admins only.")
         return
     s = await bot.tree.sync()
     await ctx.send(f"Synced {len(s)} commands.")
@@ -2003,8 +2205,8 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
 @bot.tree.command(name="blacklist", description="Blacklist user")
 @app_commands.guild_only()
 async def blacklist(interaction: discord.Interaction, user: discord.Member):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
     gid = str(interaction.guild_id)
@@ -2024,8 +2226,8 @@ async def blacklist(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="spawn_leaderboard", description="Spawn live leaderboard")
 @app_commands.guild_only()
 async def spawn_lb(interaction: discord.Interaction):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("Admins or Bot Owners only.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
         return
 
     emb = discord.Embed(title="Host Leaderboards", description="Updating...")
@@ -2039,28 +2241,34 @@ async def spawn_lb(interaction: discord.Interaction):
     await update_leaderboard(interaction.guild)
     await interaction.response.send_message("Leaderboard spawned.", ephemeral=True)
 
-@bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list")
+@bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list in THIS server")
+@app_commands.guild_only()
 async def trust_cmd(interaction: discord.Interaction, user: discord.User):
     if interaction.user.id not in BOT_OWNER_IDS:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
-    lst = db.setdefault("trusted_users", [])
+    lst = db["trusted_users"].setdefault(str(interaction.guild_id), [])
     if user.id in lst:
         lst.remove(user.id)
-        text = f"Removed {user.mention} from the admin list."
+        text = f"Removed {user.mention} from the admin list in this server."
     else:
         lst.append(user.id)
-        text = f"Added {user.mention} to the admin list."
+        text = f"Added {user.mention} to the admin list in this server."
     save_db(db)
     await interaction.response.send_message(text, ephemeral=True)
 
-@bot.tree.command(name="trusted_list", description="Owner only: show who can use admin actions")
+@bot.tree.command(name="trusted_list", description="Owner only: show who can use admin actions in this server")
+@app_commands.guild_only()
 async def trusted_list_cmd(interaction: discord.Interaction):
     if interaction.user.id not in BOT_OWNER_IDS:
         await interaction.response.send_message("Owner only.", ephemeral=True)
         return
-    ids = list(dict.fromkeys(BOT_OWNER_IDS + ALLOWED_USER_IDS + db.get("trusted_users", [])))
-    await interaction.response.send_message("Trusted: " + (", ".join(f"<@{i}>" for i in ids) or "none") + "\nServer admins can always use it too.", ephemeral=True)
+    here = db["trusted_users"].get(str(interaction.guild_id), [])
+    fixed = list(dict.fromkeys(BOT_OWNER_IDS + ALLOWED_USER_IDS))
+    text = ("**Everywhere (hardcoded):** " + (", ".join(f"<@{i}>" for i in fixed) or "none") +
+            "\n**This server only:** " + (", ".join(f"<@{i}>" for i in here) or "none") +
+            "\nServer admins can always use it too.")
+    await interaction.response.send_message(text, ephemeral=True)
 
 tk = os.environ.get("BOT_TOKEN")
 if tk:
