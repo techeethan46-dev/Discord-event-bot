@@ -68,6 +68,7 @@ ai_worker_task = None
 
 BOT_OWNER_IDS = [
     1359263076838539296,  # Your User ID
+    1298335881647620108,  # Added owner
 ]
 
 ALLOWED_USER_IDS = [
