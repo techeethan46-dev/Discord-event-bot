@@ -8,6 +8,7 @@ import re
 import difflib
 import asyncio
 import datetime
+import random
 import colorsys
 import aiohttp
 from discord.http import Route
@@ -78,6 +79,11 @@ ALLOWED_USER_IDS = [
 
 AI_COOLDOWN = 30   # seconds between AI chats per person
 MAX_WORDS = 25     # hard cap on reply length
+GIPHY_KEY = os.environ.get("GIPHY_API_KEY")   # free key from developers.giphy.com (GIFs are skipped without it)
+GIF_CHANCE = 0.10                              # ~1 in 10 replies comes with a GIF
+GIF_ADDON = ("\n\nFOR THIS REPLY ONLY: after your short text, add a tag like [gif: crying laughing] with a "
+             "1 to 3 word GIF search that fits the mood. The text itself still stays under 25 words.")
+GIF_TAG_RE = re.compile(r"\[gif:\s*([^\]]{1,40})\]", re.IGNORECASE)
 
 _PERSONA_BASE = """
 You're texting in a Discord server. You're a bot and you never hide it if asked, but you text like a real person, never like an assistant.
@@ -374,77 +380,222 @@ async def update_leaderboard(guild):
     except discord.HTTPException as e:
         print("leaderboard edit failed:", e)
 
+SECTION_SEP = "\n─────────────────────\n"
+EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
+
 def build_embed(name, info, guild=None):
-    start = info["start_time"]
-    end = info["end_time"]
-    host = info["host_id"]
-    cohost = info.get("cohost_id")
+    start, end = info["start_time"], info["end_time"]
+    host, cohost = info["host_id"], info.get("cohost_id")
     res = info["reservations"]
     wait = info.get("waitlist", [])
     sps = info.get("superpowers", [])
+    helpers = info.get("helpers", [])
     max_p = info.get("max_players", 0)
-
     now = int(time.time())
-    is_live = now >= end and not info.get("concluded")
 
+    sp_set = {s.title() for s in sps}
     sp_role = get_config(guild.id).get("superpower_role") if guild else None
-    sp_lines, reg_lines = [], []
 
-    for country, u_data in res.items():
-        uid = u_data['discord_id']
+    sp_lines, reg_lines = [], []
+    for country, u in res.items():
+        uid = u["discord_id"]
         badge = ""
         if guild:
             mem = guild.get_member(uid)
             if mem and (mem.premium_since or (sp_role and sp_role in [r.id for r in mem.roles])):
                 badge = " 💎"
+        line = f"• {get_flag(country)} **{country}** · `{u['roblox']}` · <@{uid}>{badge}"
+        (sp_lines if country.title() in sp_set else reg_lines).append(line)
 
-        line = f"• {get_flag(country)} **{country}:** `{u_data['roblox']}` (<@{uid}>){badge}"
-        if country.title() in [s.title() for s in sps]: 
-            sp_lines.append(line)
-        else: 
-            reg_lines.append(line)
+    if info.get("concluded"):
+        emoji, color, status = "🔒", 0xE74C3C, "🔒 **Concluded**"
+    elif now >= end:
+        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ **Live** · reservations closed <t:{end}:R>"
+    elif now < start:
+        emoji, color, status = "🕒", 0x3498DB, f"🕒 **Opens** <t:{start}:R>"
+    else:
+        emoji, color, status = "🚩", 0x2ECC71, f"🟢 **Open** · closes <t:{end}:R>"
+
+    h_str = f"<@{host}>" + (f" & <@{cohost}>" if cohost else "")
+    head = f"{status}\n\n### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}"
+    if helpers:
+        head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
+    head += SECTION_SEP
 
     sp_sec = ""
     if sps:
         unclaimed = [s for s in sps if s.title() not in res]
-        text = "\n".join(sp_lines) if sp_lines else ""
-        if unclaimed: 
-            text += f"\n*Available:* " + ", ".join([f"**{s}**" for s in unclaimed])
-        sp_sec = f"### ⭐ Superpowers\n{text.strip()}\n\n"
+        body = "\n".join(sp_lines)
+        if unclaimed:
+            body += ("\n" if body else "") + "*Available:* " + ", ".join(f"**{s}**" for s in unclaimed)
+        sp_sec = f"### ⭐ Superpowers\n{body}{SECTION_SEP}"
 
     wait_sec = ""
     if wait:
-        lines = [f"• {get_flag(w['country'])} **{w['country']}**: <@{w['discord_id']}>" for w in wait[:5]]
-        wait_sec = f"\n\n### ⏳ Waitlist ({len(wait)})\n" + "\n".join(lines)
+        w_lines = [f"• {get_flag(w['country'])} **{w['country']}** · <@{w['discord_id']}>" for w in wait[:5]]
+        more = f"\n*+{len(wait) - 5} more*" if len(wait) > 5 else ""
+        wait_sec = f"### ⏳ Waitlist ({len(wait)})\n" + "\n".join(w_lines) + more
 
-    if info.get("concluded"):
-        hdr = "🔒 **[CONCLUDED]**"
-        tmr = f"• **Ended:** <t:{end}:f>"
-        clr = 0xE74C3C
-    elif is_live:
-        hdr = "⚔️ **[LIVE]**"
-        tmr = f"• **Closed:** <t:{end}:f>\n• **Elapsed:** <t:{end}:R>"
-        clr = 0xF1C40F
-    else:
-        hdr = "🚩 **[OPEN]**"
-        tmr = f"• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f> (<t:{end}:R>)"
-        clr = 0x2ECC71
+    chunks = []
+    cur = head + sp_sec + f"### 📋 Reservations ({len(reg_lines)})\n"
+    if not reg_lines:
+        cur += "*No reservations yet*"
+    shown = 0
+    for ln in reg_lines:
+        if len(cur) + len(ln) + 1 > EMBED_CHUNK:
+            if chunks:  # max two embeds per message
+                break
+            chunks.append(cur.rstrip("\n"))
+            cur = "### 📋 Reservations (continued)\n"
+        cur += ln + "\n"
+        shown += 1
+    if shown < len(reg_lines):
+        cur += f"*…and {len(reg_lines) - shown} more*\n"
+    cur = cur.rstrip("\n")
+    if wait_sec:
+        if len(cur) + len(wait_sec) + 2 > EMBED_CHUNK and not chunks:
+            chunks.append(cur)
+            cur = wait_sec
+        else:
+            cur += "\n\n" + wait_sec
+    chunks.append(cur)
+    chunks = [c[:EMBED_CHUNK + 200] for c in chunks]
 
-    emb = discord.Embed(color=clr, title=f"{hdr} {name}")
-    h_str = f"<@{host}>"
-    if cohost: 
-        h_str += f" & <@{cohost}>"
+    n = len(chunks)
+    embs = []
+    for i, d in enumerate(chunks):
+        title = f"{emoji} {name}" + (f" · Part {i + 1}/{n}" if n > 1 else "")
+        embs.append(discord.Embed(color=color, title=title[:250], description=d))
+    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live")
+    return embs
 
-    desc = f"### 🗓️ Schedule\n{tmr}\n• **Host:** {h_str}\n\n─────────────\n\n{sp_sec}### 📋 Reservations\n"
-    desc += "\n".join(reg_lines) if reg_lines else "*None*"
-    desc += wait_sec
+# ==========================================
+# PER-EVENT LOG EMBED (one live embed per event, browsable by category)
+# ==========================================
+LOG_CATS = {
+    "reservation": ("📋", "Reservations"),
+    "waitlist": ("⏳", "Waitlist"),
+    "swap": ("🔄", "Swaps"),
+    "host": ("🛠️", "Host actions"),
+}
+LOG_BLUE = 0x3498DB
+LOG_PAGE_SIZE = 8
 
-    if len(desc) > 3900:
-        desc = desc[:3850] + "\n\n*... list cut off due to length.*"
+def _log_line(e):
+    emoji = LOG_CATS.get(e["c"], ("•", ""))[0]
+    return f"{emoji} <t:{e['t']}:d> <t:{e['t']}:t> · {e['m']}"
 
-    emb.description = desc
-    emb.set_footer(text=f"Joined: {len(res)}{f' / {max_p}' if max_p > 0 else ''} Players")
-    return [emb]
+def build_log_embed(info):
+    logs = info.get("logs", [])
+    counts = {c: sum(1 for e in logs if e["c"] == c) for c in LOG_CATS}
+    stats = "\n".join(f"{LOG_CATS[c][0]} **{LOG_CATS[c][1]}** · {counts[c]}" for c in LOG_CATS)
+    recent = "\n".join(_log_line(e) for e in reversed(logs[-5:])) or "*No activity yet*"
+    desc = f"### 📊 Overview\n{stats}\n\n### 🕒 Latest activity\n{recent}"
+    if info.get("helpers"):
+        desc += "\n\n### 🤝 Helpers\n" + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
+    emb = discord.Embed(color=LOG_BLUE, title=f"📜 Event Log · {info['display_name']}"[:250], description=desc[:4000])
+    state = "🔒 Concluded" if info.get("concluded") else "🟢 Live"
+    emb.set_footer(text=f"{len(logs)} entries · {state} · pick a category below to browse")
+    return emb
+
+def find_event_by_log(msg_id):
+    for info in db["events"].values():
+        if (info.get("log_msg") or {}).get("id") == msg_id:
+            return info
+    return None
+
+async def refresh_log_message(info):
+    lm = info.get("log_msg")
+    if not lm:
+        return False
+    ch = bot.get_channel(lm["ch"])
+    if not ch:
+        return False
+    try:
+        m = await ch.fetch_message(lm["id"])
+        await m.edit(embed=build_log_embed(info))
+        return True
+    except discord.NotFound:
+        info.pop("log_msg", None)  # message was deleted: respawn on the next entry
+        save_db(db)
+        return False
+    except discord.HTTPException as e:
+        print("refresh_log_message failed:", e)
+        return False
+
+async def spawn_event_log(guild, info):
+    log_id = get_config(guild.id).get("log_channel")
+    ch = guild.get_channel(log_id) if log_id else None
+    if not ch:
+        return False
+    try:
+        m = await ch.send(embed=build_log_embed(info), view=EventLogView())
+        info["log_msg"] = {"ch": ch.id, "id": m.id}
+        save_db(db)
+        return True
+    except discord.HTTPException as e:
+        print("spawn_event_log failed:", e)
+        return False
+
+async def event_log(guild, info, cat, text):
+    """Record an entry on the event and update (or create) its log embed."""
+    logs = info.setdefault("logs", [])
+    logs.append({"t": int(time.time()), "c": cat, "m": str(text)[:300]})
+    if len(logs) > 500:
+        del logs[:-500]
+    save_db(db)
+    if info.get("log_msg"):
+        await refresh_log_message(info)
+    if not info.get("log_msg"):
+        await spawn_event_log(guild, info)
+
+class LogPager(discord.ui.View):
+    def __init__(self, info, cat):
+        super().__init__(timeout=180)
+        self.info, self.cat, self.page = info, cat, 0
+
+    def build(self):
+        logs = self.info.get("logs", [])
+        rows = list(reversed([e for e in logs if self.cat == "all" or e["c"] == self.cat]))
+        pages = max(1, -(-len(rows) // LOG_PAGE_SIZE))
+        self.page = max(0, min(self.page, pages - 1))
+        chunk = rows[self.page * LOG_PAGE_SIZE:(self.page + 1) * LOG_PAGE_SIZE]
+        label = "📜 All activity" if self.cat == "all" else f"{LOG_CATS[self.cat][0]} {LOG_CATS[self.cat][1]}"
+        emb = discord.Embed(color=LOG_BLUE, title=f"{label} · {self.info['display_name']}"[:250],
+                            description="\n".join(_log_line(e) for e in chunk) or "*Nothing here yet*")
+        emb.set_footer(text=f"Page {self.page + 1}/{pages} · {len(rows)} entries")
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= pages - 1
+        return emb
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction, btn):
+        self.page -= 1
+        await interaction.response.edit_message(embed=self.build(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction, btn):
+        self.page += 1
+        await interaction.response.edit_message(embed=self.build(), view=self)
+
+class EventLogView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(custom_id="evlog_select", placeholder="Browse logs by category", options=[
+        discord.SelectOption(label="All activity", value="all", emoji="📜"),
+        discord.SelectOption(label="Reservations", value="reservation", emoji="📋"),
+        discord.SelectOption(label="Waitlist", value="waitlist", emoji="⏳"),
+        discord.SelectOption(label="Swaps", value="swap", emoji="🔄"),
+        discord.SelectOption(label="Host actions", value="host", emoji="🛠️"),
+    ])
+    async def pick(self, interaction, select):
+        info = find_event_by_log(interaction.message.id)
+        if not info:
+            await interaction.response.send_message("This event log is no longer available.", ephemeral=True)
+            return
+        pager = LogPager(info, select.values[0])
+        await interaction.response.send_message(embed=pager.build(), view=pager, ephemeral=True)
 
 async def process_waitlist(info, opened, guild, channel):
     wait = info.get("waitlist", [])
@@ -485,6 +636,7 @@ async def process_waitlist(info, opened, guild, channel):
     wait.remove(promo)
 
     info["reservations"][promo["country"].title()] = {"roblox": promo["roblox"], "discord_id": promo["discord_id"]}
+    await event_log(guild, info, "waitlist", f"<@{promo['discord_id']}> got **{promo['country'].title()}** from the waitlist")
 
     await add_event_role(guild, promo["discord_id"])
 
@@ -785,7 +937,16 @@ async def act_create_channel(ctx, a):
         return False, "Missing channel name."
     ctype = str(a.get("type") or "text").lower()
     cat = find_channel(ctx.guild, a.get("category"), (discord.CategoryChannel,)) if a.get("category") else None
-    roles = [r for r in (find_role(ctx.guild, x) for x in as_list(a.get("roles"))) if r]
+    roles, missing = [], []
+    for x in as_list(a.get("roles")):
+        r = find_role(ctx.guild, x)
+        if r:
+            roles.append(r)
+        else:
+            missing.append(str(x))
+    if missing:
+        # Never fall back to a PUBLIC channel when the person asked for a private one.
+        return False, f"Couldn't find the role {', '.join(missing)}, so I didn't create anything."
     overwrites = {}
     if roles:
         overwrites[ctx.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
@@ -1399,18 +1560,18 @@ async def run_admin_flow(msg, txt):
             ok_count += 1 if ok else 0
 
         if ok_count == len(plan):
-            title, color = "Done", 0x2ECC71
+            title, color = "✅ Done", 0x2ECC71
         elif ok_count == 0:
-            title, color = "Couldn't do that", 0xE74C3C
+            title, color = "❌ Couldn't do that", 0xE74C3C
         else:
-            title, color = "Partly done", 0xE67E22
+            title, color = "⚠️ Partly done", 0xE67E22
         emb = discord.Embed(title=title, description="\n".join(lines)[:3900], color=color)
         emb.set_footer(text=f"Requested by {msg.author.display_name}")
         await safe_reply(msg, embed=emb)
 
         if ok_count:
             await log_action(msg.guild, "AI Admin Action",
-                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500])
+                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500], color=0xE74C3C)
     except Exception as e:
         print("run_admin_flow error:", e)
         await dm_owners(f"⚠️ **Admin flow exception:** `{e}`")
@@ -1509,6 +1670,27 @@ async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=No
 
     return ans, groq_err, openrouter_err
 
+async def fetch_gif(query):
+    """A real GIF from Giphy (never a model-invented link). Returns a URL or None."""
+    if not GIPHY_KEY or not query:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get("https://api.giphy.com/v1/gifs/search", params={
+                    "api_key": GIPHY_KEY, "q": query[:40], "limit": 8, "rating": "pg-13", "lang": "en"}) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+        items = data.get("data") or []
+        if not items:
+            return None
+        imgs = random.choice(items).get("images", {})
+        return (imgs.get("downsized") or imgs.get("original") or {}).get("url")
+    except Exception as e:
+        print("fetch_gif failed:", e)
+        return None
+
 async def process_ai_queue():
     while True:
         msg, txt, uid = await ai_queue.get()
@@ -1523,7 +1705,9 @@ async def process_ai_queue():
                 ai_history[uid].append({"role": "user", "content": txt})
                 ai_history[uid] = ai_history[uid][-6:]
 
-                messages = [{"role": "system", "content": pick_persona(msg.author)}] + ai_history[uid]
+                want_gif = bool(GIPHY_KEY) and random.random() < GIF_CHANCE
+                persona = pick_persona(msg.author) + (GIF_ADDON if want_gif else "")
+                messages = [{"role": "system", "content": persona}] + ai_history[uid]
                 ans, groq_err, openrouter_err = await llm_complete(messages, temperature=0.8)
 
                 if not ans:
@@ -1535,30 +1719,23 @@ async def process_ai_queue():
                     await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
 
+                tag = GIF_TAG_RE.search(ans)
+                gif_query = tag.group(1).strip() if (tag and want_gif) else None
+                ans = GIF_TAG_RE.sub("", ans)
+                ans = re.sub(r"https?://\S+", "", ans)  # the model never posts raw links
                 ans = limit_words(dedupe_sentences(clean_ai_text(ans)), MAX_WORDS)
-                ai_history[uid].append({"role": "assistant", "content": ans})
+                ai_history[uid].append({"role": "assistant", "content": ans or "lol"})
 
                 if len(ans) > 2000:
                     ans = ans[:1996] + "..."
 
-                # Direct image/GIF links get embedded cleanly. (Giphy/Tenor page links are
-                # left as-is: Discord unfurls those into GIFs by itself.)
-                url_match = GIF_RE.search(ans)
-                if url_match:
-                    gif_url = url_match.group(0)
-                    clean_text = ans.replace(gif_url, "").strip()
-                    if await verify_image_url(gif_url):
-                        emb = discord.Embed(color=0x2ECC71)
-                        emb.set_image(url=gif_url)
-                        if clean_text:
-                            await safe_reply(msg, clean_text, embed=emb)
-                        else:
-                            await safe_reply(msg, embed=emb)
-                    else:
-                        # Dead/made-up link: drop it instead of posting an empty embed.
-                        await safe_reply(msg, clean_text or "bruh")
+                gif_url = await fetch_gif(gif_query) if gif_query else None
+                if gif_url:
+                    emb = discord.Embed(color=0x2B2D31)  # same shade as the dark theme, so no visible bar
+                    emb.set_image(url=gif_url)
+                    await safe_reply(msg, ans or None, embed=emb)
                 else:
-                    await safe_reply(msg, ans)
+                    await safe_reply(msg, ans or "lol")
         except Exception as e:
             print("AI Chat Error:", e)
             await dm_owners(f"⚠️ **Critical AI Exception:** `{e}`")
@@ -1620,7 +1797,16 @@ async def handle_ai_trigger(msg):
     # Individual per-user cooldown check (AI_COOLDOWN)
     last_msg_time = user_cooldowns.get(uid, 0)
     if now - last_msg_time < AI_COOLDOWN:
-        await safe_reply(msg, f"ayo chill for {AI_COOLDOWN} seconds.", delete_after=5)
+        wait = int(AI_COOLDOWN - (now - last_msg_time)) + 1
+        try:
+            await msg.delete()  # needs Manage Messages; silently skipped if the bot lacks it
+        except discord.HTTPException:
+            pass
+        try:
+            await msg.channel.send(f"{msg.author.mention} ayo wait {wait} more seconds", delete_after=5,
+                                   allowed_mentions=discord.AllowedMentions(users=[msg.author]))
+        except discord.HTTPException:
+            pass
         return
 
     user_cooldowns[uid] = now
@@ -1749,6 +1935,7 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
 
             await refresh_event_message(info, interaction.guild)
             await interaction.response.send_message(f"Spot taken/full! Added to waitlist for {c_title}.", ephemeral=True)
+            await event_log(interaction.guild, info, "waitlist", f"<@{interaction.user.id}> joined the waitlist for **{c_title}**")
             return
 
         matches = difflib.get_close_matches(c_title, list(info["reservations"].keys()), cutoff=0.88)
@@ -1766,10 +1953,10 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
         info["waitlist"] = [w for w in info["waitlist"] if w["discord_id"] != interaction.user.id]
         save_db(db)
 
+        await interaction.response.send_message(f"Reserved **{c_title}**!", ephemeral=True)
         await add_event_role(interaction.guild, interaction.user.id)
         await refresh_event_message(info, interaction.guild)
-        await log_action(interaction.guild, "Spot Claimed", f"<@{interaction.user.id}> reserved **{c_title}**.")
-        await interaction.response.send_message(f"Reserved **{c_title}**!", ephemeral=True)
+        await event_log(interaction.guild, info, "reservation", f"<@{interaction.user.id}> reserved **{c_title}**")
 
 class SwapModal(discord.ui.Modal, title="Propose Swap"):
     target = discord.ui.TextInput(label="Nation You Want", required=True, max_length=40)
@@ -1820,6 +2007,7 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
         emb = discord.Embed(title="🔄 Swap Request", description=f"<@{interaction.user.id}> wants to swap with <@{t_id}>!\n\nGives: {get_flag(u_c)} **{u_c}**\nGets: {get_flag(t_c)} **{t_c}**", color=0xF1C40F)
         await swap_ch.send(content=f"<@{t_id}>", embed=emb, view=SwapAcceptView(self.key, interaction.user.id, t_id, u_c, t_c))
         await interaction.response.send_message(f"Proposal sent in <#{ch_id}>!", ephemeral=True)
+        await event_log(interaction.guild, info, "swap", f"<@{interaction.user.id}> proposed a swap with <@{t_id}> ({u_c} ↔ {t_c})")
 
 class SwapAcceptView(discord.ui.View):
     def __init__(self, key, s_id, t_id, s_c, t_c):
@@ -1866,7 +2054,7 @@ class SwapAcceptView(discord.ui.View):
         emb.title = "✅ Swap Completed"
         await interaction.response.edit_message(embed=emb, view=self)
         await refresh_event_message(info, interaction.guild)
-        await log_action(interaction.guild, "Swap", f"<@{self.s_id}> and <@{self.t_id}> swapped spots.")
+        await event_log(interaction.guild, info, "swap", f"<@{self.s_id}> and <@{self.t_id}> swapped **{self.s_c}** ↔ **{self.t_c}**")
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline(self, interaction, btn):
@@ -1881,6 +2069,9 @@ class SwapAcceptView(discord.ui.View):
         emb.color = 0xE74C3C
         emb.title = "❌ Swap Declined"
         await interaction.response.edit_message(embed=emb, view=self)
+        info = db["events"].get(self.key)
+        if info:
+            await event_log(interaction.guild, info, "swap", f"<@{self.t_id}> declined a swap from <@{self.s_id}>")
 
 class KickSelect(discord.ui.Select):
     def __init__(self, key, res):
@@ -1907,7 +2098,7 @@ class KickSelect(discord.ui.Select):
 
         save_db(db)
         await refresh_event_message(info, interaction.guild)
-        await log_action(interaction.guild, "Player Kicked", f"<@{interaction.user.id}> removed **{c_title}** (<@{uid}>).")
+        await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> removed **{c_title}** (<@{uid}>)")
         await interaction.followup.send(f"Kicked **{c_title}**.", ephemeral=True)
 
 class RateBtnView(discord.ui.View):
@@ -1919,6 +2110,24 @@ class RateBtnView(discord.ui.View):
     async def rate(self, i, b):
         await i.response.send_modal(RateModal(self.h_id, self.e_key))
 
+class HelperSelect(discord.ui.UserSelect):
+    def __init__(self, key):
+        super().__init__(placeholder="Pick the people who helped (replaces the list)", min_values=0, max_values=25, row=2)
+        self.key = key
+
+    async def callback(self, interaction):
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.send_message("Event not found.", ephemeral=True)
+            return
+        ids = [u.id for u in self.values if not getattr(u, "bot", False)]
+        info["helpers"] = ids
+        save_db(db)
+        names = ", ".join(f"<@{i}>" for i in ids)
+        await interaction.response.send_message(f"Helpers saved: {names}" if ids else "Helpers cleared.", ephemeral=True)
+        await refresh_event_message(info, interaction.guild)
+        await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set helpers: {names or 'none'}")
+
 class HostActionsView(discord.ui.View):
     def __init__(self, key):
         super().__init__(timeout=300)
@@ -1926,6 +2135,7 @@ class HostActionsView(discord.ui.View):
         info = db["events"].get(key)
         if info and info["reservations"]:
             self.add_item(KickSelect(key, info["reservations"]))
+        self.add_item(HelperSelect(key))
 
     async def interaction_check(self, interaction):
         if is_authorized_manager(interaction.user):
@@ -1999,6 +2209,8 @@ class HostActionsView(discord.ui.View):
                 emb.add_field(name="Host", value=f"<@{info['host_id']}>", inline=True)
                 emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
                 emb.add_field(name="Players", value=f"{p_count}", inline=True)
+                if info.get("helpers"):
+                    emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
 
                 try:
                     await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
@@ -2007,6 +2219,9 @@ class HostActionsView(discord.ui.View):
 
         await update_leaderboard(interaction.guild)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
+        await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> concluded the event · {p_count} players · {dur}h live")
+        if info.get("helpers"):
+            await event_log(interaction.guild, info, "host", "🤝 Helpers: " + ", ".join(f"<@{i}>" for i in info["helpers"]))
 
 class EventButtonsView(discord.ui.View):
     def __init__(self):
@@ -2052,8 +2267,8 @@ class EventButtonsView(discord.ui.View):
 
             save_db(db)
             await refresh_event_message(info, interaction.guild)
-            await log_action(interaction.guild, "Spot Left", f"<@{interaction.user.id}> left {tgt}.")
             await interaction.followup.send("Spot removed.", ephemeral=True)
+            await event_log(interaction.guild, info, "reservation", f"<@{interaction.user.id}> left **{tgt}**")
             return
 
         wait = info.get("waitlist", [])
@@ -2063,6 +2278,7 @@ class EventButtonsView(discord.ui.View):
             save_db(db)
             await refresh_event_message(info, interaction.guild)
             await interaction.followup.send("Removed from waitlist.", ephemeral=True)
+            await event_log(interaction.guild, info, "waitlist", f"<@{interaction.user.id}> left the waitlist")
             return
 
         await interaction.followup.send("You don't have a spot here.", ephemeral=True)
@@ -2188,6 +2404,7 @@ async def before_refresh_timers():
 async def setup_hook():
     global ai_worker_task
     bot.add_view(EventButtonsView())
+    bot.add_view(EventLogView())
     refresh_timers.start()
     ai_worker_task = asyncio.create_task(process_ai_queue())
 
@@ -2196,6 +2413,11 @@ bot.setup_hook = setup_hook
 @bot.event
 async def on_ready():
     print(f"Logged in: {bot.user.name}")
+    try:
+        await bot.change_presence(status=discord.Status.online,
+                                  activity=discord.Activity(type=discord.ActivityType.watching, name="the events · ping me"))
+    except Exception as e:
+        print("presence failed:", e)
 
 @bot.command()
 @commands.guild_only()
@@ -2256,8 +2478,8 @@ async def create_ev(interaction: discord.Interaction, name: str, starts_in: str,
     db["events"][key]["message_ids"] = [msg.id]
     save_db(db)
 
-    await log_action(interaction.guild, "Event Created", f"**{name}** made by <@{interaction.user.id}>.")
     await interaction.followup.send("Event created.", ephemeral=True)
+    await event_log(interaction.guild, db["events"][key], "host", f"Event created by <@{interaction.user.id}>")
 
 @bot.tree.command(name="set_superpowers", description="Set superpowers")
 @app_commands.guild_only()
@@ -2279,6 +2501,7 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
 
     await refresh_event_message(info, interaction.guild)
     await interaction.response.send_message(f"Superpowers set: {', '.join(sps)}", ephemeral=True)
+    await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set superpowers: {', '.join(sps)}")
 
 @bot.tree.command(name="blacklist", description="Blacklist user")
 @app_commands.guild_only()
