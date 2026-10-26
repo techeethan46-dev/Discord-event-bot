@@ -382,7 +382,8 @@ async def update_leaderboard(guild):
 
 # One solid, straight divider. (~~ strikethrough over blank Braille characters draws a continuous line;
 # the box-drawing dashes it replaces rendered as broken segments on phones.)
-DIV = "~~" + "\u2800" * 30 + "~~"
+DIV_WIDTH = 22  # blank characters per divider; lower this if a line ever wraps on your phone
+DIV = "~~" + "\u2800" * DIV_WIDTH + "~~"
 SECTION_SEP = f"\n{DIV}\n"
 BRAND = "AbyssalNoob1 is the Best"
 EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
@@ -415,7 +416,7 @@ def build_embed(name, info, guild=None):
     if info.get("concluded"):
         emoji, color, status = "🔒", 0xE74C3C, "🔒 Concluded"
     elif now >= end:
-        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ Live · reservations closed <t:{end}:R>"
+        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ Live · closed <t:{end}:R>"
     elif now < start:
         emoji, color, status = "🕒", 0x3498DB, f"🕒 Opens <t:{start}:R>"
     else:
@@ -473,7 +474,7 @@ def build_embed(name, info, guild=None):
     for i, d in enumerate(chunks):
         d = d.replace(_PART, f" · Part {i + 1}/{n}" if n > 1 else "")
         embs.append(discord.Embed(color=color, description=d))
-    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live · {BRAND}")
+    embs[-1].set_footer(text=f"{len(res)}{f'/{max_p}' if max_p > 0 else ''} reservations · {BRAND}")
     return embs
 
 # ==========================================
@@ -1306,7 +1307,12 @@ async def act_purge(ctx, a):
     n = max(1, min(100, _to_int(a.get("count"), 10)))
     target = find_member(ctx.guild, a.get("member")) if a.get("member") else None
     before = ctx.msg if ch.id == ctx.msg.channel.id else None
-    deleted = await ch.purge(limit=n, before=before, check=(lambda m: m.author.id == target.id) if target else None)
+    kw = {"limit": n}
+    if before:
+        kw["before"] = before
+    if target:
+        kw["check"] = lambda m: m.author.id == target.id  # never pass check=None: discord.py would call it and crash
+    deleted = await ch.purge(**kw)
     return True, f"Deleted {len(deleted)} message(s) in {ch.mention}"
 
 async def act_send_message(ctx, a):
