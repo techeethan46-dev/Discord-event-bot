@@ -338,7 +338,7 @@ async def log_action(guild, title, desc, color=0x3498DB):
     if not log_id: return
     channel = guild.get_channel(log_id)
     if channel:
-        emb = discord.Embed(title=f"📝 {title}", description=desc, color=color)
+        emb = discord.Embed(description=f"## 📝 {title}\n{DIV}\n{desc}", color=color)
         try: 
             await channel.send(embed=emb)
         except discord.HTTPException: 
@@ -380,8 +380,13 @@ async def update_leaderboard(guild):
     except discord.HTTPException as e:
         print("leaderboard edit failed:", e)
 
-SECTION_SEP = "\n─────────────────────\n"
+# One solid, straight divider. (~~ strikethrough over blank Braille characters draws a continuous line;
+# the box-drawing dashes it replaces rendered as broken segments on phones.)
+DIV = "~~" + "\u2800" * 30 + "~~"
+SECTION_SEP = f"\n{DIV}\n"
+BRAND = "AbyssalNoob1 is the Best"
 EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
+_PART = "\x00PART\x00"
 
 def build_embed(name, info, guild=None):
     start, end = info["start_time"], info["end_time"]
@@ -408,16 +413,18 @@ def build_embed(name, info, guild=None):
         (sp_lines if country.title() in sp_set else reg_lines).append(line)
 
     if info.get("concluded"):
-        emoji, color, status = "🔒", 0xE74C3C, "🔒 **Concluded**"
+        emoji, color, status = "🔒", 0xE74C3C, "🔒 Concluded"
     elif now >= end:
-        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ **Live** · reservations closed <t:{end}:R>"
+        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ Live · reservations closed <t:{end}:R>"
     elif now < start:
-        emoji, color, status = "🕒", 0x3498DB, f"🕒 **Opens** <t:{start}:R>"
+        emoji, color, status = "🕒", 0x3498DB, f"🕒 Opens <t:{start}:R>"
     else:
-        emoji, color, status = "🚩", 0x2ECC71, f"🟢 **Open** · closes <t:{end}:R>"
+        emoji, color, status = "🚩", 0x2ECC71, f"🟢 Open · closes <t:{end}:R>"
 
+    # Headings (not the embed title) so the name and status render large.
     h_str = f"<@{host}>" + (f" & <@{cohost}>" if cohost else "")
-    head = f"{status}\n\n### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}"
+    head = (f"# {emoji} {name}{_PART}\n## {status}{SECTION_SEP}"
+            f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
     if helpers:
         head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
     head += SECTION_SEP
@@ -446,7 +453,7 @@ def build_embed(name, info, guild=None):
             if chunks:  # max two embeds per message
                 break
             chunks.append(cur.rstrip("\n"))
-            cur = "### 📋 Reservations (continued)\n"
+            cur = f"# {emoji} {name}{_PART}\n### 📋 Reservations (continued)\n"
         cur += ln + "\n"
         shown += 1
     if shown < len(reg_lines):
@@ -455,22 +462,22 @@ def build_embed(name, info, guild=None):
     if wait_sec:
         if len(cur) + len(wait_sec) + 2 > EMBED_CHUNK and not chunks:
             chunks.append(cur)
-            cur = wait_sec
+            cur = f"# {emoji} {name}{_PART}\n" + wait_sec
         else:
             cur += "\n\n" + wait_sec
-    chunks.append(cur)
-    chunks = [c[:EMBED_CHUNK + 200] for c in chunks]
+    chunks.append(cur + SECTION_SEP.rstrip("\n"))  # closing line above the footer
+    chunks = [c[:EMBED_CHUNK + 250] for c in chunks]
 
     n = len(chunks)
     embs = []
     for i, d in enumerate(chunks):
-        title = f"{emoji} {name}" + (f" · Part {i + 1}/{n}" if n > 1 else "")
-        embs.append(discord.Embed(color=color, title=title[:250], description=d))
-    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live")
+        d = d.replace(_PART, f" · Part {i + 1}/{n}" if n > 1 else "")
+        embs.append(discord.Embed(color=color, description=d))
+    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live · {BRAND}")
     return embs
 
 # ==========================================
-# PER-EVENT LOG EMBED (one live embed per event, browsable by category)
+# PER-EVENT LOG EMBED (one live embed per event; the category dropdown + page buttons edit it in place)
 # ==========================================
 LOG_CATS = {
     "reservation": ("📋", "Reservations"),
@@ -478,24 +485,48 @@ LOG_CATS = {
     "swap": ("🔄", "Swaps"),
     "host": ("🛠️", "Host actions"),
 }
+LOG_OPTIONS = [("all", "All activity", "📜"), ("reservation", "Reservations", "📋"),
+               ("waitlist", "Waitlist", "⏳"), ("swap", "Swaps", "🔄"), ("host", "Host actions", "🛠️")]
 LOG_BLUE = 0x3498DB
-LOG_PAGE_SIZE = 8
+LOG_PAGE_SIZE = 5
+
+def _fmt_ts(t):
+    # Time only for recent entries, date + time once they're older than about 20 hours.
+    return f"<t:{t}:d> <t:{t}:t>" if time.time() - t > 72000 else f"<t:{t}:t>"
 
 def _log_line(e):
     emoji = LOG_CATS.get(e["c"], ("•", ""))[0]
-    return f"{emoji} <t:{e['t']}:d> <t:{e['t']}:t> · {e['m']}"
+    return f"{emoji} {_fmt_ts(e['t'])} · {e['m']}"
+
+def log_state(info):
+    v = info.get("log_view") or {}
+    cat = v.get("cat", "all")
+    if cat != "all" and cat not in LOG_CATS:
+        cat = "all"
+    rows = list(reversed([e for e in info.get("logs", []) if cat == "all" or e["c"] == cat]))
+    pages = max(1, -(-len(rows) // LOG_PAGE_SIZE))
+    try:
+        page = int(v.get("page", 0))
+    except (TypeError, ValueError):
+        page = 0
+    return cat, max(0, min(page, pages - 1)), pages, rows
 
 def build_log_embed(info):
+    cat, page, pages, rows = log_state(info)
     logs = info.get("logs", [])
     counts = {c: sum(1 for e in logs if e["c"] == c) for c in LOG_CATS}
+    host = f"👑 **Host** · <@{info['host_id']}>" + (f" & <@{info['cohost_id']}>" if info.get("cohost_id") else "")
     stats = "\n".join(f"{LOG_CATS[c][0]} **{LOG_CATS[c][1]}** · {counts[c]}" for c in LOG_CATS)
-    recent = "\n".join(_log_line(e) for e in reversed(logs[-5:])) or "*No activity yet*"
-    desc = f"### 📊 Overview\n{stats}\n\n### 🕒 Latest activity\n{recent}"
+    sec = "🕒 Latest activity" if cat == "all" else f"{LOG_CATS[cat][0]} {LOG_CATS[cat][1]}"
+    body = "\n".join(_log_line(e) for e in rows[page * LOG_PAGE_SIZE:(page + 1) * LOG_PAGE_SIZE]) or "*Nothing here yet*"
+    desc = (f"# 📜 Event Log · {info['display_name']}\n{DIV}\n"
+            f"### 📊 Overview\n{host}\n{stats}\n{DIV}\n"
+            f"### {sec}\n{body}")
     if info.get("helpers"):
-        desc += "\n\n### 🤝 Helpers\n" + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
-    emb = discord.Embed(color=LOG_BLUE, title=f"📜 Event Log · {info['display_name']}"[:250], description=desc[:4000])
+        desc += f"\n{DIV}\n### 🤝 Helpers\n" + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
+    emb = discord.Embed(color=LOG_BLUE, description=desc[:4000])
     state = "🔒 Concluded" if info.get("concluded") else "🟢 Live"
-    emb.set_footer(text=f"{len(logs)} entries · {state} · pick a category below to browse")
+    emb.set_footer(text=f"{len(logs)} entries · {state} · Page {page + 1}/{pages}")
     return emb
 
 def find_event_by_log(msg_id):
@@ -503,6 +534,47 @@ def find_event_by_log(msg_id):
         if (info.get("log_msg") or {}).get("id") == msg_id:
             return info
     return None
+
+class LogCatSelect(discord.ui.Select):
+    def __init__(self, cur="all"):
+        opts = [discord.SelectOption(label=l, value=v, emoji=e, default=(v == cur)) for v, l, e in LOG_OPTIONS]
+        super().__init__(custom_id="evlog_select", placeholder="Browse logs by category", options=opts, row=0)
+
+    async def callback(self, interaction):
+        info = find_event_by_log(interaction.message.id)
+        if not info:
+            await interaction.response.send_message("This event log is no longer available.", ephemeral=True)
+            return
+        info["log_view"] = {"cat": self.values[0], "page": 0}
+        save_db(db)
+        await interaction.response.edit_message(embed=build_log_embed(info), view=make_log_view(info))
+
+class LogPageButton(discord.ui.Button):
+    def __init__(self, direction, disabled=True):
+        super().__init__(label="◀ Prev" if direction < 0 else "Next ▶", style=discord.ButtonStyle.secondary,
+                         custom_id="evlog_prev" if direction < 0 else "evlog_next", disabled=disabled, row=1)
+        self.direction = direction
+
+    async def callback(self, interaction):
+        info = find_event_by_log(interaction.message.id)
+        if not info:
+            await interaction.response.send_message("This event log is no longer available.", ephemeral=True)
+            return
+        cat, page, pages, _ = log_state(info)
+        info["log_view"] = {"cat": cat, "page": max(0, min(pages - 1, page + self.direction))}
+        save_db(db)
+        await interaction.response.edit_message(embed=build_log_embed(info), view=make_log_view(info))
+
+class EventLogView(discord.ui.View):
+    def __init__(self, cat="all", page=0, pages=1):
+        super().__init__(timeout=None)
+        self.add_item(LogCatSelect(cat))
+        self.add_item(LogPageButton(-1, disabled=page <= 0))
+        self.add_item(LogPageButton(+1, disabled=page >= pages - 1))
+
+def make_log_view(info):
+    cat, page, pages, _ = log_state(info)
+    return EventLogView(cat, page, pages)
 
 async def refresh_log_message(info):
     lm = info.get("log_msg")
@@ -513,7 +585,7 @@ async def refresh_log_message(info):
         return False
     try:
         m = await ch.fetch_message(lm["id"])
-        await m.edit(embed=build_log_embed(info))
+        await m.edit(embed=build_log_embed(info), view=make_log_view(info))
         return True
     except discord.NotFound:
         info.pop("log_msg", None)  # message was deleted: respawn on the next entry
@@ -529,7 +601,7 @@ async def spawn_event_log(guild, info):
     if not ch:
         return False
     try:
-        m = await ch.send(embed=build_log_embed(info), view=EventLogView())
+        m = await ch.send(embed=build_log_embed(info), view=make_log_view(info))
         info["log_msg"] = {"ch": ch.id, "id": m.id}
         save_db(db)
         return True
@@ -548,54 +620,6 @@ async def event_log(guild, info, cat, text):
         await refresh_log_message(info)
     if not info.get("log_msg"):
         await spawn_event_log(guild, info)
-
-class LogPager(discord.ui.View):
-    def __init__(self, info, cat):
-        super().__init__(timeout=180)
-        self.info, self.cat, self.page = info, cat, 0
-
-    def build(self):
-        logs = self.info.get("logs", [])
-        rows = list(reversed([e for e in logs if self.cat == "all" or e["c"] == self.cat]))
-        pages = max(1, -(-len(rows) // LOG_PAGE_SIZE))
-        self.page = max(0, min(self.page, pages - 1))
-        chunk = rows[self.page * LOG_PAGE_SIZE:(self.page + 1) * LOG_PAGE_SIZE]
-        label = "📜 All activity" if self.cat == "all" else f"{LOG_CATS[self.cat][0]} {LOG_CATS[self.cat][1]}"
-        emb = discord.Embed(color=LOG_BLUE, title=f"{label} · {self.info['display_name']}"[:250],
-                            description="\n".join(_log_line(e) for e in chunk) or "*Nothing here yet*")
-        emb.set_footer(text=f"Page {self.page + 1}/{pages} · {len(rows)} entries")
-        self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= pages - 1
-        return emb
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_btn(self, interaction, btn):
-        self.page -= 1
-        await interaction.response.edit_message(embed=self.build(), view=self)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
-    async def next_btn(self, interaction, btn):
-        self.page += 1
-        await interaction.response.edit_message(embed=self.build(), view=self)
-
-class EventLogView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.select(custom_id="evlog_select", placeholder="Browse logs by category", options=[
-        discord.SelectOption(label="All activity", value="all", emoji="📜"),
-        discord.SelectOption(label="Reservations", value="reservation", emoji="📋"),
-        discord.SelectOption(label="Waitlist", value="waitlist", emoji="⏳"),
-        discord.SelectOption(label="Swaps", value="swap", emoji="🔄"),
-        discord.SelectOption(label="Host actions", value="host", emoji="🛠️"),
-    ])
-    async def pick(self, interaction, select):
-        info = find_event_by_log(interaction.message.id)
-        if not info:
-            await interaction.response.send_message("This event log is no longer available.", ephemeral=True)
-            return
-        pager = LogPager(info, select.values[0])
-        await interaction.response.send_message(embed=pager.build(), view=pager, ephemeral=True)
 
 async def process_waitlist(info, opened, guild, channel):
     wait = info.get("waitlist", [])
@@ -1512,8 +1536,8 @@ async def run_admin_flow(msg, txt):
             return
 
         if any(needs_confirm(a) for a in plan):
-            emb = discord.Embed(title="Confirm these actions",
-                                description="\n".join(f"• {summarize(a)}" for a in plan), color=0xF1C40F)
+            emb = discord.Embed(description="## ⚠️ Confirm these actions\n" + DIV + "\n" +
+                                "\n".join(f"• {summarize(a)}" for a in plan), color=0xF1C40F)
             emb.set_footer(text="Confirm within 30 seconds")
             view = ConfirmView(uid)
             prompt = await safe_reply(msg, embed=emb, view=view)
@@ -1521,7 +1545,8 @@ async def run_admin_flow(msg, txt):
                 return
             await view.wait()
             if not view.value:
-                emb.title = "Cancelled" if view.value is False else "Timed out"
+                emb.description = emb.description.replace(
+                    "## ⚠️ Confirm these actions", "## ❌ Cancelled" if view.value is False else "## ⌛ Timed out")
                 emb.color = 0x95A5A6
                 emb.set_footer(text="Nothing was changed")
                 try:
@@ -1565,7 +1590,7 @@ async def run_admin_flow(msg, txt):
             title, color = "❌ Couldn't do that", 0xE74C3C
         else:
             title, color = "⚠️ Partly done", 0xE67E22
-        emb = discord.Embed(title=title, description="\n".join(lines)[:3900], color=color)
+        emb = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
         emb.set_footer(text=f"Requested by {msg.author.display_name}")
         await safe_reply(msg, embed=emb)
 
@@ -2204,7 +2229,7 @@ class HostActionsView(discord.ui.View):
         if s_id:
             s_ch = interaction.guild.get_channel(s_id)
             if s_ch:
-                emb = discord.Embed(title="📊 EVENT RESULTS", color=0xF1C40F)
+                emb = discord.Embed(description=f"## 📊 Event Results\n{DIV}", color=0xF1C40F)
                 emb.add_field(name="Event", value=f"**{info['display_name']}**", inline=False)
                 emb.add_field(name="Host", value=f"<@{info['host_id']}>", inline=True)
                 emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
@@ -2415,7 +2440,7 @@ async def on_ready():
     print(f"Logged in: {bot.user.name}")
     try:
         await bot.change_presence(status=discord.Status.online,
-                                  activity=discord.Activity(type=discord.ActivityType.watching, name="the events · ping me"))
+                                  activity=discord.Game(name="with events · ping me"))
     except Exception as e:
         print("presence failed:", e)
 
