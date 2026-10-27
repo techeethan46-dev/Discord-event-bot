@@ -333,8 +333,9 @@ async def dm_owners(text):
         except Exception as e:
             print("Failed to DM owner:", e)
 
-async def log_action(guild, title, desc, color=0x3498DB):
-    log_id = get_config(guild.id).get("log_channel")
+async def log_action(guild, title, desc, color=0x3498DB, key="log_channel"):
+    conf = get_config(guild.id)
+    log_id = conf.get(key) or (conf.get("log_channel") if key == "ai_log_channel" else None)
     if not log_id: return
     channel = guild.get_channel(log_id)
     if channel:
@@ -1602,7 +1603,8 @@ async def run_admin_flow(msg, txt):
 
         if ok_count:
             await log_action(msg.guild, "AI Admin Action",
-                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500], color=0xE74C3C)
+                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500], color=0xE74C3C,
+                             key="ai_log_channel")
     except Exception as e:
         print("run_admin_flow error:", e)
         await dm_owners(f"⚠️ **Admin flow exception:** `{e}`")
@@ -2326,45 +2328,202 @@ class EventButtonsView(discord.ui.View):
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
-class SetupRolePanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(discord.ui.RoleSelect(placeholder="Host Role", custom_id="r1"))
-        self.add_item(discord.ui.RoleSelect(placeholder="Event Role", custom_id="r2"))
-        self.add_item(discord.ui.RoleSelect(placeholder="VIP Role", custom_id="r3"))
+# ==========================================
+# /setup: step-by-step dashboard
+# ==========================================
+SETUP_STEPS = [
+    {"key": "host_role", "kind": "role", "icon": "🎤", "title": "Host role", "required": False,
+     "desc": "Members with this role can create events and open the Host panel. Admins can always do both."},
+    {"key": "event_role", "kind": "role", "icon": "🎟️", "title": "Event role", "required": False,
+     "desc": "Given to players while they hold a spot, and removed when they leave or the event ends."},
+    {"key": "superpower_role", "kind": "role", "icon": "💎", "title": "VIP role", "required": False,
+     "desc": "Boosters and members with this role can claim Superpower nations."},
+    {"key": "log_channel", "kind": "channel", "icon": "📜", "title": "Event log channel", "required": True,
+     "desc": "Every event gets one live log embed here that you can browse by category."},
+    {"key": "ai_log_channel", "kind": "channel", "icon": "🛡️", "title": "AI admin log channel", "required": False,
+     "desc": "Every action the AI admin runs is logged here in red. If you skip it, those logs go to the event log channel."},
+    {"key": "swap_channel", "kind": "channel", "icon": "🔄", "title": "Swap channel", "required": True,
+     "desc": "Swap requests are posted here so the other player can accept or decline."},
+    {"key": "stats_channel", "kind": "channel", "icon": "📊", "title": "Stats channel", "required": True,
+     "desc": "Event results and the rate-your-host button are posted here when an event is concluded."},
+]
+SETUP_COLOR = 0x5865F2
+
+def _setup_value(guild, st, conf):
+    v = conf.get(st["key"])
+    if not v:
+        return "⚠️ *not set*" if st["required"] else "➖ *not set*"
+    if st["kind"] == "role":
+        return f"✅ <@&{v}>" if guild.get_role(v) else "⚠️ *role was deleted*"
+    return f"✅ <#{v}>" if guild.get_channel(v) else "⚠️ *channel was deleted*"
+
+def setup_checks(guild, conf):
+    me = guild.me
+    out = []
+    for st in SETUP_STEPS:
+        v = conf.get(st["key"])
+        if not v:
+            if st["required"]:
+                out.append(f"⚠️ **{st['title']}** isn't set")
+            continue
+        if st["kind"] == "role":
+            r = guild.get_role(v)
+            if r and st["key"] == "event_role" and r >= me.top_role:
+                out.append("⚠️ **Event role** is above my role, so I can't hand it out")
+        else:
+            ch = guild.get_channel(v)
+            if ch:
+                p = ch.permissions_for(me)
+                if not (p.view_channel and p.send_messages and p.embed_links):
+                    out.append(f"⚠️ I can't post embeds in {ch.mention} (need Send Messages + Embed Links)")
+    gp = me.guild_permissions
+    if not gp.manage_roles:
+        out.append("⚠️ I need **Manage Roles** (event role + AI admin)")
+    if not gp.manage_messages:
+        out.append("⚠️ I need **Manage Messages** (cooldown cleanup + purge)")
+    return out or ["✅ Everything looks good"]
+
+class SetupWizard(discord.ui.View):
+    def __init__(self, guild, owner_id, step=0, note=""):
+        super().__init__(timeout=900)
+        self.guild, self.owner_id, self.step, self.note = guild, owner_id, step, note
+        self.rebuild()
+
+    @property
+    def total(self):
+        return len(SETUP_STEPS)
+
+    def rebuild(self):
+        self.clear_items()
+        conf = get_config(self.guild.id)
+        if self.step < self.total:
+            st = SETUP_STEPS[self.step]
+            self.add_item(SetupRolePick(st) if st["kind"] == "role" else SetupChannelPick(st))
+            self.add_item(SetupNav("back", disabled=self.step == 0))
+            self.add_item(SetupNav("next", skip=not conf.get(st["key"])))
+            self.add_item(SetupNav("clear", disabled=not conf.get(st["key"])))
+        else:
+            self.add_item(SetupJump())
+            self.add_item(SetupNav("back"))
+            self.add_item(SetupNav("finish"))
+
+    def embed(self):
+        conf = get_config(self.guild.id)
+        t = self.total
+        if self.step < t:
+            st = SETUP_STEPS[self.step]
+            bar = "▰" * (self.step + 1) + "▱" * (t - self.step - 1)
+            desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
+            if self.note:
+                desc += f"{self.note}\n\n"
+            desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}"
+            emb = discord.Embed(color=SETUP_COLOR, description=desc)
+            emb.set_footer(text="Pick below · it saves instantly and moves to the next step")
+            return emb
+        roles = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
+                          for s in SETUP_STEPS if s["kind"] == "role")
+        chans = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
+                          for s in SETUP_STEPS if s["kind"] == "channel")
+        checks = "\n".join(setup_checks(self.guild, conf))
+        desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
+                f"### 🎭 Roles\n{roles}\n{DIV}\n### 📡 Channels\n{chans}\n{DIV}\n### 🔍 Checks\n{checks}")
+        if self.note:
+            desc = self.note + "\n\n" + desc
+        emb = discord.Embed(color=SETUP_COLOR, description=desc[:4000])
+        emb.set_footer(text="Jump to any step with the menu · press Finish when you're done")
+        return emb
 
     async def interaction_check(self, interaction):
-        val = interaction.data["values"][0]
-        cid = interaction.data["custom_id"]
-        conf = get_config(interaction.guild_id)
-
-        if cid == "r1": conf["host_role"] = int(val)
-        elif cid == "r2": conf["event_role"] = int(val)
-        elif cid == "r3": conf["superpower_role"] = int(val)
-
-        save_db(db)
-        await interaction.response.send_message("Role saved.", ephemeral=True)
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This panel belongs to someone else. Run /setup yourself.", ephemeral=True)
+            return False
         return True
 
-class SetupChannelPanel(discord.ui.View):
+    async def go(self, interaction, step=None, note=""):
+        if step is not None:
+            self.step = max(0, min(self.total, step))
+        self.note = note
+        self.rebuild()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+def _setup_saved(st, extra=""):
+    return f"✅ **{st['title']}** saved." + (f"\n{extra}" if extra else "")
+
+class SetupRolePick(discord.ui.RoleSelect):
+    def __init__(self, st):
+        super().__init__(placeholder=f"Select the {st['title'].lower()}...", min_values=1, max_values=1, row=0)
+        self.st = st
+
+    async def callback(self, interaction):
+        view, role = self.view, self.values[0]
+        guild = view.guild
+        if role.is_default() or role.managed:
+            await view.go(interaction, note="❌ That role can't be used (it's @everyone or managed by a bot). Pick another.")
+            return
+        get_config(guild.id)[self.st["key"]] = role.id
+        save_db(db)
+        extra = ""
+        if self.st["key"] == "event_role" and role >= guild.me.top_role:
+            extra = "⚠️ This role is above mine, so I won't be able to hand it out. Move my role higher."
+        await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
+
+class SetupChannelPick(discord.ui.ChannelSelect):
+    def __init__(self, st):
+        super().__init__(placeholder=f"Select the {st['title'].lower()}...", min_values=1, max_values=1, row=0,
+                         channel_types=[discord.ChannelType.text, discord.ChannelType.news])
+        self.st = st
+
+    async def callback(self, interaction):
+        view, picked = self.view, self.values[0]
+        guild = view.guild
+        get_config(guild.id)[self.st["key"]] = picked.id
+        save_db(db)
+        extra = ""
+        ch = guild.get_channel(picked.id)
+        if ch:
+            p = ch.permissions_for(guild.me)
+            if not (p.view_channel and p.send_messages and p.embed_links):
+                extra = f"⚠️ I can't post embeds in {ch.mention} yet. Give me View Channel, Send Messages and Embed Links there."
+        await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
+
+class SetupNav(discord.ui.Button):
+    LABELS = {"back": ("◀ Back", discord.ButtonStyle.secondary), "next": ("Next ▶", discord.ButtonStyle.primary),
+              "clear": ("Clear", discord.ButtonStyle.secondary), "finish": ("✅ Finish", discord.ButtonStyle.success)}
+
+    def __init__(self, kind, disabled=False, skip=False):
+        label, style = self.LABELS[kind]
+        if kind == "next" and skip:
+            label, style = "Skip ▶", discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, disabled=disabled, row=1)
+        self.kind = kind
+
+    async def callback(self, interaction):
+        view = self.view
+        if self.kind == "back":
+            await view.go(interaction, step=view.step - 1)
+        elif self.kind == "next":
+            await view.go(interaction, step=view.step + 1)
+        elif self.kind == "clear":
+            st = SETUP_STEPS[view.step]
+            get_config(view.guild.id).pop(st["key"], None)
+            save_db(db)
+            await view.go(interaction, note=f"🗑️ **{st['title']}** cleared.")
+        else:
+            conf = get_config(view.guild.id)
+            done = sum(1 for s in SETUP_STEPS if conf.get(s["key"]))
+            emb = discord.Embed(color=0x2ECC71, description=(
+                f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
+                "Run **/setup** any time to change something."))
+            await interaction.response.edit_message(embed=emb, view=None)
+            view.stop()
+
+class SetupJump(discord.ui.Select):
     def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(discord.ui.ChannelSelect(placeholder="Log Channel", custom_id="c1"))
-        self.add_item(discord.ui.ChannelSelect(placeholder="Swap Channel", custom_id="c2"))
-        self.add_item(discord.ui.ChannelSelect(placeholder="Stats Channel", custom_id="c3"))
+        opts = [discord.SelectOption(label=s["title"], value=str(i), emoji=s["icon"]) for i, s in enumerate(SETUP_STEPS)]
+        super().__init__(placeholder="Jump to a step...", options=opts, row=0)
 
-    async def interaction_check(self, interaction):
-        val = interaction.data["values"][0]
-        cid = interaction.data["custom_id"]
-        conf = get_config(interaction.guild_id)
-
-        if cid == "c1": conf["log_channel"] = int(val)
-        elif cid == "c2": conf["swap_channel"] = int(val)
-        elif cid == "c3": conf["stats_channel"] = int(val)
-
-        save_db(db)
-        await interaction.response.send_message("Channel saved.", ephemeral=True)
-        return True
+    async def callback(self, interaction):
+        await self.view.go(interaction, step=int(self.values[0]))
 
 @bot.tree.command(name="clearchat", description="Clears your AI chat history")
 async def clearchat_cmd(interaction: discord.Interaction):
@@ -2384,19 +2543,14 @@ async def clearchat_all_cmd(interaction: discord.Interaction):
     ai_history.clear()
     await interaction.response.send_message(f"Cleared AI memory for {n} user(s).", ephemeral=True)
 
-@bot.tree.command(name="setup", description="Admin setup panel")
+@bot.tree.command(name="setup", description="Step-by-step setup dashboard")
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
     if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-
-    conf = get_config(interaction.guild_id)
-    e1 = discord.Embed(title="Setup Roles", description=f"Host: <@&{conf.get('host_role')}>\nEvent: <@&{conf.get('event_role')}>\nVIP: <@&{conf.get('superpower_role')}>")
-    await interaction.response.send_message(embed=e1, view=SetupRolePanel(), ephemeral=True)
-
-    e2 = discord.Embed(title="Setup Channels", description=f"Logs: <#{conf.get('log_channel')}>\nSwaps: <#{conf.get('swap_channel')}>\nStats: <#{conf.get('stats_channel')}>")
-    await interaction.followup.send(embed=e2, view=SetupChannelPanel(), ephemeral=True)
+    wizard = SetupWizard(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=wizard.embed(), view=wizard, ephemeral=True)
 
 # Last phase ("open"/"live") we rendered per event, so we only edit when it flips.
 event_phase = {}
