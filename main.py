@@ -632,7 +632,7 @@ async def update_leaderboard(guild):
 
 # One solid, straight divider. (~~ strikethrough over blank Braille characters draws a continuous line;
 # the box-drawing dashes it replaces rendered as broken segments on phones.)
-DIV = "~~" + "\u2800" * 30 + "~~"
+DIV = "~~" + "\u2800" * 25 + "~~"
 SECTION_SEP = f"\n{DIV}\n"
 BRAND = "AbyssalNoob1 is the Best"
 EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
