@@ -383,15 +383,33 @@ async def ensure_achievement_roles(guild):
     conf = get_config(guild.id)
     role_map = conf.setdefault("achievement_roles", {})
     created, existing = [], []
-    me = guild.me
+
+    # Reuse roles already recorded in config. If a role was deleted or the config
+    # was lost, look for an existing role by its exact achievement name before
+    # creating anything. This makes setup safe to run repeatedly.
     for aid, data in ACHIEVEMENT_DEFS.items():
-        role = achievement_role_for(guild, aid)
-        if role:
-            existing.append(data["name"])
+        role_name = f"{data['emoji']} {data['name']}"
+        role = None
+
+        rid = role_map.get(aid)
+        if rid:
+            try:
+                role = guild.get_role(int(rid))
+            except (TypeError, ValueError):
+                role = None
+
+        if role is None:
+            role = discord.utils.find(lambda r: r.name == role_name, guild.roles)
+            if role is not None:
+                role_map[aid] = role.id
+
+        if role is not None:
+            existing.append(role.name)
             continue
+
         try:
             role = await guild.create_role(
-                name=f"{data['emoji']} {data['name']}",
+                name=role_name,
                 color=discord.Color(ACHIEVEMENT_ROLE_COLORS.get(data["tier"], 0x3498DB)),
                 mentionable=False,
                 reason="Host Assistant achievement role setup"
@@ -401,6 +419,7 @@ async def ensure_achievement_roles(guild):
         except discord.HTTPException as e:
             print(f"achievement role create failed for {aid}: {e}")
             break
+
     save_db(db)
     return created, existing
 
@@ -2146,7 +2165,9 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
 
         await interaction.response.send_message(f"Rated **{val}/5**!", ephemeral=True)
         await update_leaderboard(interaction.guild)
-        await check_and_announce_achievements(interaction.guild, self.host_id, get_config(interaction.guild_id) and interaction.guild.get_channel(get_config(interaction.guild_id).get("stats_channel")))
+        stats_id = get_config(interaction.guild_id).get("stats_channel")
+        stats_channel = interaction.guild.get_channel(stats_id) if stats_id else None
+        await check_and_announce_achievements(interaction.guild, self.host_id, stats_channel)
 
 class ClaimModal(discord.ui.Modal, title="Claim Spot"):
     country = discord.ui.TextInput(label="Nation", required=True, max_length=40)
@@ -2475,8 +2496,8 @@ class HostActionsView(discord.ui.View):
         save_db(db)
 
         s_id = get_config(interaction.guild_id).get("stats_channel")
-        if s_id:
-            s_ch = interaction.guild.get_channel(s_id)
+        s_ch = interaction.guild.get_channel(s_id) if s_id else None
+        if s_ch:
             if s_ch:
                 emb = discord.Embed(description=f"## 📊 Event Results\n{DIV}", color=0xF1C40F)
                 emb.add_field(name="Event", value=f"**{info['display_name']}**", inline=False)
@@ -2570,146 +2591,6 @@ class EventButtonsView(discord.ui.View):
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
-class SetupRolePanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(discord.ui.RoleSelect(placeholder="Host Role", custom_id="r1"))
-        self.add_item(discord.ui.RoleSelect(placeholder="Event Role", custom_id="r2"))
-        self.add_item(discord.ui.RoleSelect(placeholder="VIP Role", custom_id="r3"))
-
-    async def interaction_check(self, interaction):
-        val = interaction.data["values"][0]
-        cid = interaction.data["custom_id"]
-        conf = get_config(interaction.guild_id)
-
-        if cid == "r1": conf["host_role"] = int(val)
-        elif cid == "r2": conf["event_role"] = int(val)
-        elif cid == "r3": conf["superpower_role"] = int(val)
-
-        save_db(db)
-        await interaction.response.send_message("Role saved.", ephemeral=True)
-        return True
-
-class SetupAchievementPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    async def interaction_check(self, interaction):
-        if not is_server_admin(interaction.user):
-            await interaction.response.send_message("Admins only.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="🏆 Create All Achievement Roles", style=discord.ButtonStyle.primary)
-    async def create_roles(self, interaction, btn):
-        await interaction.response.defer(ephemeral=True)
-        created, existing = await ensure_achievement_roles(interaction.guild)
-        await interaction.followup.send(
-            f"🏆 Achievement roles ready. Created **{len(created)}** and already had **{len(existing)}**.",
-            ephemeral=True
-        )
-
-class SetupChannelPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(discord.ui.ChannelSelect(placeholder="Log Channel", custom_id="c1"))
-        self.add_item(discord.ui.ChannelSelect(placeholder="Swap Channel", custom_id="c2"))
-        self.add_item(discord.ui.ChannelSelect(placeholder="Stats Channel", custom_id="c3"))
-
-    async def interaction_check(self, interaction):
-        val = interaction.data["values"][0]
-        cid = interaction.data["custom_id"]
-        conf = get_config(interaction.guild_id)
-
-        if cid == "c1": conf["log_channel"] = int(val)
-        elif cid == "c2": conf["swap_channel"] = int(val)
-        elif cid == "c3": conf["stats_channel"] = int(val)
-
-        save_db(db)
-        await interaction.response.send_message("Channel saved.", ephemeral=True)
-        return True
-
-@bot.tree.command(name="clearchat", description="Clears your AI chat history")
-async def clearchat_cmd(interaction: discord.Interaction):
-    uid = interaction.user.id
-    if uid in ai_history:
-        del ai_history[uid]
-        await interaction.response.send_message("AI memory cleared.", ephemeral=True)
-    else:
-        await interaction.response.send_message("No memory to clear.", ephemeral=True)
-
-@bot.tree.command(name="clearchat_all", description="Owner only: wipes AI chat memory for everyone")
-async def clearchat_all_cmd(interaction: discord.Interaction):
-    if interaction.user.id not in BOT_OWNER_IDS:
-        await interaction.response.send_message("Owner only.", ephemeral=True)
-        return
-    n = len(ai_history)
-    ai_history.clear()
-    await interaction.response.send_message(f"Cleared AI memory for {n} user(s).", ephemeral=True)
-
-def _host_server_stats(guild_id, host_id):
-    events = completed_events_for_host(guild_id, host_id)
-    event_keys = {k for k, e in db["events"].items()
-                  if e.get("guild_id") == int(guild_id) and e.get("host_id") == int(host_id) and e.get("concluded")}
-    ratings = []
-    global_host = db.get("hosts", {}).get(str(host_id), {})
-    for r in global_host.get("rating_history", []):
-        if r.get("event_key") in event_keys:
-            try:
-                ratings.append(float(r.get("rating", 0)))
-            except (TypeError, ValueError):
-                pass
-    return events, ratings
-
-def _achievement_points(unlocked):
-    return sum(ACHIEVEMENT_DEFS[a]["points"] for a in unlocked if a in ACHIEVEMENT_DEFS)
-
-def build_host_profile_embed(guild, member):
-    events, ratings = _host_server_stats(guild.id, member.id)
-    total_players = sum(event_player_count(e) for e in events)
-    avg_rating = (sum(ratings) / len(ratings)) if ratings else 0.0
-    state = get_achievement_state(guild.id, member.id)
-    unlocked = [a for a in ACHIEVEMENT_ORDER if a in state.get("unlocked", [])]
-    points = _achievement_points(unlocked)
-    earned, _ = achievement_progress_text(guild.id, member.id)
-    completed = len(events)
-    full = sum(1 for e in events if event_was_full(e))
-    occupancy = []
-    for e in events:
-        cap = int(e.get("max_players", 0) or 0)
-        if cap > 0:
-            occupancy.append(min(100, round(event_player_count(e) / cap * 100, 1)))
-    avg_occupancy = sum(occupancy) / len(occupancy) if occupancy else 0
-
-    emb = discord.Embed(
-        title="👤 Host Profile",
-        description=f"## {member.display_name}\n<@{member.id}>\n\n{DIV}\n### 📊 Career\n",
-        color=0x3498DB
-    )
-    emb.add_field(name="🎪 Events Hosted", value=f"**{completed}**", inline=True)
-    emb.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
-    emb.add_field(name="⭐ Average Rating", value=f"**{avg_rating:.2f} / 5**" if ratings else "**No ratings yet**", inline=True)
-    emb.add_field(name="🎟️ Sold Out Events", value=f"**{full}**", inline=True)
-    emb.add_field(name="📈 Avg Occupancy", value=f"**{avg_occupancy:.1f}%**" if occupancy else "**N/A**", inline=True)
-    emb.add_field(name="🏆 Achievement Points", value=f"**{points:,}**", inline=True)
-
-    shown = unlocked[-8:]
-    achievement_lines = [f"{ACHIEVEMENT_DEFS[a]['emoji']} **{ACHIEVEMENT_DEFS[a]['name']}**" for a in shown]
-    if len(unlocked) > 8:
-        achievement_lines.insert(0, f"*{len(unlocked) - 8} more unlocked...*")
-    emb.add_field(name=f"🏅 Achievements · {len(unlocked)}/{len(ACHIEVEMENT_DEFS)}", value="\n".join(achievement_lines) or "*No achievements yet*", inline=False)
-
-    next_goals = []
-    thresholds = [("getting_started", 3), ("experienced", 7), ("event_machine", 15), ("event_master", 25), ("event_legend", 50)]
-    for aid, target in thresholds:
-        if not earned.get(aid):
-            next_goals.append(f"{ACHIEVEMENT_DEFS[aid]['emoji']} {ACHIEVEMENT_DEFS[aid]['name']} · {completed}/{target} events")
-    if next_goals:
-        emb.add_field(name="🎯 Next Milestones", value="\n".join(next_goals[:3]), inline=False)
-    emb.set_thumbnail(url=member.display_avatar.url)
-    emb.set_footer(text=f"Host Assistant · {guild.name}")
-    return emb
-
 @bot.tree.command(name="host", description="View a host's profile")
 @app_commands.guild_only()
 async def host_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
@@ -2793,28 +2674,294 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
     emb.set_footer(text="Historical analytics are calculated from completed event records.")
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
-@bot.tree.command(name="setup", description="Admin setup panel")
+
+# ==========================================
+# /setup: modern step-by-step dashboard
+# ==========================================
+SETUP_STEPS = [
+    {"key": "host_role", "kind": "role", "icon": "🎤", "title": "Host role", "required": False,
+     "desc": "Members with this role can create events and open the Host panel. Admins can always do both."},
+    {"key": "event_role", "kind": "role", "icon": "🎟️", "title": "Event role", "required": False,
+     "desc": "Given to players while they hold a spot, and removed when they leave or the event ends."},
+    {"key": "superpower_role", "kind": "role", "icon": "💎", "title": "VIP role", "required": False,
+     "desc": "Boosters and members with this role can claim Superpower nations."},
+    {"key": "log_channel", "kind": "channel", "icon": "📜", "title": "Event log channel", "required": True,
+     "desc": "Every event gets one live log embed here that you can browse by category."},
+    {"key": "ai_log_channel", "kind": "channel", "icon": "🛡️", "title": "AI admin log channel", "required": False,
+     "desc": "Every action the AI admin runs is logged here in red. If you skip it, those logs go to the event log channel."},
+    {"key": "swap_channel", "kind": "channel", "icon": "🔄", "title": "Swap channel", "required": True,
+     "desc": "Swap requests are posted here so the other player can accept or decline."},
+    {"key": "stats_channel", "kind": "channel", "icon": "📊", "title": "Stats channel", "required": True,
+     "desc": "Event results and the rate-your-host button are posted here when an event is concluded."},
+    {"key": "achievement_roles", "kind": "achievement", "icon": "🏆", "title": "Achievement roles", "required": False,
+     "desc": "Create and sync every Host Assistant achievement role. Existing roles are reused, so running setup again will not duplicate them."},
+]
+SETUP_COLOR = 0x5865F2
+
+def _achievement_roles_ready(guild):
+    conf = get_config(guild.id)
+    role_map = conf.get("achievement_roles", {})
+    ready = 0
+    for aid, data in ACHIEVEMENT_DEFS.items():
+        role = None
+        rid = role_map.get(aid)
+        if rid:
+            try:
+                role = guild.get_role(int(rid))
+            except (TypeError, ValueError):
+                role = None
+        if role is None:
+            role = discord.utils.find(lambda r: r.name == f"{data['emoji']} {data['name']}", guild.roles)
+        if role:
+            ready += 1
+    return ready, len(ACHIEVEMENT_DEFS)
+
+def _setup_step_configured(guild, st, conf):
+    if st["kind"] == "achievement":
+        ready, total = _achievement_roles_ready(guild)
+        return ready == total and total > 0
+    return bool(conf.get(st["key"]))
+
+def _setup_value(guild, st, conf):
+    if st["kind"] == "achievement":
+        ready, total = _achievement_roles_ready(guild)
+        if ready == total and total > 0:
+            return f"✅ **{ready}/{total} roles ready**"
+        return f"⚠️ **{ready}/{total} roles ready**"
+    v = conf.get(st["key"])
+    if not v:
+        return "⚠️ *not set*" if st["required"] else "➖ *not set*"
+    if st["kind"] == "role":
+        return f"✅ <@&{v}>" if guild.get_role(v) else "⚠️ *role was deleted*"
+    return f"✅ <#{v}>" if guild.get_channel(v) else "⚠️ *channel was deleted*"
+
+def setup_checks(guild, conf):
+    me = guild.me
+    out = []
+    for st in SETUP_STEPS:
+        if st["kind"] == "achievement":
+            ready, total = _achievement_roles_ready(guild)
+            if ready < total:
+                out.append(f"⚠️ **Achievement roles** are incomplete ({ready}/{total})")
+            continue
+        v = conf.get(st["key"])
+        if not v:
+            if st["required"]:
+                out.append(f"⚠️ **{st['title']}** isn't set")
+            continue
+        if st["kind"] == "role":
+            r = guild.get_role(v)
+            if r and st["key"] == "event_role" and r >= me.top_role:
+                out.append("⚠️ **Event role** is above my role, so I can't hand it out")
+        else:
+            ch = guild.get_channel(v)
+            if ch:
+                p = ch.permissions_for(me)
+                if not (p.view_channel and p.send_messages and p.embed_links):
+                    out.append(f"⚠️ I can't post embeds in {ch.mention} (need Send Messages + Embed Links)")
+    gp = me.guild_permissions
+    if not gp.manage_roles:
+        out.append("⚠️ I need **Manage Roles** (event role + achievement roles + AI admin)")
+    if not gp.manage_messages:
+        out.append("⚠️ I need **Manage Messages** (cooldown cleanup + purge)")
+    return out or ["✅ Everything looks good"]
+
+class SetupAchievementRolesButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🏆 Create / Sync Achievement Roles", style=discord.ButtonStyle.primary, row=0)
+
+    async def callback(self, interaction):
+        view = self.view
+        await interaction.response.defer()
+        created, existing = await ensure_achievement_roles(interaction.guild)
+        ready, total = _achievement_roles_ready(interaction.guild)
+        if created:
+            note = f"🏆 **Achievement roles synced.** Created **{len(created)}** new role(s); **{len(existing)}** already existed. **{ready}/{total}** are ready."
+        else:
+            note = f"🏆 **Achievement roles already existed.** No duplicates created. **{ready}/{total}** are ready."
+        await view.go(interaction, step=view.step + 1, note=note)
+
+class SetupWizard(discord.ui.View):
+    def __init__(self, guild, owner_id, step=0, note=""):
+        super().__init__(timeout=900)
+        self.guild, self.owner_id, self.step, self.note = guild, owner_id, step, note
+        self.rebuild()
+
+    @property
+    def total(self):
+        return len(SETUP_STEPS)
+
+    def rebuild(self):
+        self.clear_items()
+        conf = get_config(self.guild.id)
+        if self.step < self.total:
+            st = SETUP_STEPS[self.step]
+            if st["kind"] == "role":
+                self.add_item(SetupRolePick(st))
+            elif st["kind"] == "channel":
+                self.add_item(SetupChannelPick(st))
+            elif st["kind"] == "achievement":
+                self.add_item(SetupAchievementRolesButton())
+            self.add_item(SetupNav("back", disabled=self.step == 0))
+            self.add_item(SetupNav("next", skip=not _setup_step_configured(self.guild, st, conf)))
+            self.add_item(SetupNav("clear", disabled=(st["kind"] == "achievement" or not _setup_step_configured(self.guild, st, conf))))
+        else:
+            self.add_item(SetupJump())
+            self.add_item(SetupNav("back"))
+            self.add_item(SetupNav("finish"))
+
+    def embed(self):
+        conf = get_config(self.guild.id)
+        t = self.total
+        if self.step < t:
+            st = SETUP_STEPS[self.step]
+            bar = "▰" * (self.step + 1) + "▱" * (t - self.step - 1)
+            desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
+            if self.note:
+                desc += f"{self.note}\n\n"
+            desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}"
+            emb = discord.Embed(color=SETUP_COLOR, description=desc)
+            emb.set_footer(text="Pick below · it saves instantly and moves to the next step")
+            return emb
+
+        roles = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
+                          for s in SETUP_STEPS if s["kind"] == "role")
+        chans = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
+                          for s in SETUP_STEPS if s["kind"] == "channel")
+        ready, total = _achievement_roles_ready(self.guild)
+        checks = "\n".join(setup_checks(self.guild, conf))
+        desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
+                f"### 🎭 Roles\n{roles}\n{DIV}\n"
+                f"### 📡 Channels\n{chans}\n{DIV}\n"
+                f"### 🏆 Achievement Roles\n🏆 **Achievement roles** · **{ready}/{total} ready**\n{DIV}\n"
+                f"### 🔍 Checks\n{checks}")
+        if self.note:
+            desc = self.note + "\n\n" + desc
+        emb = discord.Embed(color=SETUP_COLOR, description=desc[:4000])
+        emb.set_footer(text="Jump to any step with the menu · press Finish when you're done")
+        return emb
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This panel belongs to someone else. Run /setup yourself.", ephemeral=True)
+            return False
+        return True
+
+    async def go(self, interaction, step=None, note=""):
+        if step is not None:
+            self.step = max(0, min(self.total, step))
+        self.note = note
+        self.rebuild()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self.embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+
+def _setup_saved(st, extra=""):
+    return f"✅ **{st['title']}** saved." + (f"\n{extra}" if extra else "")
+
+class SetupRolePick(discord.ui.RoleSelect):
+    def __init__(self, st):
+        super().__init__(placeholder=f"Select the {st['title'].lower()}...", min_values=1, max_values=1, row=0)
+        self.st = st
+
+    async def callback(self, interaction):
+        view, role = self.view, self.values[0]
+        guild = view.guild
+        if role.is_default() or role.managed:
+            await view.go(interaction, note="❌ That role can't be used (it's @everyone or managed by a bot). Pick another.")
+            return
+        get_config(guild.id)[self.st["key"]] = role.id
+        save_db(db)
+        extra = ""
+        if self.st["key"] == "event_role" and role >= guild.me.top_role:
+            extra = "⚠️ This role is above my role, so I won't be able to hand it out. Move my role higher."
+        await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
+
+class SetupChannelPick(discord.ui.ChannelSelect):
+    def __init__(self, st):
+        super().__init__(placeholder=f"Select the {st['title'].lower()}...", min_values=1, max_values=1, row=0,
+                         channel_types=[discord.ChannelType.text, discord.ChannelType.news])
+        self.st = st
+
+    async def callback(self, interaction):
+        view, picked = self.view, self.values[0]
+        guild = view.guild
+        get_config(guild.id)[self.st["key"]] = picked.id
+        save_db(db)
+        extra = ""
+        ch = guild.get_channel(picked.id)
+        if ch:
+            p = ch.permissions_for(guild.me)
+            if not (p.view_channel and p.send_messages and p.embed_links):
+                extra = f"⚠️ I can't post embeds in {ch.mention} yet. Give me View Channel, Send Messages and Embed Links there."
+        await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
+
+class SetupNav(discord.ui.Button):
+    LABELS = {"back": ("◀ Back", discord.ButtonStyle.secondary), "next": ("Next ▶", discord.ButtonStyle.primary),
+              "clear": ("Clear", discord.ButtonStyle.secondary), "finish": ("✅ Finish", discord.ButtonStyle.success)}
+
+    def __init__(self, kind, disabled=False, skip=False):
+        label, style = self.LABELS[kind]
+        if kind == "next" and skip:
+            label, style = "Skip ▶", discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, disabled=disabled, row=1)
+        self.kind = kind
+
+    async def callback(self, interaction):
+        view = self.view
+        if self.kind == "back":
+            await view.go(interaction, step=view.step - 1)
+        elif self.kind == "next":
+            await view.go(interaction, step=view.step + 1)
+        elif self.kind == "clear":
+            st = SETUP_STEPS[view.step]
+            get_config(view.guild.id).pop(st["key"], None)
+            save_db(db)
+            await view.go(interaction, note=f"🗑️ **{st['title']}** cleared.")
+        else:
+            conf = get_config(view.guild.id)
+            done = sum(1 for s in SETUP_STEPS if _setup_step_configured(view.guild, s, conf))
+            emb = discord.Embed(color=0x2ECC71, description=(
+                f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
+                "Run **/setup** any time to change something."))
+            await interaction.response.edit_message(embed=emb, view=None)
+            view.stop()
+
+class SetupJump(discord.ui.Select):
+    def __init__(self):
+        opts = [discord.SelectOption(label=s["title"], value=str(i), emoji=s["icon"]) for i, s in enumerate(SETUP_STEPS)]
+        super().__init__(placeholder="Jump to a step...", options=opts, row=0)
+
+    async def callback(self, interaction):
+        await self.view.go(interaction, step=int(self.values[0]))
+
+@bot.tree.command(name="clearchat", description="Clears your AI chat history")
+async def clearchat_cmd(interaction: discord.Interaction):
+    uid = interaction.user.id
+    if uid in ai_history:
+        del ai_history[uid]
+        await interaction.response.send_message("AI memory cleared.", ephemeral=True)
+    else:
+        await interaction.response.send_message("No memory to clear.", ephemeral=True)
+
+@bot.tree.command(name="clearchat_all", description="Owner only: wipes AI chat memory for everyone")
+async def clearchat_all_cmd(interaction: discord.Interaction):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    n = len(ai_history)
+    ai_history.clear()
+    await interaction.response.send_message(f"Cleared AI memory for {n} user(s).", ephemeral=True)
+
+@bot.tree.command(name="setup", description="Step-by-step setup dashboard")
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
     if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-
-    conf = get_config(interaction.guild_id)
-    e1 = discord.Embed(title="Setup Roles", description=f"Host: <@&{conf.get('host_role')}>\nEvent: <@&{conf.get('event_role')}>\nVIP: <@&{conf.get('superpower_role')}>")
-    await interaction.response.send_message(embed=e1, view=SetupRolePanel(), ephemeral=True)
-
-    e2 = discord.Embed(title="Setup Channels", description=f"Logs: <#{conf.get('log_channel')}>\nSwaps: <#{conf.get('swap_channel')}>\nStats: <#{conf.get('stats_channel')}>")
-    await interaction.followup.send(embed=e2, view=SetupChannelPanel(), ephemeral=True)
-
-    role_count = len(conf.get("achievement_roles", {}))
-    e3 = discord.Embed(
-        title="Setup Achievement Roles",
-        description=(f"🏆 Achievement roles configured: **{role_count}/{len(ACHIEVEMENT_DEFS)}**\n\n"
-                     "Press the button to create every missing achievement role.\n"
-                     "Roles are created with rarity colors so you can rank/reorder them later.")
-    )
-    await interaction.followup.send(embed=e3, view=SetupAchievementPanel(), ephemeral=True)
+    wizard = SetupWizard(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=wizard.embed(), view=wizard, ephemeral=True)
 
 # Last phase ("open"/"live") we rendered per event, so we only edit when it flips.
 event_phase = {}
