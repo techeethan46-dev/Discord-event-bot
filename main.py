@@ -149,8 +149,8 @@ DISABLED_GUILD_IDS = [
 ]
 
 DISABLED_GUILD_MESSAGE = (
-    "The bot has been disabled in this server. Please contact one of the bot owners "
-    "'abyssalnoob1' or 'meruem015'"
+    "The bot has been disabled in this server. Contact one of the bot owners "
+    "abyssalnoob1 or meruem\n015"
 )
 
 def is_disabled_guild(guild_id):
@@ -2598,6 +2598,52 @@ class EventButtonsView(GuardedView):
             return
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
+
+def _achievement_points(unlocked):
+    """Return the total point value of unlocked achievements."""
+    return sum(ACHIEVEMENT_DEFS[aid]["points"] for aid in unlocked if aid in ACHIEVEMENT_DEFS)
+
+
+def build_host_profile_embed(guild, member):
+    """Build the Host Assistant profile embed for a member."""
+    host_id = check_host(member.id)
+    stats = db.get("hosts", {}).get(host_id, {})
+
+    total_events = int(stats.get("total_events", 0) or 0)
+    total_players = int(stats.get("total_players", 0) or 0)
+    ratings = []
+    for value in stats.get("ratings", []) or []:
+        try:
+            ratings.append(float(value))
+        except (TypeError, ValueError):
+            pass
+
+    average_rating = (sum(ratings) / len(ratings)) if ratings else 0.0
+    state = get_achievement_state(guild.id, member.id)
+    unlocked = set(state.get("unlocked", []))
+    points = _achievement_points(unlocked)
+
+    embed = discord.Embed(
+        title=f"🎖️ {member.display_name} · Host Profile",
+        description=f"<@{member.id}>\n\nA Host Assistant hosting profile for this community.",
+        color=0x3498DB
+    )
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(name="📅 Events Hosted", value=f"**{total_events:,}**", inline=True)
+    embed.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
+    embed.add_field(name="⭐ Average Rating", value=f"**{average_rating:.2f}/5**" if ratings else "**No ratings yet**", inline=True)
+    embed.add_field(
+        name="🏆 Achievements",
+        value=f"**{len(unlocked)}/{len(ACHIEVEMENT_DEFS)}** unlocked\n**{points:,}** points",
+        inline=True
+    )
+    embed.add_field(name="📝 Ratings Received", value=f"**{len(ratings):,}**", inline=True)
+    embed.add_field(name="🎯 Host Status", value="**Active Host**" if total_events else "**New Host**", inline=True)
+    embed.set_footer(text=f"Host Assistant · {guild.name}")
+    return embed
+
 
 async def global_guild_check(interaction: discord.Interaction) -> bool:
     """Block every application command in disabled servers, except owner management commands."""
