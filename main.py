@@ -141,7 +141,34 @@ EXEMPT_GUILD_IDS = [
     123456789012345678,
     1360298446937919711   # Exempt server ID
 ]
-BLACKLISTED_GUILD_IDS = [111122223333444455]
+
+# Servers where Host Assistant is completely disabled.
+# Add server IDs here, separated by commas.
+DISABLED_GUILD_IDS = [
+    # 123456789012345678,
+]
+
+DISABLED_GUILD_MESSAGE = (
+    "The bot has been disabled in this server. Contact one of the bot owners "
+    "abyssalnoob1 or meruem\n015"
+)
+
+def is_disabled_guild(guild_id):
+    if guild_id is None:
+        return False
+    if guild_id in DISABLED_GUILD_IDS:
+        return True
+    try:
+        return str(guild_id) in db.get("disabled_guilds", [])
+    except NameError:
+        return False
+
+async def disabled_guild_response(interaction):
+    if is_disabled_guild(interaction.guild_id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(DISABLED_GUILD_MESSAGE, ephemeral=True)
+        return True
+    return False
 
 DATA_FILE = "events_data.json"
 
@@ -201,6 +228,8 @@ db = load_db()
 for k in ["server_config", "events", "blacklists", "hosts", "achievement_progress"]:
     if k not in db:
         db[k] = {}
+if not isinstance(db.get("disabled_guilds"), list):
+    db["disabled_guilds"] = []
 if not isinstance(db.get("trusted_users"), dict):
     db["trusted_users"] = {}  # old global list is dropped: re-add people per server with /trust
 
@@ -522,6 +551,11 @@ def is_server_admin(member):
     """Server admins, plus the bot owners in ANY server (so you can run /setup etc. everywhere)."""
     return member.id in BOT_OWNER_IDS or member.guild_permissions.administrator
 
+def has_host_role(member, guild_id):
+    """Return True only when the member has this server's configured Host role."""
+    host_role_id = get_config(guild_id).get("host_role")
+    return bool(host_role_id) and any(r.id == host_role_id for r in getattr(member, "roles", []))
+
 def is_vip(member, guild_id):
     """Booster, VIP role, or admin: may hold Superpower nations."""
     if member is None:
@@ -593,42 +627,6 @@ async def log_action(guild, title, desc, color=0x3498DB):
             await channel.send(embed=emb)
         except discord.HTTPException: 
             pass
-
-async def update_leaderboard(guild):
-    conf = get_config(guild.id)
-    msg_id = conf.get("leaderboard_msg_id")
-    ch_id = conf.get("leaderboard_ch_id")
-    if not msg_id or not ch_id: 
-        return
-
-    ch = guild.get_channel(ch_id)
-    if not ch: return
-
-    try: 
-        msg = await ch.fetch_message(msg_id)
-    except discord.HTTPException: 
-        return
-
-    scores = []
-    for hid, data in db["hosts"].items():
-        avg = sum(data["ratings"])/len(data["ratings"]) if data["ratings"] else 0.0
-        scores.append((hid, data["total_events"], data["total_players"], round(avg, 1)))
-
-    emb = discord.Embed(title="🏆 Host Leaderboards", description=f"Updated: <t:{int(time.time())}:R>", color=0xF1C40F)
-
-    t_ev = sorted(scores, key=lambda x: x[1], reverse=True)[:3]
-    emb.add_field(name="🔥 Most Events", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[1]} Events" for i, h in enumerate(t_ev) if h[1] > 0]) or "None", inline=False)
-
-    t_pl = sorted(scores, key=lambda x: x[2], reverse=True)[:3]
-    emb.add_field(name="👥 Most Players", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[2]} Players" for i, h in enumerate(t_pl) if h[2] > 0]) or "None", inline=False)
-
-    t_rt = sorted([h for h in scores if len(db["hosts"][h[0]]["ratings"]) >= 2], key=lambda x: x[3], reverse=True)[:3]
-    emb.add_field(name="⭐ Top Rated", value="\n".join([f"**{i+1}.** <@{h[0]}> - {h[3]} ⭐" for i, h in enumerate(t_rt)]) or "Not enough data", inline=False)
-
-    try:
-        await msg.edit(embed=emb)
-    except discord.HTTPException as e:
-        print("leaderboard edit failed:", e)
 
 # One solid, straight divider. (~~ strikethrough over blank Braille characters draws a continuous line;
 # the box-drawing dashes it replaces rendered as broken segments on phones.)
@@ -815,7 +813,13 @@ class LogPageButton(discord.ui.Button):
         save_db(db)
         await interaction.response.edit_message(embed=build_log_embed(info), view=make_log_view(info))
 
-class EventLogView(discord.ui.View):
+class GuardedView(discord.ui.View):
+    """Base view that disables every button/select in disabled servers."""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return not await disabled_guild_response(interaction)
+
+
+class EventLogView(GuardedView):
     def __init__(self, cat="all", page=0, pages=1):
         super().__init__(timeout=None)
         self.add_item(LogCatSelect(cat))
@@ -1724,7 +1728,7 @@ def summarize(a):
     detail = ", ".join(bits)[:150]
     return f"**{label}**" + (f" ({detail})" if detail else "")
 
-class ConfirmView(discord.ui.View):
+class ConfirmView(GuardedView):
     def __init__(self, author_id):
         super().__init__(timeout=30)
         self.author_id = author_id
@@ -2098,7 +2102,7 @@ async def on_message(msg):
     if msg.author.bot:
         return
 
-    if msg.guild and msg.guild.id in BLACKLISTED_GUILD_IDS:
+    if msg.guild and is_disabled_guild(msg.guild.id):
         return
 
     try:
@@ -2118,6 +2122,8 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
         self.key = key
 
     async def on_submit(self, interaction):
+        if await disabled_guild_response(interaction):
+            return
         info = db["events"].get(self.key)
         if not info:
             await interaction.response.send_message("Event not found.", ephemeral=True)
@@ -2164,7 +2170,6 @@ class RateModal(discord.ui.Modal, title="Rate Event"):
         save_db(db)
 
         await interaction.response.send_message(f"Rated **{val}/5**!", ephemeral=True)
-        await update_leaderboard(interaction.guild)
         stats_id = get_config(interaction.guild_id).get("stats_channel")
         stats_channel = interaction.guild.get_channel(stats_id) if stats_id else None
         await check_and_announce_achievements(interaction.guild, self.host_id, stats_channel)
@@ -2178,6 +2183,8 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
         self.key = key
 
     async def on_submit(self, interaction):
+        if await disabled_guild_response(interaction):
+            return
         info = db["events"].get(self.key)
         if not info or info.get("concluded"):
             await interaction.response.send_message("Event is over.", ephemeral=True)
@@ -2251,6 +2258,8 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
         self.key = key
 
     async def on_submit(self, interaction):
+        if await disabled_guild_response(interaction):
+            return
         info = db["events"].get(self.key)
         if not info or info.get("concluded"):
             await interaction.response.send_message("Event is over.", ephemeral=True)
@@ -2294,7 +2303,7 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
         await interaction.response.send_message(f"Proposal sent in <#{ch_id}>!", ephemeral=True)
         await event_log(interaction.guild, info, "swap", f"<@{interaction.user.id}> proposed a swap with <@{t_id}> ({u_c} ↔ {t_c})")
 
-class SwapAcceptView(discord.ui.View):
+class SwapAcceptView(GuardedView):
     def __init__(self, key, s_id, t_id, s_c, t_c):
         super().__init__(timeout=300)
         self.key = key
@@ -2387,7 +2396,7 @@ class KickSelect(discord.ui.Select):
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> removed **{c_title}** (<@{uid}>)")
         await interaction.followup.send(f"Kicked **{c_title}**.", ephemeral=True)
 
-class RateBtnView(discord.ui.View):
+class RateBtnView(GuardedView):
     def __init__(self, h_id, e_key):
         super().__init__(timeout=3600)
         self.h_id, self.e_key = h_id, e_key
@@ -2414,7 +2423,7 @@ class HelperSelect(discord.ui.UserSelect):
         await refresh_event_message(info, interaction.guild)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set helpers: {names or 'none'}")
 
-class HostActionsView(discord.ui.View):
+class HostActionsView(GuardedView):
     def __init__(self, key):
         super().__init__(timeout=300)
         self.key = key
@@ -2512,14 +2521,13 @@ class HostActionsView(discord.ui.View):
                 except discord.HTTPException as e:
                     print("stats post failed:", e)
 
-        await update_leaderboard(interaction.guild)
         await check_and_announce_achievements(interaction.guild, info["host_id"], s_ch)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> concluded the event · {p_count} players · {dur}h live")
         if info.get("helpers"):
             await event_log(interaction.guild, info, "host", "🤝 Helpers: " + ", ".join(f"<@{i}>" for i in info["helpers"]))
 
-class EventButtonsView(discord.ui.View):
+class EventButtonsView(GuardedView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -2591,74 +2599,15 @@ class EventButtonsView(discord.ui.View):
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
-def _host_server_stats(guild_id, host_id):
-    events = completed_events_for_host(guild_id, host_id)
-    event_keys = {k for k, e in db["events"].items()
-                  if e.get("guild_id") == int(guild_id) and e.get("host_id") == int(host_id) and e.get("concluded")}
-    ratings = []
-    global_host = db.get("hosts", {}).get(str(host_id), {})
-    for r in global_host.get("rating_history", []):
-        if r.get("event_key") in event_keys:
-            try:
-                ratings.append(float(r.get("rating", 0)))
-            except (TypeError, ValueError):
-                pass
-    return events, ratings
+async def global_guild_check(interaction: discord.Interaction) -> bool:
+    """Block every application command in disabled servers with one ephemeral message."""
+    if await disabled_guild_response(interaction):
+        return False
+    return True
 
 
-def _achievement_points(unlocked):
-    return sum(ACHIEVEMENT_DEFS[a]["points"] for a in unlocked if a in ACHIEVEMENT_DEFS)
+bot.tree.interaction_check = global_guild_check
 
-
-def build_host_profile_embed(guild, member):
-    events, ratings = _host_server_stats(guild.id, member.id)
-    total_players = sum(event_player_count(e) for e in events)
-    avg_rating = (sum(ratings) / len(ratings)) if ratings else 0.0
-    state = get_achievement_state(guild.id, member.id)
-    unlocked = [a for a in ACHIEVEMENT_ORDER if a in state.get("unlocked", [])]
-    points = _achievement_points(unlocked)
-    earned, _ = achievement_progress_text(guild.id, member.id)
-    completed = len(events)
-    full = sum(1 for e in events if event_was_full(e))
-    occupancy = []
-    for e in events:
-        cap = int(e.get("max_players", 0) or 0)
-        if cap > 0:
-            occupancy.append(min(100, round(event_player_count(e) / cap * 100, 1)))
-    avg_occupancy = sum(occupancy) / len(occupancy) if occupancy else 0
-
-    emb = discord.Embed(
-        title="👤 Host Profile",
-        description=f"## {member.display_name}\n<@{member.id}>\n\n{DIV}\n### 📊 Career\n",
-        color=0x3498DB
-    )
-    emb.add_field(name="🎪 Events Hosted", value=f"**{completed}**", inline=True)
-    emb.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
-    emb.add_field(name="⭐ Average Rating", value=f"**{avg_rating:.2f} / 5**" if ratings else "**No ratings yet**", inline=True)
-    emb.add_field(name="🎟️ Sold Out Events", value=f"**{full}**", inline=True)
-    emb.add_field(name="📈 Avg Occupancy", value=f"**{avg_occupancy:.1f}%**" if occupancy else "**N/A**", inline=True)
-    emb.add_field(name="🏆 Achievement Points", value=f"**{points:,}**", inline=True)
-
-    shown = unlocked[-8:]
-    achievement_lines = [f"{ACHIEVEMENT_DEFS[a]['emoji']} **{ACHIEVEMENT_DEFS[a]['name']}**" for a in shown]
-    if len(unlocked) > 8:
-        achievement_lines.insert(0, f"*{len(unlocked) - 8} more unlocked...*")
-    emb.add_field(
-        name=f"🏅 Achievements · {len(unlocked)}/{len(ACHIEVEMENT_DEFS)}",
-        value="\n".join(achievement_lines) or "*No achievements yet*",
-        inline=False
-    )
-
-    next_goals = []
-    thresholds = [("getting_started", 3), ("experienced", 7), ("event_machine", 15), ("event_master", 25), ("event_legend", 50)]
-    for aid, target in thresholds:
-        if not earned.get(aid):
-            next_goals.append(f"{ACHIEVEMENT_DEFS[aid]['emoji']} {ACHIEVEMENT_DEFS[aid]['name']} · {completed}/{target} events")
-    if next_goals:
-        emb.add_field(name="🎯 Next Milestones", value="\n".join(next_goals[:3]), inline=False)
-    emb.set_thumbnail(url=member.display_avatar.url)
-    emb.set_footer(text=f"Host Assistant · {guild.name}")
-    return emb
 
 @bot.tree.command(name="host", description="View a host's profile")
 @app_commands.guild_only()
@@ -2695,6 +2644,25 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
     emb.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENT_DEFS)} unlocked · {_achievement_points(unlocked):,} points")
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
+@bot.tree.command(name="disable_server", description="Disable Host Assistant in this server")
+@app_commands.guild_only()
+async def disable_server_cmd(interaction: discord.Interaction):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Bot owners only.", ephemeral=True)
+        return
+
+    gid = str(interaction.guild_id)
+    disabled = db.setdefault("disabled_guilds", [])
+    if gid not in disabled:
+        disabled.append(gid)
+        save_db(db)
+
+    await interaction.response.send_message(
+        "✅ Host Assistant has been disabled in this server.",
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name="analytics", description="View real event and host analytics")
 @app_commands.guild_only()
 @app_commands.choices(period=[
@@ -2704,6 +2672,13 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
     app_commands.Choice(name="All Time", value="0"),
 ])
 async def analytics_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    if not has_host_role(interaction.user, interaction.guild_id):
+        await interaction.response.send_message(
+            "Only members with the configured Host role can use /analytics.",
+            ephemeral=True
+        )
+        return
+
     days = int(period.value) if period else 30
     cutoff = 0 if days == 0 else time.time() - days * 86400
     events = [e for e in db["events"].values()
@@ -2850,7 +2825,7 @@ class SetupAchievementRolesButton(discord.ui.Button):
             note = f"🏆 **Achievement roles already existed.** No duplicates created. **{ready}/{total}** are ready."
         await view.go(interaction, step=view.step + 1, note=note)
 
-class SetupWizard(discord.ui.View):
+class SetupWizard(GuardedView):
     def __init__(self, guild, owner_id, step=0, note=""):
         super().__init__(timeout=900)
         self.guild, self.owner_id, self.step, self.note = guild, owner_id, step, note
@@ -3190,24 +3165,6 @@ async def blacklist(interaction: discord.Interaction, user: discord.Member):
 
     save_db(db)
     await interaction.response.send_message(msg, ephemeral=True)
-
-@bot.tree.command(name="spawn_leaderboard", description="Spawn live leaderboard")
-@app_commands.guild_only()
-async def spawn_lb(interaction: discord.Interaction):
-    if not is_server_admin(interaction.user):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-
-    emb = discord.Embed(title="Host Leaderboards", description="Updating...")
-    msg = await interaction.channel.send(embed=emb)
-
-    conf = get_config(interaction.guild_id)
-    conf["leaderboard_msg_id"] = msg.id
-    conf["leaderboard_ch_id"] = interaction.channel_id
-    save_db(db)
-
-    await update_leaderboard(interaction.guild)
-    await interaction.response.send_message("Leaderboard spawned.", ephemeral=True)
 
 @bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list in THIS server")
 @app_commands.guild_only()
