@@ -2591,6 +2591,75 @@ class EventButtonsView(discord.ui.View):
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
+def _host_server_stats(guild_id, host_id):
+    events = completed_events_for_host(guild_id, host_id)
+    event_keys = {k for k, e in db["events"].items()
+                  if e.get("guild_id") == int(guild_id) and e.get("host_id") == int(host_id) and e.get("concluded")}
+    ratings = []
+    global_host = db.get("hosts", {}).get(str(host_id), {})
+    for r in global_host.get("rating_history", []):
+        if r.get("event_key") in event_keys:
+            try:
+                ratings.append(float(r.get("rating", 0)))
+            except (TypeError, ValueError):
+                pass
+    return events, ratings
+
+
+def _achievement_points(unlocked):
+    return sum(ACHIEVEMENT_DEFS[a]["points"] for a in unlocked if a in ACHIEVEMENT_DEFS)
+
+
+def build_host_profile_embed(guild, member):
+    events, ratings = _host_server_stats(guild.id, member.id)
+    total_players = sum(event_player_count(e) for e in events)
+    avg_rating = (sum(ratings) / len(ratings)) if ratings else 0.0
+    state = get_achievement_state(guild.id, member.id)
+    unlocked = [a for a in ACHIEVEMENT_ORDER if a in state.get("unlocked", [])]
+    points = _achievement_points(unlocked)
+    earned, _ = achievement_progress_text(guild.id, member.id)
+    completed = len(events)
+    full = sum(1 for e in events if event_was_full(e))
+    occupancy = []
+    for e in events:
+        cap = int(e.get("max_players", 0) or 0)
+        if cap > 0:
+            occupancy.append(min(100, round(event_player_count(e) / cap * 100, 1)))
+    avg_occupancy = sum(occupancy) / len(occupancy) if occupancy else 0
+
+    emb = discord.Embed(
+        title="👤 Host Profile",
+        description=f"## {member.display_name}\n<@{member.id}>\n\n{DIV}\n### 📊 Career\n",
+        color=0x3498DB
+    )
+    emb.add_field(name="🎪 Events Hosted", value=f"**{completed}**", inline=True)
+    emb.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
+    emb.add_field(name="⭐ Average Rating", value=f"**{avg_rating:.2f} / 5**" if ratings else "**No ratings yet**", inline=True)
+    emb.add_field(name="🎟️ Sold Out Events", value=f"**{full}**", inline=True)
+    emb.add_field(name="📈 Avg Occupancy", value=f"**{avg_occupancy:.1f}%**" if occupancy else "**N/A**", inline=True)
+    emb.add_field(name="🏆 Achievement Points", value=f"**{points:,}**", inline=True)
+
+    shown = unlocked[-8:]
+    achievement_lines = [f"{ACHIEVEMENT_DEFS[a]['emoji']} **{ACHIEVEMENT_DEFS[a]['name']}**" for a in shown]
+    if len(unlocked) > 8:
+        achievement_lines.insert(0, f"*{len(unlocked) - 8} more unlocked...*")
+    emb.add_field(
+        name=f"🏅 Achievements · {len(unlocked)}/{len(ACHIEVEMENT_DEFS)}",
+        value="\n".join(achievement_lines) or "*No achievements yet*",
+        inline=False
+    )
+
+    next_goals = []
+    thresholds = [("getting_started", 3), ("experienced", 7), ("event_machine", 15), ("event_master", 25), ("event_legend", 50)]
+    for aid, target in thresholds:
+        if not earned.get(aid):
+            next_goals.append(f"{ACHIEVEMENT_DEFS[aid]['emoji']} {ACHIEVEMENT_DEFS[aid]['name']} · {completed}/{target} events")
+    if next_goals:
+        emb.add_field(name="🎯 Next Milestones", value="\n".join(next_goals[:3]), inline=False)
+    emb.set_thumbnail(url=member.display_avatar.url)
+    emb.set_footer(text=f"Host Assistant · {guild.name}")
+    return emb
+
 @bot.tree.command(name="host", description="View a host's profile")
 @app_commands.guild_only()
 async def host_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
