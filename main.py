@@ -149,8 +149,8 @@ DISABLED_GUILD_IDS = [
 ]
 
 DISABLED_GUILD_MESSAGE = (
-    "The bot has been disabled in this server. Contact one of the bot owners "
-    "abyssalnoob1 or meruem\n015"
+    "The bot has been disabled in this server. Please contact one of the bot owners "
+    "'abyssalnoob1' or 'meruem015'"
 )
 
 def is_disabled_guild(guild_id):
