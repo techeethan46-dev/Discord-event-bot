@@ -2600,7 +2600,12 @@ class EventButtonsView(GuardedView):
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
 async def global_guild_check(interaction: discord.Interaction) -> bool:
-    """Block every application command in disabled servers with one ephemeral message."""
+    """Block every application command in disabled servers, except owner management commands."""
+    # Bot owners must always be able to manage disabled servers.
+    if interaction.command and interaction.command.name in {"disable_server", "enable_server"}:
+        if interaction.user.id in BOT_OWNER_IDS:
+            return True
+
     if await disabled_guild_response(interaction):
         return False
     return True
@@ -2644,23 +2649,50 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
     emb.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENT_DEFS)} unlocked · {_achievement_points(unlocked):,} points")
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
-@bot.tree.command(name="disable_server", description="Disable Host Assistant in this server")
-@app_commands.guild_only()
-async def disable_server_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="disable_server", description="Disable Host Assistant in a server")
+@app_commands.describe(server_id="The Discord server ID to disable")
+async def disable_server_cmd(interaction: discord.Interaction, server_id: str):
     if interaction.user.id not in BOT_OWNER_IDS:
         await interaction.response.send_message("Bot owners only.", ephemeral=True)
         return
 
-    gid = str(interaction.guild_id)
-    disabled = db.setdefault("disabled_guilds", [])
-    if gid not in disabled:
-        disabled.append(gid)
-        save_db(db)
+    server_id = server_id.strip()
+    if not server_id.isdigit():
+        await interaction.response.send_message("❌ Invalid server ID. Please provide a numeric Discord server ID.", ephemeral=True)
+        return
 
-    await interaction.response.send_message(
-        "✅ Host Assistant has been disabled in this server.",
-        ephemeral=True
-    )
+    disabled = db.setdefault("disabled_guilds", [])
+    if server_id not in disabled:
+        disabled.append(server_id)
+        save_db(db)
+        message = f"✅ Host Assistant has been disabled in server `{server_id}`."
+    else:
+        message = f"ℹ️ Server `{server_id}` is already disabled."
+
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+@bot.tree.command(name="enable_server", description="Re-enable Host Assistant in a server")
+@app_commands.describe(server_id="The Discord server ID to re-enable")
+async def enable_server_cmd(interaction: discord.Interaction, server_id: str):
+    if interaction.user.id not in BOT_OWNER_IDS:
+        await interaction.response.send_message("Bot owners only.", ephemeral=True)
+        return
+
+    server_id = server_id.strip()
+    if not server_id.isdigit():
+        await interaction.response.send_message("❌ Invalid server ID. Please provide a numeric Discord server ID.", ephemeral=True)
+        return
+
+    disabled = db.setdefault("disabled_guilds", [])
+    if server_id in disabled:
+        disabled.remove(server_id)
+        save_db(db)
+        message = f"✅ Host Assistant has been re-enabled in server `{server_id}`."
+    else:
+        message = f"ℹ️ Server `{server_id}` is not in the disabled server list."
+
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.tree.command(name="analytics", description="View real event and host analytics")
