@@ -55,11 +55,15 @@ openrouter_client = AsyncOpenAI(
     api_key=OPENROUTER_KEY
 ) if OPENROUTER_KEY else None
 
+# OpenRouter free routing.  Keep this list current-friendly: OpenRouter can route
+# `openrouter/free` to an available free model instead of us hardcoding models that
+# may disappear.  Vision requests use the explicit multimodal model first.
 OPENROUTER_FREE_MODELS = [
+    "openrouter/free"
+]
+OPENROUTER_VISION_MODELS = [
+    "nvidia/nemotron-3.5-super-vl:free",
     "openrouter/free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "mistralai/mistral-7b-instruct:free"
 ]
 
 ai_history = {}
@@ -617,9 +621,16 @@ async def dm_owners(text):
         except Exception as e:
             print("Failed to DM owner:", e)
 
-async def log_action(guild, title, desc, color=0x3498DB):
-    log_id = get_config(guild.id).get("log_channel")
-    if not log_id: return
+async def log_action(guild, title, desc, color=0x3498DB, channel_key=None):
+    # AI Admin actions have their own setup channel.  Everything else keeps using
+    # the normal event log channel, so existing logging is unchanged.
+    log_id = get_config(guild.id).get(channel_key or "log_channel")
+    if not log_id:
+        # Preserve the old fallback if an AI log channel was not configured.
+        if channel_key == "ai_log_channel":
+            log_id = get_config(guild.id).get("log_channel")
+        if not log_id:
+            return
     channel = guild.get_channel(log_id)
     if channel:
         emb = discord.Embed(description=f"## 📝 {title}\n{DIV}\n{desc}", color=color)
@@ -1756,9 +1767,13 @@ class ConfirmView(GuardedView):
         await interaction.response.defer()
         self.stop()
 
-async def parse_admin_request(txt):
+async def parse_admin_request(txt, image_urls=None):
     """Returns list of actions ([] = not an admin request) or None if every AI provider failed."""
-    messages = [{"role": "system", "content": ADMIN_PARSER_PROMPT}, {"role": "user", "content": txt}]
+    image_urls = image_urls or []
+    content = [{"type": "text", "text": txt or "Please inspect the attached image and determine the requested admin action."}]
+    content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_urls[:4])
+    user_message = {"role": "user", "content": content if image_urls else (txt or "")}
+    messages = [{"role": "system", "content": ADMIN_PARSER_PROMPT}, user_message]
     raw, _, _ = await llm_complete(messages, groq_tokens=1500, or_tokens=800, temperature=0)
     if not raw:
         return None
@@ -1776,9 +1791,10 @@ async def parse_admin_request(txt):
 
 async def run_admin_flow(msg, txt):
     uid = msg.author.id
+    image_urls = [a.url for a in msg.attachments if (a.content_type or "").startswith("image/")][:4]
     try:
         async with msg.channel.typing():
-            plan = await parse_admin_request(txt)
+            plan = await parse_admin_request(txt, image_urls=image_urls)
 
         if plan is None:
             await safe_reply(msg, "⚠️ Couldn't reach my brain right now, try again in a sec.")
@@ -1851,7 +1867,8 @@ async def run_admin_flow(msg, txt):
 
         if ok_count:
             await log_action(msg.guild, "AI Admin Action",
-                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500], color=0xE74C3C)
+                             f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500],
+                             color=0xE74C3C, channel_key="ai_log_channel")
     except Exception as e:
         print("run_admin_flow error:", e)
         await dm_owners(f"⚠️ **Admin flow exception:** `{e}`")
@@ -1914,31 +1931,47 @@ def clean_ai_text(t):
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
+def messages_have_images(messages):
+    """Return True when any chat message contains an OpenAI-compatible image_url part."""
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
 async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=None):
-    """Try Groq first, then OpenRouter free models. Returns (text_or_None, groq_err, openrouter_err).
-    (gpt-oss models spend tokens on hidden reasoning, so groq_tokens must be generous.)"""
+    """Run normal text through Groq first; route image conversations to OpenRouter vision.
+    Returns (text_or_None, groq_err, openrouter_err)."""
     extra = {} if temperature is None else {"temperature": temperature}
     ans, groq_err, openrouter_err = None, "", ""
+    has_images = messages_have_images(messages)
 
-    if groq_client:
-        for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
-            try:
-                res = await groq_client.chat.completions.create(
-                    model=groq_model, messages=messages, max_tokens=groq_tokens, **extra)
-                if res.choices and (res.choices[0].message.content or "").strip():
-                    return res.choices[0].message.content.strip(), groq_err, openrouter_err
-            except Exception as e:
-                groq_err = str(e)
-                print(f"Groq ({groq_model}) error:", e)
-    else:
-        groq_err = "GROQ_API_KEY not set"
+    # Groq is intentionally skipped for image conversations so an image can never
+    # be silently converted into text-only input.
+    if not has_images:
+        if groq_client:
+            for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+                try:
+                    res = await groq_client.chat.completions.create(
+                        model=groq_model, messages=messages, max_tokens=groq_tokens, **extra)
+                    if res.choices and (res.choices[0].message.content or "").strip():
+                        return res.choices[0].message.content.strip(), groq_err, openrouter_err
+                except Exception as e:
+                    groq_err = str(e)
+                    print(f"Groq ({groq_model}) error:", e)
+        else:
+            groq_err = "GROQ_API_KEY not set"
 
     if openrouter_client:
-        for open_model in OPENROUTER_FREE_MODELS:
+        models = OPENROUTER_VISION_MODELS if has_images else OPENROUTER_FREE_MODELS
+        for open_model in models:
             try:
                 res = await openrouter_client.chat.completions.create(
                     model=open_model, messages=messages, max_tokens=or_tokens,
-                    extra_headers={"HTTP-Referer": "https://github.com", "X-Title": "Discord Bot"},
+                    extra_headers={"HTTP-Referer": "https://github.com", "X-Title": "Host Assistant"},
                     **extra)
                 if res.choices and (res.choices[0].message.content or "").strip():
                     return res.choices[0].message.content.strip(), groq_err, openrouter_err
@@ -1982,7 +2015,14 @@ async def process_ai_queue():
                 if uid not in ai_history:
                     ai_history[uid] = []
 
-                ai_history[uid].append({"role": "user", "content": txt})
+                image_urls = [a.url for a in msg.attachments if (a.content_type or "").startswith("image/")][:4]
+                if image_urls:
+                    user_content = [{"type": "text", "text": txt or "Please inspect the attached image."}]
+                    user_content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_urls)
+                else:
+                    user_content = txt
+
+                ai_history[uid].append({"role": "user", "content": user_content})
                 ai_history[uid] = ai_history[uid][-6:]
 
                 want_gif = bool(GIPHY_KEY) and random.random() < GIF_CHANCE
@@ -2045,6 +2085,7 @@ async def handle_ai_trigger(msg):
         return
 
     txt = re.sub(rf"<@!?{bot.user.id}>", "", msg.content).strip()
+    has_image = any((a.content_type or "").startswith("image/") for a in msg.attachments)
 
     # Mute Command Check (Owner Only)
     if txt.lower() == "shut up":
@@ -2058,9 +2099,11 @@ async def handle_ai_trigger(msg):
             await safe_reply(msg, "back, did you miss me?")
         return
 
-    if not txt:
+    if not txt and not has_image:
         await safe_reply(msg, "tf you want bro?")
         return
+    if not txt and has_image:
+        txt = "Please look at the attached image and tell me what you see."
 
     uid = msg.author.id
 
