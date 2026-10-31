@@ -141,16 +141,86 @@ def pick_persona(member):
     except Exception:
         return PERSONA_ROAST
 
-EXEMPT_GUILD_IDS = [
-    123456789012345678,
-    1360298446937919711   # Exempt server ID
-]
+# Only these servers are allowed to have Host Assistant installed.
+# The bot will immediately leave any other server it is invited to or already in.
+WHITELISTED_GUILD_IDS = {
+    1360298446937919711,
+    1472539132675751949,
+    1566161677307875520,
+}
 
 # Servers where Host Assistant is completely disabled.
 # Add server IDs here, separated by commas.
 DISABLED_GUILD_IDS = [
     # 123456789012345678,
 ]
+
+_whitelist_cleanup_tasks = set()
+
+
+def is_whitelisted_guild(guild_id):
+    try:
+        return int(guild_id) in WHITELISTED_GUILD_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+async def delete_bot_messages(guild):
+    """Best-effort cleanup of this bot's own messages before leaving a non-whitelisted guild."""
+    if not bot.user:
+        return 0
+
+    deleted = 0
+    channels = list(getattr(guild, "text_channels", []))
+    channels += list(getattr(guild, "threads", []))
+
+    for channel in channels:
+        try:
+            # Reading history is permission-gated. We only delete messages authored by this bot.
+            async for message in channel.history(limit=None, oldest_first=False):
+                if message.author.id != bot.user.id:
+                    continue
+                try:
+                    await message.delete(reason="Host Assistant whitelist enforcement")
+                    deleted += 1
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    pass
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            continue
+        except Exception as e:
+            print(f"Whitelist cleanup error in #{getattr(channel, 'name', 'unknown')}:", e)
+
+    return deleted
+
+
+async def enforce_guild_whitelist(guild):
+    """Delete our own messages where possible, then leave any non-whitelisted guild."""
+    if is_whitelisted_guild(guild.id):
+        return
+
+    try:
+        deleted = await delete_bot_messages(guild)
+        print(f"Whitelist: leaving {guild.name} ({guild.id}); deleted {deleted} bot messages where possible.")
+    except Exception as e:
+        print(f"Whitelist cleanup failed for {guild.name} ({guild.id}):", e)
+
+    try:
+        await guild.leave()
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"Whitelist: failed to leave {guild.name} ({guild.id}):", e)
+
+
+def schedule_whitelist_enforcement(guild):
+    if is_whitelisted_guild(guild.id):
+        return
+    key = guild.id
+    if key in _whitelist_cleanup_tasks:
+        return
+    task = asyncio.create_task(enforce_guild_whitelist(guild))
+    _whitelist_cleanup_tasks.add(key)
+    def _done(_):
+        _whitelist_cleanup_tasks.discard(key)
+    task.add_done_callback(_done)
 
 DISABLED_GUILD_MESSAGE = (
     "The bot has been disabled in this server. Contact one of the bot owners "
@@ -2072,10 +2142,6 @@ _bg_tasks = set()
 async def handle_ai_trigger(msg):
     global bot_muted
 
-    # AI chat is disabled in small, non-exempt servers (commands still work there).
-    if msg.guild and (msg.guild.member_count or 0) < 200 and msg.guild.id not in EXEMPT_GUILD_IDS:
-        return
-
     # AI Chat Trigger (Ping or Reply)
     pinged = bot.user in msg.mentions
     ref = msg.reference.resolved if msg.reference else None
@@ -2143,6 +2209,9 @@ async def handle_ai_trigger(msg):
 @bot.event
 async def on_message(msg):
     if msg.author.bot:
+        return
+
+    if msg.guild and not is_whitelisted_guild(msg.guild.id):
         return
 
     if msg.guild and is_disabled_guild(msg.guild.id):
@@ -2689,7 +2758,14 @@ def build_host_profile_embed(guild, member):
 
 
 async def global_guild_check(interaction: discord.Interaction) -> bool:
-    """Block every application command in disabled servers, except owner management commands."""
+    """Block every application command outside the whitelist and in disabled servers."""
+    if interaction.guild_id and not is_whitelisted_guild(interaction.guild_id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Host Assistant is not authorized for this server.", ephemeral=True
+            )
+        return False
+
     # Bot owners must always be able to manage disabled servers.
     if interaction.command and interaction.command.name in {"disable_server", "enable_server"}:
         if interaction.user.id in BOT_OWNER_IDS:
@@ -3172,8 +3248,18 @@ async def setup_hook():
 bot.setup_hook = setup_hook
 
 @bot.event
+async def on_guild_join(guild):
+    # Discord necessarily fires this after the bot joins, so this is the earliest
+    # possible enforcement point. Non-whitelisted guilds are cleaned up and left immediately.
+    schedule_whitelist_enforcement(guild)
+
+
+@bot.event
 async def on_ready():
     print(f"Logged in: {bot.user.name}")
+    # Enforce the whitelist for every guild already connected to the bot.
+    for guild in list(bot.guilds):
+        schedule_whitelist_enforcement(guild)
     try:
         await bot.change_presence(status=discord.Status.online,
                                   activity=discord.Game(name="with events · ping me"))
