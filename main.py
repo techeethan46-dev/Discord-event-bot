@@ -11,6 +11,9 @@ import datetime
 import random
 import colorsys
 import aiohttp
+import traceback
+import socket
+import platform
 from discord.http import Route
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -22,17 +25,115 @@ from threading import Thread
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 
+# ============================================================
+# STARTUP / RENDER DIAGNOSTICS
+# ============================================================
+START_TIME = time.time()
+PORT = int(os.environ.get("PORT", "10000"))
+FLASK_THREAD = None
+FLASK_STARTED = False
+FLASK_ERROR = None
+
 app = Flask(__name__)
 
 @app.route('/')
-def home(): 
-    return "ok"
+def home():
+    return "Host Assistant is alive."
+
+@app.route('/health')
+def health():
+    """Safe diagnostic endpoint for Render/UptimeRobot. Never exposes secrets."""
+    bot_user = None
+    try:
+        bot_user = str(bot.user) if bot.user else None
+    except Exception:
+        bot_user = None
+
+    return {
+        "status": "ok",
+        "service": "Host Assistant",
+        "pid": os.getpid(),
+        "python": platform.python_version(),
+        "port": PORT,
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "flask_started": FLASK_STARTED,
+        "flask_error": FLASK_ERROR,
+        "discord_user": bot_user,
+        "discord_ready": bool(bot.is_ready()),
+        "discord_guilds": len(bot.guilds),
+    }
+
+@app.errorhandler(Exception)
+def flask_exception(error):
+    global FLASK_ERROR
+    FLASK_ERROR = f"{type(error).__name__}: {error}"
+    print("[FLASK ERROR]", FLASK_ERROR, flush=True)
+    traceback.print_exc()
+    return {"status": "error", "error": FLASK_ERROR}, 500
 
 def run_server():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    global FLASK_STARTED, FLASK_ERROR
+    print("[BOOT][FLASK] Starting Flask server...", flush=True)
+    print(f"[BOOT][FLASK] PORT environment variable: {os.environ.get('PORT')!r}", flush=True)
+    print(f"[BOOT][FLASK] Resolved port: {PORT}", flush=True)
+    print("[BOOT][FLASK] Binding to 0.0.0.0", flush=True)
+    print(f"[BOOT][FLASK] PID: {os.getpid()}", flush=True)
+    try:
+        # Mark this before entering Flask so /health can show that startup reached this point.
+        FLASK_STARTED = True
+        # Explicitly disable the reloader so Render gets exactly one Flask process.
+        app.run(
+            host="0.0.0.0",
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+    except Exception as e:
+        FLASK_ERROR = f"{type(e).__name__}: {e}"
+        print("[BOOT][FLASK][FATAL] Flask failed to start:", FLASK_ERROR, flush=True)
+        traceback.print_exc()
+    finally:
+        FLASK_STARTED = False
+        print("[BOOT][FLASK] Flask thread exited.", flush=True)
 
 def keep_alive():
-    Thread(target=run_server, daemon=True).start()
+    global FLASK_THREAD
+    print("[BOOT][FLASK] Creating Flask background thread...", flush=True)
+    FLASK_THREAD = Thread(target=run_server, name="HostAssistant-Flask", daemon=True)
+    FLASK_THREAD.start()
+    print(f"[BOOT][FLASK] Thread started: alive={FLASK_THREAD.is_alive()}", flush=True)
+
+def port_watchdog():
+    """Prove whether the process actually has a listening TCP port on Render."""
+    print(f"[WATCHDOG][PORT] Starting port probe for 127.0.0.1:{PORT}", flush=True)
+    last_state = None
+    for attempt in range(1, 121):
+        reachable = False
+        error_text = None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        try:
+            result = sock.connect_ex(("127.0.0.1", PORT))
+            reachable = result == 0
+            if not reachable:
+                error_text = f"connect_ex={result}"
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {e}"
+        finally:
+            sock.close()
+
+        state = "OPEN" if reachable else "CLOSED"
+        if state != last_state or attempt % 10 == 0:
+            print(f"[WATCHDOG][PORT] attempt={attempt}/120 state={state} {error_text or ''}".rstrip(), flush=True)
+            last_state = state
+        if reachable:
+            print(f"[WATCHDOG][PORT] SUCCESS: Render should be able to detect port {PORT}.", flush=True)
+            return
+        time.sleep(1)
+
+    print(f"[WATCHDOG][PORT][FATAL] Port {PORT} never opened after 120 seconds.", flush=True)
+    print("[WATCHDOG][PORT][FATAL] This means Flask did not successfully bind the Render port.", flush=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -193,34 +294,55 @@ async def delete_bot_messages(guild):
     return deleted
 
 
-async def enforce_guild_whitelist(guild):
-    """Immediately leave non-whitelisted guilds without scanning message history.
-
-    Scanning every channel with history(limit=None) can generate a huge number of
-    Discord API requests and trigger HTTP 429 rate limits during startup. The bot
-    cannot delete other users' messages anyway, so leaving immediately is safer.
-    """
+async def enforce_guild_whitelist(guild, delay=0):
+    """Leave a non-whitelisted guild safely, without flooding Discord's API."""
     if is_whitelisted_guild(guild.id):
         return
+    if delay:
+        await asyncio.sleep(delay)
 
-    print(f"Whitelist: leaving non-whitelisted guild {guild.name} ({guild.id}) immediately.")
+    print(f"Whitelist: leaving non-whitelisted guild {guild.name} ({guild.id}).")
     try:
         await guild.leave()
-    except (discord.Forbidden, discord.HTTPException) as e:
-        print(f"Whitelist: failed to leave {guild.name} ({guild.id}):", e)
+        print(f"Whitelist: left {guild.name} ({guild.id}).")
+    except discord.Forbidden as e:
+        print(f"Whitelist: no permission to leave {guild.name} ({guild.id}): {e}")
+    except discord.HTTPException as e:
+        # A 429 must never be allowed to kill the bot. Discord may be rate-limiting
+        # the connection, so leave this guild for a later retry instead.
+        print(f"Whitelist: Discord HTTP error while leaving {guild.name} ({guild.id}): {e}")
+    except Exception as e:
+        print(f"Whitelist: unexpected error while leaving {guild.name} ({guild.id}): {e}")
 
 
-def schedule_whitelist_enforcement(guild):
+def schedule_whitelist_enforcement(guild, delay=0):
     if is_whitelisted_guild(guild.id):
         return
     key = guild.id
     if key in _whitelist_cleanup_tasks:
         return
-    task = asyncio.create_task(enforce_guild_whitelist(guild))
+    task = asyncio.create_task(enforce_guild_whitelist(guild, delay=delay))
     _whitelist_cleanup_tasks.add(key)
     def _done(_):
         _whitelist_cleanup_tasks.discard(key)
+        try:
+            _.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
     task.add_done_callback(_done)
+
+
+async def enforce_existing_guilds_safely():
+    """Clean up old non-whitelisted guilds one at a time after startup.
+
+    This deliberately avoids firing many DELETE /guilds/... requests at once.
+    """
+    await asyncio.sleep(20)
+    for guild in list(bot.guilds):
+        if is_whitelisted_guild(guild.id):
+            continue
+        await enforce_guild_whitelist(guild)
+        await asyncio.sleep(10)
 
 DISABLED_GUILD_MESSAGE = (
     "The bot has been disabled in this server. Contact one of the bot owners "
@@ -3255,11 +3377,40 @@ async def on_guild_join(guild):
 
 
 @bot.event
+async def on_connect():
+    print("[DISCORD][CONNECT] Gateway connection established.", flush=True)
+    install_asyncio_exception_handler()
+
+@bot.event
+async def on_disconnect():
+    print("[DISCORD][DISCONNECT] Gateway connection lost.", flush=True)
+
+@bot.event
+async def on_resumed():
+    print("[DISCORD][RESUMED] Discord session resumed.", flush=True)
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"[DISCORD][EVENT ERROR] Event={event!r}", flush=True)
+    traceback.print_exc()
+
+@bot.event
+async def on_command_error(ctx, error):
+    print(f"[DISCORD][COMMAND ERROR] Command={getattr(ctx.command, 'qualified_name', None)!r}", flush=True)
+    print(f"[DISCORD][COMMAND ERROR] {type(error).__name__}: {error}", flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__)
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+@bot.event
 async def on_ready():
-    print(f"Logged in: {bot.user.name}")
-    # Enforce the whitelist for every guild already connected to the bot.
-    for guild in list(bot.guilds):
-        schedule_whitelist_enforcement(guild)
+    print(f"[DISCORD][READY] Logged in: {bot.user.name}", flush=True)
+    await diagnostic_ready_report()
+    print("Connected guilds:", [(g.name, g.id) for g in bot.guilds])
+    # Do NOT mass-leave guilds during on_ready. That can burst Discord DELETE
+    # requests and trigger a 429/Cloudflare rate limit. Clean them up slowly in
+    # the background while keeping the bot online. New joins are handled immediately.
+    asyncio.create_task(enforce_existing_guilds_safely())
     try:
         await bot.change_presence(status=discord.Status.online,
                                   activity=discord.Game(name="with events · ping me"))
@@ -3402,9 +3553,81 @@ async def trusted_list_cmd(interaction: discord.Interaction):
             "\nServer admins can always use it too.")
     await interaction.response.send_message(text, ephemeral=True)
 
+# ============================================================
+# DIAGNOSTIC STARTUP ENTRYPOINT
+# ============================================================
+def print_startup_diagnostics():
+    print("=" * 72, flush=True)
+    print("[BOOT] HOST ASSISTANT DIAGNOSTIC BUILD STARTING", flush=True)
+    print(f"[BOOT] Time: {datetime.datetime.now(datetime.timezone.utc).isoformat()}", flush=True)
+    print(f"[BOOT] Python: {platform.python_version()}", flush=True)
+    print(f"[BOOT] Platform: {platform.platform()}", flush=True)
+    print(f"[BOOT] PID: {os.getpid()}", flush=True)
+    print(f"[BOOT] PORT env: {os.environ.get('PORT')!r}", flush=True)
+    print(f"[BOOT] Resolved PORT: {PORT}", flush=True)
+    print(f"[BOOT] BOT_TOKEN present: {bool(tk)}", flush=True)
+    print(f"[BOOT] GROQ_API_KEY present: {bool(GROQ_KEY)}", flush=True)
+    print(f"[BOOT] OPENROUTER_API_KEY present: {bool(OPENROUTER_KEY)}", flush=True)
+    print(f"[BOOT] MONGODB_URI present: {bool(os.environ.get('MONGODB_URI'))}", flush=True)
+    print(f"[BOOT] GIPHY_API_KEY present: {bool(GIPHY_KEY)}", flush=True)
+    print(f"[BOOT] Whitelisted guilds: {sorted(WHITELISTED_GUILD_IDS)}", flush=True)
+    print("=" * 72, flush=True)
+
+async def diagnostic_ready_report():
+    print("[DISCORD][READY] ===== READY REPORT =====", flush=True)
+    print(f"[DISCORD][READY] User: {bot.user} (id={getattr(bot.user, 'id', None)})", flush=True)
+    print(f"[DISCORD][READY] Guild count: {len(bot.guilds)}", flush=True)
+    for g in bot.guilds:
+        print(f"[DISCORD][READY] Guild: {g.name!r} | id={g.id} | whitelisted={is_whitelisted_guild(g.id)}", flush=True)
+    print(f"[DISCORD][READY] Bot ready: {bot.is_ready()}", flush=True)
+    print("[DISCORD][READY] =======================", flush=True)
+
+# Install the diagnostic event-loop exception handler as soon as the Discord loop exists.
+def install_asyncio_exception_handler():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    def _loop_exception_handler(loop, context):
+        print("[ASYNCIO][UNHANDLED] Unhandled asyncio exception:", flush=True)
+        print(f"[ASYNCIO][UNHANDLED] Message: {context.get('message')}", flush=True)
+        if context.get('exception'):
+            traceback.print_exception(type(context['exception']), context['exception'], context['exception'].__traceback__)
+        if context.get('future'):
+            print(f"[ASYNCIO][UNHANDLED] Future: {context['future']!r}", flush=True)
+        if context.get('task'):
+            print(f"[ASYNCIO][UNHANDLED] Task: {context['task']!r}", flush=True)
+        loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_loop_exception_handler)
+    print("[BOOT][ASYNCIO] Diagnostic exception handler installed.", flush=True)
+
 tk = os.environ.get("BOT_TOKEN")
+print_startup_diagnostics()
+
 if tk:
-    keep_alive()
-    bot.run(tk)
+    try:
+        print("[BOOT] Starting Flask keep-alive BEFORE Discord login...", flush=True)
+        keep_alive()
+        Thread(target=port_watchdog, name="HostAssistant-PortWatchdog", daemon=True).start()
+        print("[BOOT] Flask thread launch returned. Port watchdog started. Starting Discord bot...", flush=True)
+        bot.run(tk)
+        print("[BOOT][DISCORD] bot.run() returned normally.", flush=True)
+    except discord.LoginFailure as e:
+        print("[BOOT][DISCORD][FATAL] Discord LoginFailure:", repr(e), flush=True)
+        traceback.print_exc()
+        raise
+    except discord.HTTPException as e:
+        print("[BOOT][DISCORD][FATAL] Discord HTTPException:", repr(e), flush=True)
+        print(f"[BOOT][DISCORD][FATAL] status={getattr(e, 'status', None)} code={getattr(e, 'code', None)}", flush=True)
+        traceback.print_exc()
+        raise
+    except Exception as e:
+        print("[BOOT][FATAL] Unhandled startup/runtime exception:", f"{type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise
 else:
-    print("No token set!")
+    print("[BOOT][FATAL] BOT_TOKEN is missing or empty. Discord bot cannot start.", flush=True)
+    print("[BOOT][FATAL] Set the BOT_TOKEN environment variable in Render.", flush=True)
+    raise RuntimeError("BOT_TOKEN is missing")
