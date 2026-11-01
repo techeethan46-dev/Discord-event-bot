@@ -194,16 +194,16 @@ async def delete_bot_messages(guild):
 
 
 async def enforce_guild_whitelist(guild):
-    """Delete our own messages where possible, then leave any non-whitelisted guild."""
+    """Immediately leave non-whitelisted guilds without scanning message history.
+
+    Scanning every channel with history(limit=None) can generate a huge number of
+    Discord API requests and trigger HTTP 429 rate limits during startup. The bot
+    cannot delete other users' messages anyway, so leaving immediately is safer.
+    """
     if is_whitelisted_guild(guild.id):
         return
 
-    try:
-        deleted = await delete_bot_messages(guild)
-        print(f"Whitelist: leaving {guild.name} ({guild.id}); deleted {deleted} bot messages where possible.")
-    except Exception as e:
-        print(f"Whitelist cleanup failed for {guild.name} ({guild.id}):", e)
-
+    print(f"Whitelist: leaving non-whitelisted guild {guild.name} ({guild.id}) immediately.")
     try:
         await guild.leave()
     except (discord.Forbidden, discord.HTTPException) as e:
