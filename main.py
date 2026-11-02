@@ -166,31 +166,8 @@ def is_whitelisted_guild(guild_id):
 
 
 async def delete_bot_messages(guild):
-    """Best-effort cleanup of this bot's own messages before leaving a non-whitelisted guild."""
-    if not bot.user:
-        return 0
-
-    deleted = 0
-    channels = list(getattr(guild, "text_channels", []))
-    channels += list(getattr(guild, "threads", []))
-
-    for channel in channels:
-        try:
-            # Reading history is permission-gated. We only delete messages authored by this bot.
-            async for message in channel.history(limit=None, oldest_first=False):
-                if message.author.id != bot.user.id:
-                    continue
-                try:
-                    await message.delete(reason="Host Assistant whitelist enforcement")
-                    deleted += 1
-                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                    pass
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-            continue
-        except Exception as e:
-            print(f"Whitelist cleanup error in #{getattr(channel, 'name', 'unknown')}:", e)
-
-    return deleted
+    """Disabled intentionally. Host Assistant never scans channel history for cleanup."""
+    return 0
 
 
 async def enforce_guild_whitelist(guild, delay=0):
@@ -660,16 +637,43 @@ def is_vip(member, guild_id):
     sp_role = get_config(guild_id).get("superpower_role")
     return bool(sp_role) and any(r.id == sp_role for r in member.roles)
 
+RATE_LIMIT_TRIGGERED = False
+_RATE_LIMIT_TASKS = set()
+
+async def emergency_rate_limit_shutdown(source="Discord API"):
+    """Trip once when Discord returns a 429 and stop our own activity immediately."""
+    global RATE_LIMIT_TRIGGERED
+    if RATE_LIMIT_TRIGGERED:
+        return
+    RATE_LIMIT_TRIGGERED = True
+    print(f"🚨 DISCORD 429 DETECTED ({source}) — Host Assistant entering safe hold mode.")
+    current = asyncio.current_task()
+    for task in list(_bg_tasks) + list(_RATE_LIMIT_TASKS):
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+    if ai_worker_task is not None and ai_worker_task is not current and not ai_worker_task.done():
+        ai_worker_task.cancel()
+    try:
+        await bot.close()
+    except Exception as e:
+        print("Rate-limit shutdown close error:", e)
+
 async def safe_reply(msg, content=None, **kwargs):
     """Reply without ever raising (a dead worker = a dead AI chat) and without live pings."""
     kwargs.setdefault("allowed_mentions", SAFE_MENTIONS)
     try:
         return await msg.reply(content, **kwargs)
-    except discord.HTTPException:
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            await emergency_rate_limit_shutdown("safe_reply")
+            return None
         try:
             return await msg.channel.send(content, **kwargs)
-        except discord.HTTPException as e:
-            print("safe_reply failed:", e)
+        except discord.HTTPException as e2:
+            if getattr(e2, "status", None) == 429:
+                await emergency_rate_limit_shutdown("safe_reply fallback")
+            else:
+                print("safe_reply failed:", e2)
             return None
 
 async def refresh_event_message(info, guild=None, remove_view=False):
@@ -2229,6 +2233,8 @@ async def handle_ai_trigger(msg):
 
 @bot.event
 async def on_message(msg):
+    if RATE_LIMIT_TRIGGERED:
+        return
     if msg.author.bot:
         return
 
@@ -3254,6 +3260,8 @@ async def refresh_timers():
             del d[k]
     while len(ai_history) > 500:
         ai_history.pop(next(iter(ai_history)))
+    for uid in [uid for uid, ts in _talk_cooldowns.items() if ts < cutoff]:
+        _talk_cooldowns.pop(uid, None)
 
 @refresh_timers.before_loop
 async def before_refresh_timers():
@@ -3285,7 +3293,7 @@ async def on_ready():
     asyncio.create_task(enforce_existing_guilds_safely())
     try:
         await bot.change_presence(status=discord.Status.online,
-                                  activity=discord.Game(name="with events · ping me"))
+                                  activity=discord.Game(name="events · hosting · /talk"))
     except Exception as e:
         print("presence failed:", e)
 
@@ -3425,9 +3433,97 @@ async def trusted_list_cmd(interaction: discord.Interaction):
             "\nServer admins can always use it too.")
     await interaction.response.send_message(text, ephemeral=True)
 
+
+# ==========================================
+# /talk — controlled bot voice message
+# ==========================================
+TALK_COOLDOWN = 4
+_talk_cooldowns = {}
+
+def can_use_talk(member, guild_id):
+    """Host, configured VIP, admins, trusted users, or bot owners can use /talk."""
+    if member is None:
+        return False
+    if member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS:
+        return True
+    if is_trusted(member):
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    if perms and perms.administrator:
+        return True
+    if has_host_role(member, guild_id):
+        return True
+    vip_role = get_config(guild_id).get("superpower_role")
+    return bool(vip_role) and any(r.id == vip_role for r in getattr(member, "roles", []))
+
+@bot.tree.command(name="talk", description="Make Host Assistant send a message as the bot")
+@app_commands.guild_only()
+@app_commands.describe(message="Exactly what Host Assistant should say")
+async def talk_cmd(interaction: discord.Interaction, message: str):
+    if RATE_LIMIT_TRIGGERED:
+        await interaction.response.send_message("⚠️ Host Assistant is temporarily paused after a Discord rate limit.", ephemeral=True)
+        return
+    if not can_use_talk(interaction.user, interaction.guild_id):
+        await interaction.response.send_message(
+            "🔒 You need the Host role, VIP role, Administrator permission, or trusted access to use /talk.",
+            ephemeral=True
+        )
+        return
+
+    message = message.strip()
+    if not message:
+        await interaction.response.send_message("❌ Give me something to say.", ephemeral=True)
+        return
+    if len(message) > 2000:
+        await interaction.response.send_message("❌ That message is too long. Discord messages are limited to 2,000 characters.", ephemeral=True)
+        return
+
+    now = time.time()
+    last = _talk_cooldowns.get(interaction.user.id, 0)
+    if now - last < TALK_COOLDOWN:
+        remaining = max(1, int(TALK_COOLDOWN - (now - last)))
+        await interaction.response.send_message(f"⏳ Slow down a little. Try again in {remaining}s.", ephemeral=True)
+        return
+    _talk_cooldowns[interaction.user.id] = now
+
+    # Defer invisibly, then send the actual content as a normal bot message.
+    # The slash command itself is not echoed, so the channel only sees the bot's message.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.channel.send(
+            message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        await interaction.edit_original_response(content="✅ Sent.")
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            await emergency_rate_limit_shutdown("/talk")
+        try:
+            await interaction.edit_original_response(content="❌ Discord rejected the message. Host Assistant has been put into safe mode if this was a 429.")
+        except Exception:
+            pass
+    except Exception as e:
+        print("/talk error:", e)
+        try:
+            await interaction.edit_original_response(content="❌ I couldn't send that message.")
+        except Exception:
+            pass
+
+
 tk = os.environ.get("BOT_TOKEN")
 if tk:
     keep_alive()
-    bot.run(tk)
+    try:
+        bot.run(tk, reconnect=False)
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            RATE_LIMIT_TRIGGERED = True
+            print("🚨 Initial Discord login was rate-limited (429). Bot will remain offline instead of restart-looping.")
+        else:
+            raise
+    if RATE_LIMIT_TRIGGERED:
+        print("🛑 Host Assistant is in safe hold mode. No further Discord requests will be made.")
+        while True:
+            time.sleep(3600)
 else:
     print("No token set!")
