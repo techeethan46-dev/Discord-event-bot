@@ -5,14 +5,15 @@ import os
 import json
 import time
 import re
+import collections
 import difflib
 import asyncio
+import base64
 import datetime
 import random
 import colorsys
 import aiohttp
 from discord.http import Route
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -62,6 +63,7 @@ OPENROUTER_FREE_MODELS = [
     "openrouter/free"
 ]
 OPENROUTER_VISION_MODELS = [
+    "google/gemma-3-27b-it:free",
     "nvidia/nemotron-3.5-super-vl:free",
     "openrouter/free",
 ]
@@ -155,7 +157,7 @@ DISABLED_GUILD_IDS = [
     # 123456789012345678,
 ]
 
-_whitelist_cleanup_tasks = set()
+_whitelist_cleanup_tasks = {}
 
 
 def is_whitelisted_guild(guild_id):
@@ -163,11 +165,6 @@ def is_whitelisted_guild(guild_id):
         return int(guild_id) in WHITELISTED_GUILD_IDS
     except (TypeError, ValueError):
         return False
-
-
-async def delete_bot_messages(guild):
-    """Disabled intentionally. Host Assistant never scans channel history for cleanup."""
-    return 0
 
 
 async def enforce_guild_whitelist(guild, delay=0):
@@ -198,11 +195,12 @@ def schedule_whitelist_enforcement(guild, delay=0):
     if key in _whitelist_cleanup_tasks:
         return
     task = asyncio.create_task(enforce_guild_whitelist(guild, delay=delay))
-    _whitelist_cleanup_tasks.add(key)
-    def _done(_):
-        _whitelist_cleanup_tasks.discard(key)
+    _whitelist_cleanup_tasks[key] = task  # strong reference: asyncio only keeps weak ones
+
+    def _done(t):
+        _whitelist_cleanup_tasks.pop(key, None)
         try:
-            _.exception()
+            t.exception()
         except (asyncio.CancelledError, Exception):
             pass
     task.add_done_callback(_done)
@@ -280,8 +278,11 @@ def _write_db(payload):
         except Exception as e:
             print("db save error:", e)
     try:
-        with open(DATA_FILE, "w") as f:
+        # Write to a temp file then swap it in, so a crash mid-write can't corrupt the save.
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w") as f:
             f.write(payload)
+        os.replace(tmp, DATA_FILE)
     except Exception as e:
         print("file save error:", e)
 
@@ -409,6 +410,11 @@ def event_was_full(event):
     cap = int(event.get("max_players", 0) or 0)
     return cap > 0 and event_player_count(event) >= cap
 
+def _event_day(e):
+    """UTC calendar day an event finished on (stable no matter where the bot is hosted)."""
+    return datetime.datetime.fromtimestamp(
+        e.get("concluded_at", e.get("end_time", 0)), datetime.timezone.utc).date()
+
 def host_achievement_requirements(guild_id, host_id):
     events = completed_events_for_host(guild_id, host_id)
     counts = len(events)
@@ -420,6 +426,10 @@ def host_achievement_requirements(guild_id, host_id):
     for e in events:
         for country in e.get("reservations", {}):
             unique_nations.add(country.title())
+
+    busiest_day = max(collections.Counter(_event_day(e) for e in events).values(), default=0)
+    # Cancelled events never show up in `events`, so "reliable" has to look at every settled event.
+    settled = [e for e in all_host_events(guild_id, host_id) if e.get("concluded") or e.get("cancelled")]
 
     # Hosting milestones.
     earned = {
@@ -438,22 +448,16 @@ def host_achievement_requirements(guild_id, host_id):
         # Rare achievements.
         "sold_out": len(full_events) >= 1,
         "packed_house": len(full_events) >= 5,
-        "the_marathon": len({datetime.datetime.fromtimestamp(e.get("concluded_at", e.get("end_time", 0))).date() for e in events}) < counts and any(
-            sum(1 for x in events if datetime.datetime.fromtimestamp(x.get("concluded_at", x.get("end_time", 0))).date() == datetime.datetime.fromtimestamp(e.get("concluded_at", e.get("end_time", 0))).date()) >= 2
-            for e in events
-        ),
+        "the_marathon": busiest_day >= 2,
         "flawless": False,  # evaluated from rating history below
-        "reliable": counts >= 10 and len(events) >= 10 and all(not e.get("cancelled", False) for e in events[-10:]),
+        "reliable": len(settled) >= 10 and not any(e.get("cancelled") for e in settled[-10:]),
         "master_negotiator": swaps >= 15,
         "world_host": len(unique_nations) >= 10,
 
         # Secret achievements.
         "forty_deep": any(p >= 40 for p in players),
         "waitlist_hero": waitlist_fills >= 5,
-        "triple_threat": any(
-            sum(1 for x in events if datetime.datetime.fromtimestamp(x.get("concluded_at", x.get("end_time", 0))).date() == datetime.datetime.fromtimestamp(e.get("concluded_at", e.get("end_time", 0))).date()) >= 3
-            for e in events
-        ),
+        "triple_threat": busiest_day >= 3,
         "perfect_run": len(events) >= 10 and all(event_player_count(e) >= 20 for e in events[-10:]),
         "big_game": any(p >= 35 for p in players),
         "veteran_ground": len(events) >= 20,
@@ -467,12 +471,6 @@ def host_achievement_requirements(guild_id, host_id):
     recent.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
     earned["flawless"] = len(recent) >= 6 and all(float(x.get("rating", 0)) == 5.0 for x in recent[:6])
     return earned
-
-def achievement_progress_text(guild_id, host_id):
-    state = get_achievement_state(guild_id, host_id)
-    earned = host_achievement_requirements(guild_id, host_id)
-    unlocked = set(state.get("unlocked", []))
-    return earned, unlocked
 
 def achievement_role_for(guild, achievement_id):
     conf = get_config(guild.id)
@@ -571,18 +569,15 @@ async def check_and_announce_achievements(guild, host_id, channel=None):
     return new_ids
 
 def parse_time(t_str):
-    t_str = t_str.lower().replace(" ", "")
-    tot = 0
-    num = ""
-    for char in t_str:
-        if char.isdigit():
-            num += char
-        elif char in ['h', 'm', 's'] and num:
-            if char == 'h': tot += int(num) * 3600
-            elif char == 'm': tot += int(num) * 60
-            elif char == 's': tot += int(num)
-            num = ""
-    return tot
+    """'1h30m', '45m', '90s', '2d' or a bare number (minutes) -> seconds.
+    Returns None when the text can't be understood, so callers can say so instead of guessing."""
+    s = str(t_str or "").lower().replace(" ", "")
+    if s in ("", "now", "0"):
+        return 0
+    if not re.fullmatch(r"(?:\d+[dhms]?)+", s):
+        return None
+    mult = {"d": 86400, "h": 3600, "m": 60, "s": 1, "": 60}
+    return sum(int(n) * mult[u] for n, u in re.findall(r"(\d+)([dhms]?)", s))
 
 FLAGS = {
     "usa": "🇺🇸", "united states": "🇺🇸", "america": "🇺🇸",
@@ -601,6 +596,28 @@ def find_event(msg_id):
         if msg_id in info.get("message_ids", []):
             return key, info
     return None, None
+
+def find_active_event(name, guild_id):
+    """Find a running (not concluded) event in this server by its name. Returns (key, info) or (None, None)."""
+    low = str(name or "").lower().strip()
+    info = db["events"].get(low)
+    if info and not info.get("concluded") and event_in_guild(info, guild_id):
+        return low, info
+    for k, v in db["events"].items():
+        if (not v.get("concluded") and event_in_guild(v, guild_id)
+                and str(v.get("display_name", "")).lower().strip() == low):
+            return k, v
+    return None, None
+
+def new_event_key(name):
+    """A key that is never already taken, so old/concluded events (and their ratings) are never overwritten."""
+    base = name.lower().strip()
+    if base not in db["events"]:
+        return base
+    n = int(time.time())
+    while f"{base}~{n}" in db["events"]:
+        n += 1
+    return f"{base}~{n}"
 
 def event_in_guild(info, guild_id):
     # Old events have no guild_id saved, so they stay visible everywhere (as before).
@@ -708,7 +725,17 @@ async def remove_event_role(guild, uid):
         try: await mem.remove_roles(role)
         except discord.HTTPException: pass
 
-async def dm_owners(text):
+_dm_last = {}
+
+async def dm_owners(text, key=None, cooldown=300):
+    """DM the bot owners. Repeats of the same alert are throttled so an outage can't spam them."""
+    now = time.time()
+    k = key or text[:40]
+    if now - _dm_last.get(k, 0) < cooldown:
+        return
+    if len(_dm_last) > 200:
+        _dm_last.clear()
+    _dm_last[k] = now
     for owner_id in BOT_OWNER_IDS:
         try:
             owner = await bot.fetch_user(owner_id)
@@ -1062,7 +1089,6 @@ PERM_FOR = {
     "timeout": "moderate_members", "untimeout": "moderate_members",
     "nickname": "manage_nicknames", "purge": "manage_messages", "send_message": "send_messages",
 }
-STAFF_PERMS = ("administrator",) + tuple(sorted(set(PERM_FOR.values()) - {"send_messages"}))
 ALWAYS_CONFIRM = {"delete_channel", "delete_role", "kick", "ban"}
 
 BASE_COLORS = {
@@ -1322,6 +1348,9 @@ async def act_create_channel(ctx, a):
         return False, "Missing channel name."
     ctype = str(a.get("type") or "text").lower()
     cat = find_channel(ctx.guild, a.get("category"), (discord.CategoryChannel,)) if a.get("category") else None
+    cat_note = ""
+    if a.get("category") and not cat and ctype != "category":
+        cat_note = f" (couldn't find the category **{a.get('category')}**, so it's at the top level)"
     roles, missing = [], []
     for x in as_list(a.get("roles")):
         r = find_role(ctx.guild, x)
@@ -1352,7 +1381,7 @@ async def act_create_channel(ctx, a):
         else:
             ch = await ctx.guild.create_text_channel(name, **kw)
     who = f" for {', '.join(r.mention for r in roles)}" if roles else ""
-    return True, f"Created {ctype} {ch.mention}{who}"
+    return True, f"Created {ctype} {ch.mention}{who}{cat_note}"
 
 async def act_delete_channel(ctx, a):
     ch = pick_channel(ctx, a) if a.get("channel") else None
@@ -1363,7 +1392,7 @@ async def act_delete_channel(ctx, a):
     return True, f"Deleted **#{name}**"
 
 async def act_rename_channel(ctx, a):
-    ch = find_channel(ctx.guild, a.get("channel"))
+    ch = pick_channel(ctx, a)  # "this channel" = the one the message was sent in
     new = clean_channel_name(a.get("name"))
     if not ch:
         return False, "Couldn't find that channel."
@@ -1436,7 +1465,7 @@ async def act_set_topic(ctx, a):
     return True, f"Updated topic of {ch.mention}"
 
 async def act_move_channel(ctx, a):
-    ch = find_channel(ctx.guild, a.get("channel"))
+    ch = pick_channel(ctx, a)
     cat = find_channel(ctx.guild, a.get("category"), (discord.CategoryChannel,))
     if not ch or isinstance(ch, discord.CategoryChannel):
         return False, "Couldn't find that channel."
@@ -1886,7 +1915,7 @@ async def parse_admin_request(txt, image_urls=None):
 
 async def run_admin_flow(msg, txt):
     uid = msg.author.id
-    image_urls = [a.url for a in msg.attachments if (a.content_type or "").startswith("image/")][:4]
+    image_urls = await image_data_urls(msg)
     try:
         async with msg.channel.typing():
             plan = await parse_admin_request(txt, image_urls=image_urls)
@@ -1966,30 +1995,31 @@ async def run_admin_flow(msg, txt):
                              color=0xE74C3C, channel_key="ai_log_channel")
     except Exception as e:
         print("run_admin_flow error:", e)
-        await dm_owners(f"⚠️ **Admin flow exception:** `{e}`")
+        await dm_owners(f"⚠️ **Admin flow exception:** `{e}`", key="admin_exc")
         await safe_reply(msg, "⚠️ Something went wrong, nothing else was changed.")
 
 # ==========================================
 # LLM HELPER + BACKGROUND QUEUE WORKER (GROQ -> OPENROUTER)
 # ==========================================
-GIF_RE = re.compile(r'https?://[^\s<>)]+?\.(?:gif|webp|png|jpg)(?![\w/])(?:\?[^\s<>)]*)?', re.IGNORECASE)
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
-IMAGE_HOSTS = ("giphy.com", "tenor.com", "imgur.com", "discordapp.com", "discordapp.net")
-
-async def verify_image_url(url):
-    """Models invent GIF links. Only embed ones that are https, on a known host, and really return an image
-    (a dead link is what shows up as an empty green bar)."""
-    try:
-        p = urlparse(url)
-        host = (p.hostname or "").lower()
-        if p.scheme != "https" or not any(host == h or host.endswith("." + h) for h in IMAGE_HOSTS):
-            return False
-        timeout = aiohttp.ClientTimeout(total=4)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url, allow_redirects=False) as r:
-                return r.status == 200 and r.headers.get("Content-Type", "").lower().startswith("image/")
-    except Exception:
-        return False
+async def image_data_urls(msg):
+    """Download a message's image attachments and embed them as base64 data URLs.
+    Many free providers can't fetch Discord CDN links ("support image URLs" 404), but accept inline images."""
+    out = []
+    for a in msg.attachments:
+        ctype = (a.content_type or "").split(";")[0].strip().lower()
+        if not ctype.startswith("image/") or a.size > MAX_IMAGE_BYTES:
+            continue
+        try:
+            raw = await a.read()
+        except discord.HTTPException as e:
+            print("image download failed:", e)
+            continue
+        out.append(f"data:{ctype};base64,{base64.b64encode(raw).decode()}")
+        if len(out) >= 4:
+            break
+    return out
 
 def limit_words(t, n):
     """Hard word cap. Cuts at the last full sentence if there is one, else just trims."""
@@ -2022,6 +2052,9 @@ def clean_ai_text(t):
     t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u200d\ufe0f]", "", t)  # no emojis
     t = re.sub(r"\s*[\u2014\u2013]\s*", ", ", t)  # em/en dashes read as AI
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"(\*{1,3})(\S(?:[^\n]*?\S)?)\1", r"\2", t)  # **bold** / *italic* -> plain
+    t = re.sub(r"^\s*[-*\u2022]\s+", "", t, flags=re.MULTILINE)  # list bullets
+    t = t.replace("`", "")
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
@@ -2110,14 +2143,15 @@ async def process_ai_queue():
                 if uid not in ai_history:
                     ai_history[uid] = []
 
-                image_urls = [a.url for a in msg.attachments if (a.content_type or "").startswith("image/")][:4]
+                image_urls = await image_data_urls(msg)
                 if image_urls:
                     user_content = [{"type": "text", "text": txt or "Please inspect the attached image."}]
                     user_content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_urls)
                 else:
                     user_content = txt
 
-                ai_history[uid].append({"role": "user", "content": user_content})
+                hist_entry = {"role": "user", "content": user_content}
+                ai_history[uid].append(hist_entry)
                 ai_history[uid] = ai_history[uid][-6:]
 
                 want_gif = bool(GIPHY_KEY) and random.random() < GIF_CHANCE
@@ -2125,11 +2159,28 @@ async def process_ai_queue():
                 messages = [{"role": "system", "content": persona}] + ai_history[uid]
                 ans, groq_err, openrouter_err = await llm_complete(messages, temperature=0.8)
 
+                # Keep only a text note of any image so later turns don't get routed to the vision model.
+                if image_urls:
+                    hist_entry["content"] = f"[sent an image] {txt}"
+                hist = ai_history.get(uid) or []  # /clearchat may have wiped it while we waited
+
+                # Free vision endpoints come and go. If every one failed, still answer the text part
+                # instead of going silent.
+                if not ans and image_urls:
+                    blind = [{"role": "system", "content": persona}] + [
+                        m for m in ai_history.get(uid, []) if m is not hist_entry]
+                    blind.append({"role": "user", "content": f"{txt}\n(they attached an image but you can't see it "
+                                                              "right now. say so in a few words, in your usual tone)"})
+                    ans, groq_err, openrouter_err = await llm_complete(blind, temperature=0.8)
+
                 if not ans:
+                    if hist and hist[-1] is hist_entry:
+                        hist.pop()  # don't leave an unanswered message behind
                     # Send detailed error logs directly to your Owner DM
                     await dm_owners(
                         f"⚠️ **AI Fallback Failed**\n• Groq Error: `{groq_err or 'None'}`\n"
-                        f"• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`")
+                        f"• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`",
+                        key="ai_fail")
                     # Send clean generic message in public channel
                     await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
                     continue
@@ -2139,7 +2190,8 @@ async def process_ai_queue():
                 ans = GIF_TAG_RE.sub("", ans)
                 ans = re.sub(r"https?://\S+", "", ans)  # the model never posts raw links
                 ans = limit_words(dedupe_sentences(clean_ai_text(ans)), MAX_WORDS)
-                ai_history[uid].append({"role": "assistant", "content": ans or "lol"})
+                if any(h is hist_entry for h in ai_history.get(uid, ())):
+                    ai_history[uid].append({"role": "assistant", "content": ans or "lol"})
 
                 if len(ans) > 2000:
                     ans = ans[:1996] + "..."
@@ -2153,7 +2205,7 @@ async def process_ai_queue():
                     await safe_reply(msg, ans or "lol")
         except Exception as e:
             print("AI Chat Error:", e)
-            await dm_owners(f"⚠️ **Critical AI Exception:** `{e}`")
+            await dm_owners(f"⚠️ **Critical AI Exception:** `{e}`", key="ai_crash")
             await safe_reply(msg, "⚠️ Something went wrong, my bad bro.")
         finally:
             ai_queue.task_done()
@@ -2343,8 +2395,11 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
                 await interaction.response.send_message("You already claimed a spot.", ephemeral=True)
                 return
 
-        c_title = self.country.value.title().strip()
+        c_title = " ".join(self.country.value.split()).title()
         r_user = self.roblox.value.strip()
+        if not c_title or not r_user:
+            await interaction.response.send_message("Nation and Roblox username can't be blank.", ephemeral=True)
+            return
 
         if interaction.user.id in db["blacklists"].get(str(interaction.guild_id), []):
             await interaction.response.send_message("You are blacklisted.", ephemeral=True)
@@ -2404,7 +2459,7 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
             await interaction.response.send_message("Event is over.", ephemeral=True)
             return
 
-        t_c = self.target.value.title().strip()
+        t_c = " ".join(self.target.value.split()).title()
         u_c = next((c for c, u in info["reservations"].items() if u["discord_id"] == interaction.user.id), None)
 
         if not u_c: 
@@ -2436,9 +2491,15 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
             await interaction.response.send_message("Swap channel missing.", ephemeral=True)
             return
 
-        swap_cooldowns[interaction.user.id] = time.time()
         emb = discord.Embed(title="🔄 Swap Request", description=f"<@{interaction.user.id}> wants to swap with <@{t_id}>!\n\nGives: {get_flag(u_c)} **{u_c}**\nGets: {get_flag(t_c)} **{t_c}**", color=0xF1C40F)
-        await swap_ch.send(content=f"<@{t_id}>", embed=emb, view=SwapAcceptView(self.key, interaction.user.id, t_id, u_c, t_c))
+        view = SwapAcceptView(self.key, interaction.user.id, t_id, u_c, t_c)
+        try:
+            view.message = await swap_ch.send(content=f"<@{t_id}>", embed=emb, view=view)
+        except discord.HTTPException as e:
+            print("swap post failed:", e)
+            await interaction.response.send_message("I can't post in the swap channel (check my permissions).", ephemeral=True)
+            return
+        swap_cooldowns[interaction.user.id] = time.time()
         await interaction.response.send_message(f"Proposal sent in <#{ch_id}>!", ephemeral=True)
         await event_log(interaction.guild, info, "swap", f"<@{interaction.user.id}> proposed a swap with <@{t_id}> ({u_c} ↔ {t_c})")
 
@@ -2450,6 +2511,19 @@ class SwapAcceptView(GuardedView):
         self.t_id = t_id
         self.s_c = s_c
         self.t_c = t_c
+        self.message = None
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message and self.message.embeds:
+            emb = self.message.embeds[0]
+            emb.color = 0x95A5A6
+            emb.title = "⌛ Swap Expired"
+            try:
+                await self.message.edit(embed=emb, view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction, btn):
@@ -2487,6 +2561,7 @@ class SwapAcceptView(GuardedView):
         emb.color = 0x2ECC71
         emb.title = "✅ Swap Completed"
         await interaction.response.edit_message(embed=emb, view=self)
+        self.stop()
         await refresh_event_message(info, interaction.guild)
         await event_log(interaction.guild, info, "swap", f"<@{self.s_id}> and <@{self.t_id}> swapped **{self.s_c}** ↔ **{self.t_c}**")
 
@@ -2503,6 +2578,7 @@ class SwapAcceptView(GuardedView):
         emb.color = 0xE74C3C
         emb.title = "❌ Swap Declined"
         await interaction.response.edit_message(embed=emb, view=self)
+        self.stop()
         info = db["events"].get(self.key)
         if info:
             await event_log(interaction.guild, info, "swap", f"<@{self.t_id}> declined a swap from <@{self.s_id}>")
@@ -2572,6 +2648,8 @@ class HostActionsView(GuardedView):
         self.add_item(HelperSelect(key))
 
     async def interaction_check(self, interaction):
+        if not await super().interaction_check(interaction):
+            return False
         if is_authorized_manager(interaction.user):
             return True
         await interaction.response.send_message("Admins or managers only.", ephemeral=True)
@@ -2646,19 +2724,17 @@ class HostActionsView(GuardedView):
         s_id = get_config(interaction.guild_id).get("stats_channel")
         s_ch = interaction.guild.get_channel(s_id) if s_id else None
         if s_ch:
-            if s_ch:
-                emb = discord.Embed(description=f"## 📊 Event Results\n{DIV}", color=0xF1C40F)
-                emb.add_field(name="Event", value=f"**{info['display_name']}**", inline=False)
-                emb.add_field(name="Host", value=f"<@{info['host_id']}>", inline=True)
-                emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
-                emb.add_field(name="Players", value=f"{p_count}", inline=True)
-                if info.get("helpers"):
-                    emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
-
-                try:
-                    await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
-                except discord.HTTPException as e:
-                    print("stats post failed:", e)
+            emb = discord.Embed(description=f"## 📊 Event Results\n{DIV}", color=0xF1C40F)
+            emb.add_field(name="Event", value=f"**{info['display_name']}**", inline=False)
+            emb.add_field(name="Host", value=f"<@{info['host_id']}>", inline=True)
+            emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
+            emb.add_field(name="Players", value=f"{p_count}", inline=True)
+            if info.get("helpers"):
+                emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
+            try:
+                await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
+            except discord.HTTPException as e:
+                print("stats post failed:", e)
 
         await check_and_announce_achievements(interaction.guild, info["host_id"], s_ch)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
@@ -2745,8 +2821,7 @@ def _achievement_points(unlocked):
 
 def build_host_profile_embed(guild, member):
     """Build the Host Assistant profile embed for a member."""
-    host_id = check_host(member.id)
-    stats = db.get("hosts", {}).get(host_id, {})
+    stats = db.get("hosts", {}).get(str(member.id), {})  # read-only: viewing must not create records
 
     total_events = int(stats.get("total_events", 0) or 0)
     total_players = int(stats.get("total_players", 0) or 0)
@@ -2823,14 +2898,13 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
     member = member or interaction.user
     state = get_achievement_state(interaction.guild_id, member.id)
     unlocked = set(state.get("unlocked", []))
-    earned = host_achievement_requirements(interaction.guild_id, member.id)
     lines = []
     for aid in ACHIEVEMENT_ORDER:
         d = ACHIEVEMENT_DEFS[aid]
         if aid in unlocked:
             lines.append(f"{d['emoji']} **{d['name']}** · {d['tier']} · +{d['points']} pts")
         elif d.get("secret"):
-            lines.append(f"🔒 **Secret Achievement** · *Undiscovered*")
+            lines.append("🔒 **Secret Achievement** · *Undiscovered*")
         else:
             lines.append(f"🔲 **{d['name']}** · {d['tier']}")
     emb = discord.Embed(
@@ -2896,38 +2970,39 @@ async def enable_server_cmd(interaction: discord.Interaction, server_id: str):
     app_commands.Choice(name="All Time", value="0"),
 ])
 async def analytics_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
-    if not has_host_role(interaction.user, interaction.guild_id):
-        await interaction.response.send_message(
-            "Only members with the configured Host role can use /analytics.",
-            ephemeral=True
-        )
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Only hosts and admins can use /analytics.", ephemeral=True)
         return
 
     days = int(period.value) if period else 30
     cutoff = 0 if days == 0 else time.time() - days * 86400
-    events = [e for e in db["events"].values()
-              if e.get("guild_id") == interaction.guild_id and e.get("concluded") and e.get("concluded_at", 0) >= cutoff]
+    period_keys = {k for k, e in db["events"].items()
+                   if e.get("guild_id") == interaction.guild_id and e.get("concluded") and e.get("concluded_at", 0) >= cutoff}
+    events = [db["events"][k] for k in period_keys]
     total_events = len(events)
     total_players = sum(event_player_count(e) for e in events)
     full = sum(1 for e in events if event_was_full(e))
     ratings = []
-    for hid, h in db.get("hosts", {}).items():
+    for h in db.get("hosts", {}).values():
         for r in h.get("rating_history", []):
-            if r.get("event_key") in {k for k, v in db["events"].items() if v.get("guild_id") == interaction.guild_id and v.get("concluded_at", 0) >= cutoff}:
-                try: ratings.append(float(r.get("rating", 0)))
-                except (TypeError, ValueError): pass
+            if r.get("event_key") in period_keys:
+                try:
+                    ratings.append(float(r.get("rating", 0)))
+                except (TypeError, ValueError):
+                    pass
     avg_rating = sum(ratings) / len(ratings) if ratings else 0.0
     avg_players = total_players / total_events if total_events else 0
-    occupancy = [min(100, event_player_count(e) / int(e.get("max_players", 0)) * 100) for e in events if int(e.get("max_players", 0) or 0) > 0]
+    occupancy = [min(100, event_player_count(e) / int(e.get("max_players", 0)) * 100)
+                 for e in events if int(e.get("max_players", 0) or 0) > 0]
     avg_occupancy = sum(occupancy) / len(occupancy) if occupancy else 0
 
-    host_rows = []
-    for m in interaction.guild.members:
-        if m.bot: continue
-        he = [e for e in events if e.get("host_id") == m.id]
-        if he:
-            host_rows.append((m, len(he), sum(event_player_count(e) for e in he)))
-    host_rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    # Group by host id straight from the event records, so hosts who left the server still count.
+    per_host = {}
+    for e in events:
+        row = per_host.setdefault(e.get("host_id"), [0, 0])
+        row[0] += 1
+        row[1] += event_player_count(e)
+    host_rows = sorted(per_host.items(), key=lambda kv: (kv[1][0], kv[1][1]), reverse=True)
 
     emb = discord.Embed(title="📊 Host Assistant · Analytics", color=0x3498DB)
     emb.description = f"**Period:** {'All Time' if days == 0 else f'Last {days} Days'}\n{DIV}"
@@ -2937,7 +3012,7 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
     emb.add_field(name="📈 Avg Players/Event", value=f"**{avg_players:.1f}**", inline=True)
     emb.add_field(name="🏟️ Full Events", value=f"**{full}**", inline=True)
     emb.add_field(name="📊 Avg Occupancy", value=f"**{avg_occupancy:.1f}%**" if occupancy else "**N/A**", inline=True)
-    top = [f"**{i}.** {m.mention} · {ev} events · {pl} players" for i, (m, ev, pl) in enumerate(host_rows[:5], 1)]
+    top = [f"**{i}.** <@{hid}> · {ev} events · {pl} players" for i, (hid, (ev, pl)) in enumerate(host_rows[:5], 1)]
     emb.add_field(name="🔥 Top Hosts", value="\n".join(top) or "No completed events in this period.", inline=False)
     emb.set_footer(text="Historical analytics are calculated from completed event records.")
     await interaction.response.send_message(embed=emb, ephemeral=True)
@@ -3110,6 +3185,8 @@ class SetupWizard(GuardedView):
         return emb
 
     async def interaction_check(self, interaction):
+        if not await super().interaction_check(interaction):
+            return False
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("This panel belongs to someone else. Run /setup yourself.", ephemeral=True)
             return False
@@ -3233,6 +3310,7 @@ async def setup_cmd(interaction: discord.Interaction):
 
 # Last phase ("open"/"live") we rendered per event, so we only edit when it flips.
 event_phase = {}
+event_refresh_fails = {}
 
 @tasks.loop(seconds=30)
 async def refresh_timers():
@@ -3242,6 +3320,7 @@ async def refresh_timers():
         try:
             if info.get("concluded"):
                 event_phase.pop(key, None)
+                event_refresh_fails.pop(key, None)
                 continue
 
             phase = "live" if now >= info["end_time"] else "open"
@@ -3250,6 +3329,12 @@ async def refresh_timers():
 
             if await refresh_event_message(info):
                 event_phase[key] = phase
+                event_refresh_fails.pop(key, None)
+            else:
+                # Message deleted or channel gone: give up after a few tries instead of retrying forever.
+                event_refresh_fails[key] = event_refresh_fails.get(key, 0) + 1
+                if event_refresh_fails[key] >= 3:
+                    event_phase[key] = phase
         except Exception as e:
             print("refresh_timers error:", e)
 
@@ -3283,14 +3368,21 @@ async def on_guild_join(guild):
     schedule_whitelist_enforcement(guild)
 
 
+_ready_once = False
+
 @bot.event
 async def on_ready():
+    global _ready_once
     print(f"Logged in: {bot.user.name}")
     print("Connected guilds:", [(g.name, g.id) for g in bot.guilds])
     # Do NOT mass-leave guilds during on_ready. That can burst Discord DELETE
     # requests and trigger a 429/Cloudflare rate limit. Clean them up slowly in
     # the background while keeping the bot online. New joins are handled immediately.
-    asyncio.create_task(enforce_existing_guilds_safely())
+    if not _ready_once:  # on_ready can fire again after a reconnect
+        _ready_once = True
+        task = asyncio.create_task(enforce_existing_guilds_safely())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
     try:
         await bot.change_presence(status=discord.Status.online,
                                   activity=discord.Game(name="events · hosting · /talk"))
@@ -3324,16 +3416,27 @@ async def create_ev(interaction: discord.Interaction, name: str, starts_in: str,
         await interaction.followup.send("Managers only.", ephemeral=True)
         return
 
-    key = name.lower().strip()
-    existing = db["events"].get(key)
-    if existing and not existing.get("concluded"):
+    name = " ".join(name.split())[:100]
+    if not name:
+        await interaction.followup.send("Give the event a name.", ephemeral=True)
+        return
+
+    _, existing = find_active_event(name, interaction.guild_id)
+    if existing:
         await interaction.followup.send("An active event with that name already exists.", ephemeral=True)
         return
 
     s_off = parse_time(starts_in)
     d_sec = parse_time(duration)
-    if d_sec <= 0: d_sec = 1800
+    if s_off is None or d_sec is None:
+        await interaction.followup.send(
+            "I couldn't read that time. Use things like `10m`, `1h30m`, `2d` (or `now` for the start).", ephemeral=True)
+        return
+    if d_sec <= 0:
+        d_sec = 1800
+    max_p = max(0, max_p)
 
+    key = new_event_key(name)
     s_ts = int(time.time()) + s_off
     e_ts = s_ts + d_sec
 
@@ -3358,7 +3461,7 @@ async def create_ev(interaction: discord.Interaction, name: str, starts_in: str,
     db["events"][key]["message_ids"] = [msg.id]
     save_db(db)
 
-    await interaction.followup.send("Event created.", ephemeral=True)
+    await interaction.followup.send(f"Event created in {target.mention}.", ephemeral=True)
     await event_log(interaction.guild, db["events"][key], "host", f"Event created by <@{interaction.user.id}>")
 
 @bot.tree.command(name="set_superpowers", description="Set superpowers")
@@ -3369,9 +3472,8 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
         await interaction.response.send_message("Managers only.", ephemeral=True)
         return
 
-    key = event_name.lower().strip()
-    info = db["events"].get(key)
-    if not info or not event_in_guild(info, interaction.guild_id): 
+    key, info = find_active_event(event_name, interaction.guild_id)
+    if not info:
         await interaction.response.send_message("Event not found.", ephemeral=True)
         return
 
