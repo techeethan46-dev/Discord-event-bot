@@ -80,6 +80,7 @@ GROQ_MAX_IMAGE_CHARS = 4_000_000
 ai_history = {}
 user_cooldowns = {}
 ai_queue = asyncio.Queue()
+_queue_notices = {}  # message id -> the "you're #N in line" notice, removed when their turn starts
 bot_muted = False
 ai_worker_task = None
 
@@ -92,18 +93,20 @@ ALLOWED_USER_IDS = [
     1359263076838539296,  # Your Owner ID / Trusted Manager IDs
 ]
 
-AI_COOLDOWN = 30   # seconds between AI chats per person
-MAX_WORDS = 25     # hard cap on reply length
+AI_COOLDOWN = 10   # seconds between AI chats per person
+SOFT_WORDS = 25    # normal reply length; anything longer never gets a GIF
+MAX_WORDS = 60     # hard cap for the rare reply that really needs more room
+TYPING_DELAY = 4   # seconds the bot "types" before it starts working on a reply (feels human)
 GIPHY_KEY = os.environ.get("GIPHY_API_KEY")   # free key from developers.giphy.com (GIFs are skipped without it)
 GIF_CHANCE = 0.10                              # ~1 in 10 replies comes with a GIF
 GIF_ADDON = ("\n\nFOR THIS REPLY ONLY: after your short text, add a tag like [gif: crying laughing] with a "
-             "1 to 3 word GIF search that fits the mood. The text itself still stays under 25 words.")
+             "1 to 3 word GIF search that fits the mood. The text itself must be 25 words or less.")
 GIF_TAG_RE = re.compile(r"\[gif:\s*([^\]]{1,40})\]", re.IGNORECASE)
 
 _PERSONA_BASE = """
 You're texting in a Discord server. You're a bot and you never hide it if asked, but you text like a real person, never like an assistant.
 HOW A REAL PERSON TEXTS (do this):
-- 25 words max, usually way fewer. Fragments are fine. "lol", "nah", "bro what", "wait" are fine.
+- aim for 25 words or less, usually way fewer. Only go longer (never past 60 words) when the message really needs it, like explaining an image or answering a real question. Fragments are fine. "lol", "nah", "bro what", "wait" are fine.
 - all lowercase, loose grammar, no polish. React to what they said instead of performing.
 - Funny comes from being specific and blunt, not from trying hard. Skip the joke if there isn't one.
 - Sometimes just a short reaction is the whole reply.
@@ -671,6 +674,22 @@ async def emergency_rate_limit_shutdown(source="Discord API"):
         await bot.close()
     except Exception as e:
         print("Rate-limit shutdown close error:", e)
+
+_notice_last = {}
+
+async def send_notice(msg, title, text, ttl=10, key="notice", every=60):
+    """A small branded notice that deletes itself. (Plain message replies can't be ephemeral;
+    only slash commands and buttons can.) Each person sees the same notice at most once per `every` seconds."""
+    now = time.time()
+    k = (msg.author.id, key)
+    if now - _notice_last.get(k, 0) < every:
+        return None
+    if len(_notice_last) > 500:
+        _notice_last.clear()
+    _notice_last[k] = now
+    emb = discord.Embed(title=title, description=text, color=0x2B2D31)
+    emb.set_footer(text=BRAND)
+    return await safe_reply(msg, embed=emb, delete_after=ttl)
 
 async def safe_reply(msg, content=None, **kwargs):
     """Reply without ever raising (a dead worker = a dead AI chat) and without live pings."""
@@ -2221,10 +2240,16 @@ async def fetch_gif(query):
 async def process_ai_queue():
     while True:
         msg, txt, uid = await ai_queue.get()
+        waiting = _queue_notices.pop(msg.id, None)
+        if waiting:
+            try:
+                await waiting.delete()
+            except discord.HTTPException:
+                pass
         try:
-            # 4-Second Artificial Typing Delay
+            # Artificial typing delay so replies feel human
             async with msg.channel.typing():
-                await asyncio.sleep(4)
+                await asyncio.sleep(TYPING_DELAY)
 
                 if uid not in ai_history:
                     ai_history[uid] = []
@@ -2287,11 +2312,16 @@ async def process_ai_queue():
                 ans = GIF_TAG_RE.sub("", ans)
                 ans = re.sub(r"https?://\S+", "", ans)  # the model never posts raw links
                 ans = limit_words(dedupe_sentences(clean_ai_text(ans)), MAX_WORDS)
+                if len(ans.split()) > SOFT_WORDS:
+                    gif_query = None  # long replies never come with a GIF
                 if any(h is hist_entry for h in ai_history.get(uid, ())):
                     ai_history[uid].append({"role": "assistant", "content": ans or "lol"})
 
                 if len(ans) > 2000:
                     ans = ans[:1996] + "..."
+
+                # Replies past the normal length "take a bit longer to type" (about +0.04s per extra word).
+                await asyncio.sleep(max(0, len(ans.split()) - SOFT_WORDS) * 0.04)
 
                 gif_url = await fetch_gif(gif_query) if gif_query else None
                 if gif_url:
@@ -2330,7 +2360,10 @@ async def handle_ai_trigger(msg):
     # Host Assistant AI is intentionally gated. The bot owners/admins always pass;
     # normal AI access is VIP or Staff. Image vision is a separate Double Booster perk.
     if msg.guild and not is_ai_user(msg.author, msg.guild.id):
-        await safe_reply(msg, "🔒 AI access is limited to the VIP and Staff roles.")
+        # Replying to one of our own notices must not trigger another one (no notice chains).
+        if is_reply and ref.embeds and (ref.embeds[0].title or "").startswith("🔒"):
+            return
+        await send_notice(msg, "🔒 Members only", "AI chat is for **VIP** and **Staff** roles.", key="lock")
         return
 
     image_allowed = bool(msg.guild and can_view_ai_images(msg.author, msg.guild.id))
@@ -2338,7 +2371,8 @@ async def handle_ai_trigger(msg):
         # The image is never forwarded to an AI provider. Text can still be answered.
         has_image = False
         if not txt:
-            await safe_reply(msg, "🖼️ Image analysis is a Double Booster perk. Give me some text and I can still chat with you.")
+            await send_notice(msg, "🖼️ Double Booster perk",
+                              "Image analysis is for Double Boosters. Send some text and I'll still chat.", key="img")
             return
 
     # Mute Command Check (Owner Only)
@@ -2369,9 +2403,10 @@ async def handle_ai_trigger(msg):
                              bool(getattr(msg.author.guild_permissions, "administrator", False)))
         if is_owner_or_admin or can_staff_timeout(msg.author):
             task = asyncio.create_task(run_admin_flow(msg, txt))
-        _bg_tasks.add(task)
-        task.add_done_callback(_bg_tasks.discard)
-        return
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
+            return
+        # anyone else who merely sounds like an admin request falls through to normal chat
 
     now = time.time()
 
@@ -2396,7 +2431,9 @@ async def handle_ai_trigger(msg):
     await ai_queue.put((msg, txt, uid))
 
     if q_size > 0:
-        await safe_reply(msg, f"⏳ Added to queue (Position #{q_size + 1}). Hold up...")
+        waiting = await safe_reply(msg, f"⏳ You're #{q_size + 1} in line, one sec...", delete_after=30)
+        if waiting:
+            _queue_notices[msg.id] = waiting
 
 @bot.event
 async def on_message(msg):
