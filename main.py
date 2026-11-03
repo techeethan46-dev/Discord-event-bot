@@ -68,6 +68,15 @@ OPENROUTER_VISION_MODELS = [
     "openrouter/free",
 ]
 
+# Groq vision models (free, fast). Tried first for images; OpenRouter is the backup.
+# Groq rejects base64 images over 4 MB, so bigger ones go straight to OpenRouter.
+GROQ_VISION_MODELS = [
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
+GROQ_MAX_IMAGE_CHARS = 4_000_000
+
 ai_history = {}
 user_cooldowns = {}
 ai_queue = asyncio.Queue()
@@ -2132,8 +2141,30 @@ async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=No
     ans, groq_err, openrouter_err = None, "", ""
     has_images = messages_have_images(messages)
 
-    # Groq is intentionally skipped for image conversations so an image can never
-    # be silently converted into text-only input.
+    def _strip_think(text):
+        # Reasoning models can put their thinking in the reply; users should never see it.
+        return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+
+    # Images: try Groq's vision models first. Every model gets the real image, never a text-only copy.
+    if has_images and groq_client:
+        img_chars = sum(len(p.get("image_url", {}).get("url", ""))
+                        for m in messages if isinstance(m.get("content"), list)
+                        for p in m["content"] if p.get("type") == "image_url")
+        if img_chars <= GROQ_MAX_IMAGE_CHARS:
+            for groq_model in GROQ_VISION_MODELS:
+                try:
+                    res = await groq_client.chat.completions.create(
+                        model=groq_model, messages=messages, max_tokens=groq_tokens, **extra)
+                    out = _strip_think(res.choices[0].message.content) if res.choices else ""
+                    if out:
+                        return out, groq_err, openrouter_err
+                except Exception as e:
+                    groq_err = f"{groq_model}: {e}"
+                    print(f"Groq vision ({groq_model}) error:", e)
+        else:
+            groq_err = "image too large for Groq (>4MB), used OpenRouter"
+
+    # Text-only conversations go to Groq's text models.
     if not has_images:
         if groq_client:
             for groq_model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
@@ -2141,7 +2172,7 @@ async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=No
                     res = await groq_client.chat.completions.create(
                         model=groq_model, messages=messages, max_tokens=groq_tokens, **extra)
                     if res.choices and (res.choices[0].message.content or "").strip():
-                        return res.choices[0].message.content.strip(), groq_err, openrouter_err
+                        return _strip_think(res.choices[0].message.content), groq_err, openrouter_err
                 except Exception as e:
                     groq_err = str(e)
                     print(f"Groq ({groq_model}) error:", e)
@@ -2157,7 +2188,7 @@ async def llm_complete(messages, groq_tokens=1024, or_tokens=400, temperature=No
                     extra_headers={"HTTP-Referer": "https://github.com", "X-Title": "Host Assistant"},
                     **extra)
                 if res.choices and (res.choices[0].message.content or "").strip():
-                    return res.choices[0].message.content.strip(), groq_err, openrouter_err
+                    return _strip_think(res.choices[0].message.content), groq_err, openrouter_err
             except Exception as e:
                 openrouter_err = str(e)
                 print(f"OpenRouter ({open_model}) error:", e)
