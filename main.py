@@ -3334,16 +3334,42 @@ TRIAL_LOG_PAGE_SIZE = 5
 
 
 def trial_log_rows(rev):
-    """Return log rows, rebuilding them from legacy vote data when needed."""
+    """Return feedback rows, attaching voter IDs without exposing timestamps."""
     rows = rev.get("logs")
     if rows is None:
         rows = [
-            {"t": vote.get("at", rev.get("closed_at", rev.get("opened_at", 0))),
-             "c": vote.get("v"), "m": vote.get("why", "")}
-            for vote in rev.get("votes", {}).values()
+            {"c": vote.get("v"), "u": str(user_id), "m": vote.get("why", "")}
+            for user_id, vote in rev.get("votes", {}).items()
             if vote.get("v") in TRIAL_CHOICES
         ]
         rev["logs"] = rows
+    else:
+        # Migrate logs created by earlier versions, which stored timestamps but
+        # did not retain a voter ID on each display row.
+        votes = list(rev.get("votes", {}).items())
+        used = set()
+        for entry in rows:
+            if entry.get("u"):
+                continue
+            match = None
+            for user_id, vote in votes:
+                if user_id in used or vote.get("v") not in TRIAL_CHOICES:
+                    continue
+                if (vote.get("at") == entry.get("t")
+                        and vote.get("v") == entry.get("c")
+                        and vote.get("why", "") == entry.get("m", "")):
+                    match = (user_id, vote)
+                    break
+            if match is None:
+                for user_id, vote in votes:
+                    if user_id in used or vote.get("v") not in TRIAL_CHOICES:
+                        continue
+                    if vote.get("v") == entry.get("c") and vote.get("why", "") == entry.get("m", ""):
+                        match = (user_id, vote)
+                        break
+            if match:
+                entry["u"] = str(match[0])
+                used.add(match[0])
     return rows
 
 
@@ -3372,12 +3398,12 @@ def trial_log_embed(rev):
     overview = "\n".join(
         f"{TRIAL_CHOICES[key]['emoji']} **{TRIAL_CHOICES[key]['label']}** · {counts[key]}"
         for key in ("keep", "idk", "sweep"))
-    section = ("🕒 Latest activity" if category == "all" else
+    section = ("📝 Latest feedback" if category == "all" else
                f"{TRIAL_CHOICES[category]['emoji']} {TRIAL_CHOICES[category]['label']}")
     page_rows = rows[page * TRIAL_LOG_PAGE_SIZE:(page + 1) * TRIAL_LOG_PAGE_SIZE]
     body = "\n".join(
         f"{TRIAL_CHOICES.get(entry.get('c'), TRIAL_CHOICES['idk'])['emoji']} "
-        f"<t:{int(entry.get('t', 0))}:t> · {entry.get('m', '')}"
+        f"<@{entry.get('u')}> — {entry.get('m', '')}"
         for entry in page_rows
     ) or "*No reasons submitted yet*"
     description = (
@@ -3587,7 +3613,7 @@ class TrialWhyModal(discord.ui.Modal):
             return
         now = int(time.time())
         rev["votes"][uid] = {"v": self.choice, "why": why, "at": now}
-        rev.setdefault("logs", []).append({"t": now, "c": self.choice, "m": why[:400]})
+        rev.setdefault("logs", []).append({"c": self.choice, "u": uid, "m": why[:400]})
         save_db(db)
         c = TRIAL_CHOICES[self.choice]
         emb = discord.Embed(color=c["color"],
