@@ -784,6 +784,15 @@ async def log_action(guild, title, desc, color=0x3498DB, channel_key=None):
 # the box-drawing dashes it replaces rendered as broken segments on phones.)
 DIV = "~~" + "\u2800" * 25 + "~~"
 SECTION_SEP = f"\n{DIV}\n"
+
+
+def add_footer_divider(embed, minimum_length=280):
+    """Add the shared divider before footer metadata on medium/long embeds."""
+    description = embed.description or ""
+    fields_length = sum(len(field.name or "") + len(field.value or "") for field in embed.fields)
+    if len(description) + fields_length >= minimum_length and description and not description.endswith(DIV):
+        embed.description = description.rstrip() + f"\n{DIV}"
+    return embed
 BRAND = "AbyssalNoob1 is the Best"
 EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
 _PART = "\x00PART\x00"
@@ -819,7 +828,7 @@ def build_embed(name, info, guild=None):
     head = (f"# {emoji} {name}{_PART}\n## {status}{SECTION_SEP}"
             f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
     if info.get("trial"):
-        head += "\n• **🎓 Trial event:** the players decide if this host stays"
+        head += "\n• **🎓 Trial event:** players can leave feedback on this trial host"
     if helpers:
         head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
     head += SECTION_SEP
@@ -868,6 +877,7 @@ def build_embed(name, info, guild=None):
     for i, d in enumerate(chunks):
         d = d.replace(_PART, f" · Part {i + 1}/{n}" if n > 1 else "")
         embs.append(discord.Embed(color=color, description=d))
+    add_footer_divider(embs[-1])
     embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live · {BRAND}")
     return embs
 
@@ -919,8 +929,10 @@ def build_log_embed(info):
             f"### {sec}\n{body}")
     if info.get("helpers"):
         desc += f"\n{DIV}\n### 🤝 Helpers\n" + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
+    desc += f"\n{DIV}"
     emb = discord.Embed(color=LOG_BLUE, description=desc[:4000])
     state = "🔒 Concluded" if info.get("concluded") else "🟢 Live"
+    add_footer_divider(emb)
     emb.set_footer(text=f"{len(logs)} entries · {state} · Page {page + 1}/{pages}")
     return emb
 
@@ -2008,6 +2020,7 @@ async def run_admin_flow(msg, txt):
         if any(needs_confirm(a) for a in plan):
             emb = discord.Embed(description="## ⚠️ Confirm these actions\n" + DIV + "\n" +
                                 "\n".join(f"• {summarize(a)}" for a in plan), color=0xF1C40F)
+            add_footer_divider(emb)
             emb.set_footer(text="Confirm within 30 seconds")
             view = ConfirmView(uid)
             prompt = await safe_reply(msg, embed=emb, view=view)
@@ -2018,6 +2031,7 @@ async def run_admin_flow(msg, txt):
                 emb.description = emb.description.replace(
                     "## ⚠️ Confirm these actions", "## ❌ Cancelled" if view.value is False else "## ⌛ Timed out")
                 emb.color = 0x95A5A6
+                add_footer_divider(emb)
                 emb.set_footer(text="Nothing was changed")
                 try:
                     await prompt.edit(embed=emb, view=None)
@@ -2069,6 +2083,7 @@ async def run_admin_flow(msg, txt):
         else:
             title, color = "⚠️ Partly done", 0xE67E22
         emb = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
+        add_footer_divider(emb)
         emb.set_footer(text=f"Requested by {msg.author.display_name}")
         await safe_reply(msg, embed=emb)
 
@@ -3066,6 +3081,7 @@ def build_host_profile_embed(guild, member):
     )
     embed.add_field(name="📝 Ratings Received", value=f"**{len(ratings):,}**", inline=True)
     embed.add_field(name="🎯 Host Status", value="**Active Host**" if total_events else "**New Host**", inline=True)
+    add_footer_divider(embed)
     embed.set_footer(text=f"Host Assistant · {guild.name}")
     return embed
 
@@ -3127,6 +3143,7 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
                      + "\n".join(lines))[:4000],
         color=0xF1C40F
     )
+    add_footer_divider(emb)
     emb.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENT_DEFS)} unlocked · Host Assistant")
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
@@ -3229,6 +3246,7 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
     emb.add_field(name="📊 Avg Occupancy", value=f"**{avg_occupancy:.1f}%**" if occupancy else "**N/A**", inline=True)
     top = [f"**{i}.** <@{hid}> · {ev} events · {pl} players" for i, (hid, (ev, pl)) in enumerate(host_rows[:5], 1)]
     emb.add_field(name="🔥 Top Hosts", value="\n".join(top) or "No completed events in this period.", inline=False)
+    add_footer_divider(emb)
     emb.set_footer(text="Historical analytics are calculated from completed event records.")
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
@@ -3236,12 +3254,10 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
 # ==========================================
 # TRIAL HOSTS: "The Trial Review"
 # ==========================================
-# A new host starts on trial. When their trial event ends, the people who played in it decide
-# through a SEALED ballot: Keep (promote), IDK (unsure) or Sweep (demote). Every vote needs a reason.
-# Results stay hidden until the ballot closes, then they are revealed in stages.
-TRIAL_VOTE_HOURS = 24      # how long the ballot stays open
-TRIAL_MIN_VOTES = 3        # fewer votes than this = no clear verdict (never more than the number of voters)
-TRIAL_PASS_SHARE = 0.60    # share of ALL votes needed to promote or demote
+# A new host starts on trial. After their trial event, eligible players submit one final
+# Keep / IDK / Sweep vote with a reason. Totals update publicly; detailed reasons live in Trial Logs.
+# The bot records feedback only. The server team makes promotion/demotion decisions manually.
+TRIAL_VOTE_HOURS = 24      # how long voting stays open
 TRIAL_REASON_MIN = 8
 TRIAL_CHOICES = {
     "keep":  {"label": "Keep",  "emoji": "✅", "block": "🟩", "color": 0x2ECC71, "meaning": "promote",
@@ -3256,6 +3272,7 @@ def can_run_trials(member):
     """Admins, bot owners and trusted users run trials. Trial hosts and normal hosts do not."""
     return is_server_admin(member) or is_trusted(member)
 
+
 def trial_state(guild_id, host_id):
     return db["trial_hosts"].get(str(guild_id), {}).get(str(host_id))
 
@@ -3265,8 +3282,15 @@ def set_trial_state(guild_id, host_id, **fields):
     return rec
 
 def trial_channel_for(guild):
+    """Public channel where trial announcements and voting are posted."""
     conf = get_config(guild.id)
     cid = conf.get("trial_channel") or conf.get("stats_channel")
+    return guild.get_channel(cid) if cid else None
+
+
+def trial_log_channel_for(guild):
+    """Separate restricted-access channel for detailed trial voting logs."""
+    cid = get_config(guild.id).get("trial_log_channel")
     return guild.get_channel(cid) if cid else None
 
 def trial_tally(rev):
@@ -3276,104 +3300,189 @@ def trial_tally(rev):
             counts[v["v"]] += 1
     return counts, sum(counts.values())
 
-def trial_bar(counts, total, width=20):
-    """Coloured bar with exactly `width` blocks (largest-remainder rounding)."""
-    if not total:
-        return "⬛" * width
-    raw = {k: counts[k] / total * width for k in counts}
-    n = {k: int(raw[k]) for k in counts}
-    for k in sorted(counts, key=lambda k: raw[k] - n[k], reverse=True)[: width - sum(n.values())]:
-        n[k] += 1
-    return "".join(TRIAL_CHOICES[k]["block"] * n[k] for k in ("keep", "idk", "sweep"))
-
-def turnout_bar(done, goal, width=10):
-    goal = max(goal, 1)
-    filled = min(width, round(done / goal * width))
-    return "▰" * filled + "▱" * (width - filled)
-
-def trial_verdict(rev):
-    """-> (verdict, reason). verdict is 'promote', 'demote' or 'undecided'."""
-    counts, total = trial_tally(rev)
-    need = min(TRIAL_MIN_VOTES, max(1, len(rev["electorate"])))
-    if total < need:
-        return "undecided", f"only {total} vote{'s' if total != 1 else ''} came in (needed {need})"
-    if counts["keep"] / total >= TRIAL_PASS_SHARE:
-        return "promote", f"Keep reached {round(counts['keep'] / total * 100)}%"
-    if counts["sweep"] / total >= TRIAL_PASS_SHARE:
-        return "demote", f"Sweep reached {round(counts['sweep'] / total * 100)}%"
-    return "undecided", f"no side reached {round(TRIAL_PASS_SHARE * 100)}%"
-
 def trial_open_embed(rev):
+    """Public trial card: live vote totals, no automated verdict or decision controls."""
     host = rev["host_id"]
     counts, total = trial_tally(rev)
-    goal = max(len(rev["electorate"]), total)
-    emb = discord.Embed(color=0x5865F2)
+    is_closed = rev.get("status") == "closed"
+    state = "🔒 Voting closed" if is_closed else "🟢 Voting open"
+    emb = discord.Embed(color=0x5865F2 if not is_closed else 0x3498DB)
     emb.description = (
         f"# ⚖️ Trial Review\n"
         f"### <@{host}> has finished their trial.\n"
-        f"Now the people who were there decide.\n{DIV}\n"
+        f"{state} · " + ("Voting period ended" if is_closed else f"Closes <t:{rev['ends_at']}:R>") + f"\n{DIV}\n"
         f"🎓 **Candidate** · <@{host}>\n"
         f"🎪 **Trial event** · {rev['event_name']}\n"
-        f"👥 **Players** · {rev['players']}  ·  ⏱️ **Ran** · {rev['hours']}h\n{DIV}\n"
-        f"### 🔒 The ballot is sealed\n"
-        f"Results stay hidden until the review closes. Only turnout is shown."
+        f"👥 **Players** · {rev['players']} · ⏱️ **Ran** · {rev['hours']}h\n{DIV}\n"
+        f"### 📊 Votes · {total} total\n"
+        f"✅ **Keep** · {counts['keep']}\n"
+        f"🤔 **IDK** · {counts['idk']}\n"
+        f"🧹 **Sweep** · {counts['sweep']}\n{DIV}\n"
+        f"{'Voting has ended. The team will review the feedback and decide what happens next.' if is_closed else 'Choose one option and explain your vote. Your submission is final.'}"
     )
-    emb.add_field(name="🗳️ Turnout", value=f"`{turnout_bar(total, goal)}` **{total}** / {goal} voices", inline=False)
-    emb.add_field(name="⏳ Closes", value=f"<t:{rev['ends_at']}:R>", inline=True)
-    emb.add_field(name="🗝️ Who can vote", value="Players from the trial event + staff", inline=True)
-    emb.add_field(
-        name="How to vote",
-        value="✅ **Keep** = promote\n🤔 **IDK** = unsure\n🧹 **Sweep** = demote\n"
-              "Every vote needs a reason. You can change your vote until it closes.",
-        inline=False)
-    emb.set_footer(text=f"Votes are anonymous to the public · staff can read reasons · {BRAND}")
+    if not is_closed:
+        emb.add_field(name="🗝️ Who can vote", value="Players from the trial event + staff", inline=True)
+    add_footer_divider(emb)
+    emb.set_footer(text=f"Vote totals are public · written reasons are in Trial Logs · {BRAND}")
     return emb
 
-def trial_reveal_embed(rev, step):
-    host = rev["host_id"]
+
+# Trial Logs mirror the Event Logs browsing experience and contain detailed written feedback.
+TRIAL_LOG_OPTIONS = [("all", "All activity", "📜"),
+                     ("keep", "Keep", "✅"), ("idk", "IDK", "🤔"), ("sweep", "Sweep", "🧹")]
+TRIAL_LOG_PAGE_SIZE = 5
+
+
+def trial_log_rows(rev):
+    """Return log rows, rebuilding them from legacy vote data when needed."""
+    rows = rev.get("logs")
+    if rows is None:
+        rows = [
+            {"t": vote.get("at", rev.get("closed_at", rev.get("opened_at", 0))),
+             "c": vote.get("v"), "m": vote.get("why", "")}
+            for vote in rev.get("votes", {}).values()
+            if vote.get("v") in TRIAL_CHOICES
+        ]
+        rev["logs"] = rows
+    return rows
+
+
+def trial_log_state(rev):
+    state = rev.get("log_view") or {}
+    category = state.get("cat", "all")
+    if category not in {"all", "keep", "idk", "sweep"}:
+        category = "all"
+    rows = [entry for entry in trial_log_rows(rev)
+            if category == "all" or entry.get("c") == category]
+    rows.reverse()
+    pages = max(1, -(-len(rows) // TRIAL_LOG_PAGE_SIZE))
+    try:
+        page = int(state.get("page", 0))
+    except (TypeError, ValueError):
+        page = 0
+    page = max(0, min(page, pages - 1))
+    return category, page, pages, rows
+
+
+def trial_log_embed(rev):
+    category, page, pages, rows = trial_log_state(rev)
+    closed = rev.get("status") == "closed"
     counts, total = trial_tally(rev)
-    if step == "unsealing":
-        emb = discord.Embed(color=0x2B2D31)
-        emb.description = f"# 🔓 Unsealing the ballot…\n### <@{host}>\n{DIV}\n{'⬛' * 20}\nCounting every voice."
-        return emb
-    lines = "\n".join(
-        f"{TRIAL_CHOICES[k]['emoji']} **{TRIAL_CHOICES[k]['label']}** · **{counts[k]}** · "
-        f"{round(counts[k] / total * 100) if total else 0}%"
-        for k in ("keep", "idk", "sweep"))
-    bar = trial_bar(counts, total)
-    if step == "counting":
-        emb = discord.Embed(color=0x2B2D31)
-        emb.description = f"# 🧮 Counting…\n### <@{host}>\n{DIV}\n{bar}\n{lines}"
-        return emb
-    verdict, why = trial_verdict(rev)
-    banner = {
-        "promote": (0x2ECC71, "# 🎖️ PROMOTED", f"### <@{host}> earned the Host role."),
-        "demote": (0xE74C3C, "# 🧹 SWEPT", f"### <@{host}> won't continue as a host."),
-        "undecided": (0xF1C40F, "# 🤔 UNDECIDED", "### The voices were split. Staff will decide."),
-    }[verdict]
-    emb = discord.Embed(color=banner[0])
-    emb.description = f"{banner[1]}\n{banner[2]}\n{DIV}\n{bar}\n{lines}"
-    emb.add_field(name="🗳️ Voices", value=f"**{total}** of {max(len(rev['electorate']), total)}", inline=True)
-    emb.add_field(name="🎪 Trial event", value=rev["event_name"], inline=True)
-    emb.set_footer(text=f"{why} · staff make it official · {BRAND}")
-    return emb
+    host = f"🎓 **Candidate** · <@{rev['host_id']}>"
+    overview = "\n".join(
+        f"{TRIAL_CHOICES[key]['emoji']} **{TRIAL_CHOICES[key]['label']}** · {counts[key]}"
+        for key in ("keep", "idk", "sweep"))
+    section = ("🕒 Latest activity" if category == "all" else
+               f"{TRIAL_CHOICES[category]['emoji']} {TRIAL_CHOICES[category]['label']}")
+    page_rows = rows[page * TRIAL_LOG_PAGE_SIZE:(page + 1) * TRIAL_LOG_PAGE_SIZE]
+    body = "\n".join(
+        f"{TRIAL_CHOICES.get(entry.get('c'), TRIAL_CHOICES['idk'])['emoji']} "
+        f"<t:{int(entry.get('t', 0))}:t> · {entry.get('m', '')}"
+        for entry in page_rows
+    ) or "*No reasons submitted yet*"
+    description = (
+        f"# 📜 Trial Log · {rev['event_name']}\n{DIV}\n"
+        f"### 📊 Overview\n{host}\n🎪 **Trial event** · {rev['event_name']}\n"
+        f"{overview}\n{DIV}\n### {section}\n{body}\n{DIV}"
+    )
+    embed = discord.Embed(color=0x3498DB, description=description[:4000])
+    state_label = ("🔒 Concluded" if closed else
+                   "🔓 Closing" if rev.get("status") == "closing" else "🟢 Voting open")
+    add_footer_divider(embed)
+    embed.set_footer(text=f"{len(trial_log_rows(rev))} entries · {state_label} · Page {page + 1}/{pages}")
+    return embed
 
-def trial_reason_pages(rev):
-    pages = []
-    for key in ("keep", "idk", "sweep"):
-        c = TRIAL_CHOICES[key]
-        rows = [(uid, v) for uid, v in rev["votes"].items() if v.get("v") == key]
-        if not rows:
-            continue
-        buf = f"## {c['emoji']} {c['label']} · {len(rows)}\n"
-        for uid, v in rows:
-            line = f"<@{uid}> — {v['why']}\n"
-            if len(buf) + len(line) > 1800:
-                pages.append((c, buf))
-                buf = f"## {c['emoji']} {c['label']} (continued)\n"
-            buf += line
-        pages.append((c, buf))
-    return pages
+
+def find_trial_by_log(message_id):
+    for review in db.get("trials", {}).values():
+        if (review.get("trial_log_msg") or {}).get("id") == message_id:
+            return review
+    return None
+
+
+async def refresh_trial_log(rev):
+    log_message = rev.get("trial_log_msg")
+    if not log_message:
+        return False
+    channel = bot.get_channel(log_message.get("ch"))
+    if not channel:
+        return False
+    try:
+        message = await channel.fetch_message(log_message["id"])
+        await message.edit(embed=trial_log_embed(rev), view=make_trial_log_view(rev))
+        return True
+    except discord.NotFound:
+        rev.pop("trial_log_msg", None)
+        save_db(db)
+        return False
+    except discord.HTTPException as error:
+        print("refresh_trial_log failed:", error)
+        return False
+
+
+async def spawn_trial_log(guild, rev):
+    # Detailed Trial Logs use their own channel configured in /setup.
+    channel = trial_log_channel_for(guild)
+    if not channel:
+        print("trial log skipped: no dedicated Trial Logs channel configured in /setup")
+        return False
+    try:
+        message = await channel.send(embed=trial_log_embed(rev), view=make_trial_log_view(rev))
+        rev["trial_log_msg"] = {"ch": channel.id, "id": message.id}
+        save_db(db)
+        return True
+    except discord.HTTPException as error:
+        print("spawn_trial_log failed:", error)
+        return False
+
+
+class TrialLogCategorySelect(discord.ui.Select):
+    def __init__(self, current="all"):
+        options = [discord.SelectOption(label=label, value=value, emoji=emoji, default=(value == current))
+                   for value, label, emoji in TRIAL_LOG_OPTIONS]
+        super().__init__(custom_id="triallog_select", placeholder="Browse trial logs by category",
+                         options=options, row=0)
+
+    async def callback(self, interaction):
+        review = find_trial_by_log(interaction.message.id)
+        if not review:
+            await interaction.response.send_message("This trial log is no longer available.", ephemeral=True)
+            return
+        review["log_view"] = {"cat": self.values[0], "page": 0}
+        save_db(db)
+        await interaction.response.edit_message(embed=trial_log_embed(review), view=make_trial_log_view(review))
+
+
+class TrialLogPageButton(discord.ui.Button):
+    def __init__(self, direction, disabled=False):
+        label = "◀ Prev" if direction < 0 else "Next ▶"
+        custom_id = "triallog_prev" if direction < 0 else "triallog_next"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=custom_id,
+                         disabled=disabled, row=1)
+        self.direction = direction
+
+    async def callback(self, interaction):
+        review = find_trial_by_log(interaction.message.id)
+        if not review:
+            await interaction.response.send_message("This trial log is no longer available.", ephemeral=True)
+            return
+        category, page, pages, _ = trial_log_state(review)
+        review["log_view"] = {"cat": category, "page": max(0, min(pages - 1, page + self.direction))}
+        save_db(db)
+        await interaction.response.edit_message(embed=trial_log_embed(review), view=make_trial_log_view(review))
+
+
+class TrialLogView(GuardedView):
+    def __init__(self, category="all", page=0, pages=1):
+        super().__init__(timeout=None)
+        self.add_item(TrialLogCategorySelect(category))
+        self.add_item(TrialLogPageButton(-1, disabled=page <= 0))
+        self.add_item(TrialLogPageButton(+1, disabled=page >= pages - 1))
+
+
+def make_trial_log_view(rev):
+    category, page, pages, _ = trial_log_state(rev)
+    return TrialLogView(category, page, pages)
 
 async def refresh_trial_message(rev, **kwargs):
     ch = bot.get_channel(rev["channel_id"])
@@ -3386,55 +3495,47 @@ async def refresh_trial_message(rev, **kwargs):
         print("trial message edit failed:", e)
         return False
 
-def start_trial_reveal(rev_id):
+def close_trial_voting(rev_id):
+    """Close voting at the deadline; never calculate or apply a promotion/demotion verdict."""
     rev = db["trials"].get(rev_id)
-    if not rev or rev["status"] == "closed":
+    if not rev or rev.get("status") == "closed":
         return
-    rev["status"] = "closing"
-    rev["closing_at"] = int(time.time())
+    rev["status"] = "closed"
+    rev["closed_at"] = int(time.time())
+    guild = bot.get_guild(rev["guild_id"])
+    if guild:
+        set_trial_state(guild.id, rev["host_id"], status="review", review=rev.get("message_id"))
     save_db(db)
-    task = asyncio.create_task(run_trial_reveal(rev_id))
+    task = asyncio.create_task(_finish_trial_closure(rev_id))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
-async def run_trial_reveal(rev_id):
+
+async def _finish_trial_closure(rev_id):
     rev = db["trials"].get(rev_id)
     if not rev:
         return
-    try:
-        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "unsealing"), view=None)
-        await asyncio.sleep(2.5)
-        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "counting"), view=None)
-        await asyncio.sleep(2.5)
-        verdict, _ = trial_verdict(rev)
-        rev["verdict"] = verdict
-        rev["status"] = "closed"
-        rev["closed_at"] = int(time.time())
-        guild = bot.get_guild(rev["guild_id"])
-        if guild:
-            set_trial_state(guild.id, rev["host_id"], status="decided", verdict=verdict)
-        save_db(db)
-        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "final"), view=TrialVerdictView(verdict))
-    except Exception as e:
-        print("trial reveal error:", e)
+    await refresh_trial_message(rev, embed=trial_open_embed(rev), view=None)
+    await refresh_trial_log(rev)
+
 
 async def close_due_trials():
     now = int(time.time())
     for rid, rev in list(db["trials"].items()):
-        due = ((rev["status"] == "open" and rev["ends_at"] <= now) or
-               (rev["status"] == "closing" and now - rev.get("closing_at", 0) > 120))  # recover after a restart
-        if due:
-            start_trial_reveal(rid)
+        if ((rev.get("status") == "open" and rev.get("ends_at", now + 1) <= now)
+                or (rev.get("status") == "closing" and now - rev.get("closing_at", 0) > 120)):
+            close_trial_voting(rid)
+
 
 async def maybe_open_trial_review(guild, info):
-    """Called when an event is concluded. Opens the sealed ballot if it was a trial host's trial event."""
+    """Called when an event ends. Opens the public feedback vote for a trial host."""
     host_id = info["host_id"]
     st = trial_state(guild.id, host_id)
     if not info.get("trial") or not st or st.get("status") != "trial":
         return
     ch = trial_channel_for(guild)
     if not ch:
-        print("trial review skipped: no trial/stats channel configured")
+        print("trial review skipped: no public trial review/stats channel configured")
         return
     now = int(time.time())
     skip = {host_id, info.get("cohost_id")}
@@ -3446,6 +3547,7 @@ async def maybe_open_trial_review(guild, info):
         "hours": round(info.get("duration_seconds", 0) / 3600, 1),
         "opened_at": now, "ends_at": now + TRIAL_VOTE_HOURS * 3600,
         "status": "open", "electorate": electorate, "votes": {}, "verdict": None, "applied": False,
+        "logs": [], "log_view": {"cat": "all", "page": 0},
     }
     try:
         msg = await ch.send(embed=trial_open_embed(rev), view=TrialVoteView())
@@ -3456,44 +3558,7 @@ async def maybe_open_trial_review(guild, info):
     db["trials"][str(msg.id)] = rev
     set_trial_state(guild.id, host_id, status="review", review=msg.id, review_channel=ch.id)
     save_db(db)
-
-async def apply_trial_verdict(guild, rev, actor):
-    """Staff pressed 'Make it official'. Returns a short note describing what happened."""
-    conf = get_config(guild.id)
-    host = guild.get_member(rev["host_id"])
-    trial_role = guild.get_role(conf.get("trial_role") or 0)
-    host_role = guild.get_role(conf.get("host_role") or 0)
-    verdict = rev["verdict"] or "undecided"
-    problems = []
-    now = int(time.time())
-
-    async def swap(add=None, remove=None):
-        if not host:
-            problems.append("They're no longer in the server, so no roles were changed.")
-            return
-        try:
-            if remove and remove in host.roles:
-                await host.remove_roles(remove, reason=f"Trial verdict by {actor}")
-            if add and add not in host.roles:
-                await host.add_roles(add, reason=f"Trial verdict by {actor}")
-        except discord.HTTPException:
-            problems.append("I couldn't change their roles. Check that my role is above theirs.")
-
-    if verdict == "promote":
-        if not host_role:
-            problems.append("No Host role is set in /setup, so none was given.")
-        await swap(add=host_role, remove=trial_role)
-        set_trial_state(guild.id, rev["host_id"], status="host", decided_at=now)
-        note = f"🎖️ <@{rev['host_id']}> is now a full host."
-    elif verdict == "demote":
-        await swap(remove=trial_role)
-        set_trial_state(guild.id, rev["host_id"], status="demoted", decided_at=now)
-        note = f"🧹 <@{rev['host_id']}> was swept and is no longer on trial."
-    else:
-        set_trial_state(guild.id, rev["host_id"], status="trial", review=None)
-        note = f"🔁 Trial extended. <@{rev['host_id']}>'s next event will be reviewed."
-    save_db(db)
-    return note + ("".join(f"\n⚠️ {p}" for p in problems))
+    await spawn_trial_log(guild, rev)
 
 class TrialWhyModal(discord.ui.Modal):
     def __init__(self, rev_id, choice, prev=None):
@@ -3517,16 +3582,22 @@ class TrialWhyModal(discord.ui.Modal):
             await interaction.response.send_message("Give a real reason (a few words at least).", ephemeral=True)
             return
         uid = str(interaction.user.id)
-        changed = uid in rev["votes"]
-        rev["votes"][uid] = {"v": self.choice, "why": why, "at": int(time.time())}
+        if uid in rev["votes"]:
+            await interaction.response.send_message("Your vote has already been submitted and cannot be changed.", ephemeral=True)
+            return
+        now = int(time.time())
+        rev["votes"][uid] = {"v": self.choice, "why": why, "at": now}
+        rev.setdefault("logs", []).append({"t": now, "c": self.choice, "m": why[:400]})
         save_db(db)
         c = TRIAL_CHOICES[self.choice]
         emb = discord.Embed(color=c["color"],
-                            description=f"## 🔏 Ballot {'updated' if changed else 'sealed'}\n{DIV}\n"
-                                        f"{c['emoji']} **{c['label']}** · {c['meaning']}\n> {why}")
-        emb.set_footer(text="Anonymous to the public. Staff can read reasons. You can change this until the ballot closes.")
+                            description=f"## ✅ Vote recorded\n{DIV}\n"
+                                        f"{c['emoji']} **{c['label']}** · {c['meaning']}\nYour vote has been recorded and is final.")
+        add_footer_divider(emb)
+        emb.set_footer(text="Your vote is final · your reason is recorded in the Trial Logs")
         await interaction.response.send_message(embed=emb, ephemeral=True)
         await refresh_trial_message(rev, embed=trial_open_embed(rev))
+        await refresh_trial_log(rev)
 
 class TrialVoteView(GuardedView):
     def __init__(self):
@@ -3542,6 +3613,9 @@ class TrialVoteView(GuardedView):
             await interaction.response.send_message("The ballot is closed.", ephemeral=True)
             return
         uid = interaction.user.id
+        if str(uid) in rev.get("votes", {}):
+            await interaction.response.send_message("You've already voted. Your submission is final.", ephemeral=True)
+            return
         if uid in (rev["host_id"],):
             await interaction.response.send_message("You can't vote on your own trial.", ephemeral=True)
             return
@@ -3549,7 +3623,7 @@ class TrialVoteView(GuardedView):
             await interaction.response.send_message(
                 "Only players from the trial event (and staff) can vote on this one.", ephemeral=True)
             return
-        await interaction.response.send_modal(TrialWhyModal(rev_id, choice, rev["votes"].get(str(uid))))
+        await interaction.response.send_modal(TrialWhyModal(rev_id, choice))
 
     @discord.ui.button(label="Keep", emoji="✅", style=discord.ButtonStyle.success, custom_id="trial_keep")
     async def keep(self, interaction, btn):
@@ -3562,69 +3636,6 @@ class TrialVoteView(GuardedView):
     @discord.ui.button(label="Sweep", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="trial_sweep")
     async def sweep(self, interaction, btn):
         await self._vote(interaction, "sweep")
-
-    @discord.ui.button(label="Seal & Reveal", emoji="🔓", style=discord.ButtonStyle.secondary, custom_id="trial_seal", row=1)
-    async def seal(self, interaction, btn):
-        if not can_run_trials(interaction.user):
-            await interaction.response.send_message("Staff only.", ephemeral=True)
-            return
-        rev_id = str(interaction.message.id)
-        rev = db["trials"].get(rev_id)
-        if not rev or rev["status"] != "open":
-            await interaction.response.send_message("This ballot is already closing or closed.", ephemeral=True)
-            return
-        await interaction.response.send_message("🔓 Unsealing the ballot now.", ephemeral=True)
-        start_trial_reveal(rev_id)
-
-class TrialVerdictView(GuardedView):
-    def __init__(self, verdict="undecided", applied=False):
-        super().__init__(timeout=None)
-        label, emoji = {"promote": ("Make it official", "🎖️"), "demote": ("Make it official", "🧹")}.get(
-            verdict, ("Extend trial", "🔁"))
-        self.official.label, self.official.emoji, self.official.disabled = label, emoji, applied
-
-    @discord.ui.button(label="Reasons", emoji="📜", style=discord.ButtonStyle.secondary, custom_id="trial_reasons")
-    async def reasons(self, interaction, btn):
-        rev = db["trials"].get(str(interaction.message.id))
-        if not rev:
-            await interaction.response.send_message("This review no longer exists.", ephemeral=True)
-            return
-        if not can_run_trials(interaction.user):
-            await interaction.response.send_message("Reasons are for staff only.", ephemeral=True)
-            return
-        pages = trial_reason_pages(rev)
-        if not pages:
-            await interaction.response.send_message("No votes were cast.", ephemeral=True)
-            return
-        embeds = [discord.Embed(description=text, color=c["color"]) for c, text in pages]
-        groups = [embeds[i:i + 3] for i in range(0, len(embeds), 3)]  # keeps each message under Discord's size limit
-        await interaction.response.send_message(embeds=groups[0], ephemeral=True)
-        for g in groups[1:]:
-            await interaction.followup.send(embeds=g, ephemeral=True)
-
-    @discord.ui.button(label="Make it official", emoji="🎖️", style=discord.ButtonStyle.success, custom_id="trial_official")
-    async def official(self, interaction, btn):
-        rev = db["trials"].get(str(interaction.message.id))
-        if not rev or rev["status"] != "closed":
-            await interaction.response.send_message("This review isn't finished yet.", ephemeral=True)
-            return
-        if not can_run_trials(interaction.user):
-            await interaction.response.send_message("Staff only.", ephemeral=True)
-            return
-        if rev.get("applied"):
-            await interaction.response.send_message("Already done.", ephemeral=True)
-            return
-        rev["applied"] = True  # set first so a double click can't run it twice
-        await interaction.response.defer(ephemeral=True)
-        note = await apply_trial_verdict(interaction.guild, rev, interaction.user)
-        save_db(db)
-        emb = interaction.message.embeds[0]
-        emb.add_field(name="📌 Made official", value=f"{note}\nby {interaction.user.mention} · <t:{int(time.time())}:R>", inline=False)
-        try:
-            await interaction.message.edit(embed=emb, view=TrialVerdictView(rev["verdict"], applied=True))
-        except discord.HTTPException as e:
-            print("trial verdict edit failed:", e)
-        await interaction.followup.send(note, ephemeral=True)
 
 trial_group = app_commands.Group(name="trial", description="Trial host system", guild_only=True)
 bot.tree.add_command(trial_group)
@@ -3660,6 +3671,7 @@ async def trial_appoint(interaction: discord.Interaction, member: discord.Member
             f"# 🎓 A new trial begins\n### {member.mention}\n{DIV}\n"
             f"Their first event will be judged by the people who play in it.\n"
             f"✅ **Keep** · 🤔 **IDK** · 🧹 **Sweep**"))
+        add_footer_divider(emb)
         emb.set_footer(text=BRAND)
         try:
             await ch.send(embed=emb)
@@ -3676,8 +3688,8 @@ async def trial_status(interaction: discord.Interaction, member: discord.Member 
         return
     stage = {
         "trial": "🎓 On trial. Their trial event hasn't ended yet.",
-        "review": "⚖️ Review in progress. The ballot is open.",
-        "decided": "🔒 The ballot closed. Staff haven't made it official yet.",
+        "review": "⚖️ Trial review in progress, or awaiting the team's manual decision after voting closes.",
+        "decided": "🔒 The ballot closed. The team decides the next step manually.",
         "host": "🎖️ Full host.",
         "demoted": "🧹 Swept. No longer on trial.",
     }.get(st.get("status"), "Unknown")
@@ -3685,6 +3697,7 @@ async def trial_status(interaction: discord.Interaction, member: discord.Member 
     if st.get("review") and st.get("review_channel"):
         text += f"\n[Jump to the review](https://discord.com/channels/{interaction.guild_id}/{st['review_channel']}/{st['review']})"
     emb = discord.Embed(description=text, color=0x5865F2)
+    add_footer_divider(emb)
     emb.set_footer(text=BRAND)
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
@@ -3705,6 +3718,8 @@ SETUP_STEPS = [
      "desc": "If your server has a Double Booster role, set it here. Only members with this role can send images for Host Assistant to analyze."},
     {"key": "staff_role", "kind": "role", "icon": "🛡️", "title": "Staff role", "required": False,
      "desc": "Members with this role can use normal AI chat and image vision, plus timeout/mute moderation. They cannot use other AI admin actions. Server admins and bot owners are always allowed."},
+    {"key": "event_manager_role", "kind": "role", "icon": "🗂️", "title": "Event Manager role", "required": False,
+     "desc": "Optional role setting for your server's Event Managers. Trial outcomes are decided manually by your team; the bot only records votes."},
     {"key": "log_channel", "kind": "channel", "icon": "📜", "title": "Event log channel", "required": True,
      "desc": "Every event gets one live log embed here that you can browse by category."},
     {"key": "ai_log_channel", "kind": "channel", "icon": "🤖", "title": "AI admin log channel", "required": False,
@@ -3716,7 +3731,9 @@ SETUP_STEPS = [
     {"key": "stats_channel", "kind": "channel", "icon": "📊", "title": "Stats channel", "required": True,
      "desc": "Event results and the rate-your-host button are posted here when an event is concluded."},
     {"key": "trial_channel", "kind": "channel", "icon": "⚖️", "title": "Trial review channel", "required": False,
-     "desc": "Trial reviews (sealed ballots and verdicts) are posted here. If you skip it, they go to the stats channel."},
+     "desc": "The public trial announcement and voting card are posted here. If you skip it, they go to the stats channel."},
+    {"key": "trial_log_channel", "kind": "channel", "icon": "📜", "title": "Trial Logs channel", "required": False,
+     "desc": "Detailed trial vote records and written reasons are posted here. Members who can view this channel can read its Trial Logs."},
     {"key": "achievement_roles", "kind": "achievement", "icon": "🏆", "title": "Achievement roles", "required": False,
      "desc": "Create and sync every Host Assistant achievement role. Existing roles are reused, so running setup again will not duplicate them."},
 ]
@@ -3783,6 +3800,8 @@ def setup_checks(guild, conf):
                 p = ch.permissions_for(me)
                 if not (p.view_channel and p.send_messages and p.embed_links):
                     out.append(f"⚠️ I can't post embeds in {ch.mention} (need Send Messages + Embed Links)")
+    if conf.get("trial_channel") and not conf.get("trial_log_channel"):
+        out.append("⚠️ **Trial Logs channel** isn't set; detailed vote records and reasons won't be posted until you configure it")
     gp = me.guild_permissions
     if not gp.manage_roles:
         out.append("⚠️ I need **Manage Roles** (event role + achievement roles + AI admin)")
@@ -3843,8 +3862,9 @@ class SetupWizard(GuardedView):
             desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
             if self.note:
                 desc += f"{self.note}\n\n"
-            desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}"
+            desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}\n{DIV}"
             emb = discord.Embed(color=SETUP_COLOR, description=desc)
+            add_footer_divider(emb)
             emb.set_footer(text="Pick below · it saves instantly and moves to the next step")
             return emb
 
@@ -3857,6 +3877,7 @@ class SetupWizard(GuardedView):
         security = (
             f"🤖 **AI access:** VIP + Staff + Administrators + Bot Owners\n"
             f"🖼️ **Image vision:** Double Booster role only\n"
+            f"⚖️ **Trial decisions:** Reviewed and decided manually by your team\n"
             f"💬 **/talk audit:** {'Configured' if conf.get('talk_log_channel') else 'Optional / not configured'}"
         )
         desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
@@ -3864,10 +3885,11 @@ class SetupWizard(GuardedView):
                 f"### 🤖 AI & Security\n{security}\n{DIV}\n"
                 f"### 📡 Channels\n{chans}\n{DIV}\n"
                 f"### 🏆 Achievement Roles\n🏆 **Achievement roles** · **{ready}/{total} ready**\n{DIV}\n"
-                f"### 🔍 Checks\n{checks}")
+                f"### 🔍 Checks\n{checks}\n{DIV}")
         if self.note:
             desc = self.note + "\n\n" + desc
         emb = discord.Embed(color=SETUP_COLOR, description=desc[:4000])
+        add_footer_divider(emb)
         emb.set_footer(text="Jump to any step with the menu · press Finish when you're done")
         return emb
 
@@ -4058,7 +4080,7 @@ async def setup_hook():
     bot.add_view(EventButtonsView())
     bot.add_view(EventLogView())
     bot.add_view(TrialVoteView())
-    bot.add_view(TrialVerdictView())
+    bot.add_view(TrialLogView())
     refresh_timers.start()
     ai_worker_task = asyncio.create_task(process_ai_queue())
 
@@ -4269,6 +4291,7 @@ async def log_talk_usage(guild, author, channel, message):
         embed.set_author(name=str(author))
     embed.add_field(name="👤 Author", value=f"{author.mention}\n`{author.id}`", inline=True)
     embed.add_field(name="📍 Channel", value=f"{channel.mention}\n`{channel.id}`", inline=True)
+    add_footer_divider(embed)
     embed.set_footer(text=f"Host Assistant · {guild.name}")
     try:
         await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
