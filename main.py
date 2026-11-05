@@ -310,7 +310,7 @@ def save_db(data):
     _db_executor.submit(_write_db, payload)
 
 db = load_db()
-for k in ["server_config", "events", "blacklists", "hosts", "achievement_progress"]:
+for k in ["server_config", "events", "blacklists", "hosts", "achievement_progress", "trials", "trial_hosts"]:
     if k not in db:
         db[k] = {}
 if not isinstance(db.get("disabled_guilds"), list):
@@ -634,6 +634,9 @@ def is_authorized_manager(member):
         host_role = get_config(guild.id).get("host_role")
         if host_role and any(r.id == host_role for r in getattr(member, "roles", [])):
             return True
+        trial_role = get_config(guild.id).get("trial_role")
+        if trial_role and any(r.id == trial_role for r in getattr(member, "roles", [])):
+            return True
     return False
 
 def is_server_admin(member):
@@ -815,6 +818,8 @@ def build_embed(name, info, guild=None):
     h_str = f"<@{host}>" + (f" & <@{cohost}>" if cohost else "")
     head = (f"# {emoji} {name}{_PART}\n## {status}{SECTION_SEP}"
             f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
+    if info.get("trial"):
+        head += "\n• **🎓 Trial event:** the players decide if this host stays"
     if helpers:
         head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
     head += SECTION_SEP
@@ -2917,6 +2922,7 @@ class HostActionsView(GuardedView):
                 print("stats post failed:", e)
 
         await check_and_announce_achievements(interaction.guild, info["host_id"], s_ch)
+        await maybe_open_trial_review(interaction.guild, info)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> concluded the event · {p_count} players · {dur}h live")
         if info.get("helpers"):
@@ -3228,11 +3234,469 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
 
 
 # ==========================================
+# TRIAL HOSTS: "The Trial Review"
+# ==========================================
+# A new host starts on trial. When their trial event ends, the people who played in it decide
+# through a SEALED ballot: Keep (promote), IDK (unsure) or Sweep (demote). Every vote needs a reason.
+# Results stay hidden until the ballot closes, then they are revealed in stages.
+TRIAL_VOTE_HOURS = 24      # how long the ballot stays open
+TRIAL_MIN_VOTES = 3        # fewer votes than this = no clear verdict (never more than the number of voters)
+TRIAL_PASS_SHARE = 0.60    # share of ALL votes needed to promote or demote
+TRIAL_REASON_MIN = 8
+TRIAL_CHOICES = {
+    "keep":  {"label": "Keep",  "emoji": "✅", "block": "🟩", "color": 0x2ECC71, "meaning": "promote",
+              "ask": "What did they do well?"},
+    "idk":   {"label": "IDK",   "emoji": "🤔", "block": "🟨", "color": 0xF1C40F, "meaning": "unsure",
+              "ask": "What left you unsure?"},
+    "sweep": {"label": "Sweep", "emoji": "🧹", "block": "🟥", "color": 0xE74C3C, "meaning": "demote",
+              "ask": "What needs to change?"},
+}
+
+def can_run_trials(member):
+    """Admins, bot owners and trusted users run trials. Trial hosts and normal hosts do not."""
+    return is_server_admin(member) or is_trusted(member)
+
+def trial_state(guild_id, host_id):
+    return db["trial_hosts"].get(str(guild_id), {}).get(str(host_id))
+
+def set_trial_state(guild_id, host_id, **fields):
+    rec = db["trial_hosts"].setdefault(str(guild_id), {}).setdefault(str(host_id), {})
+    rec.update(fields)
+    return rec
+
+def trial_channel_for(guild):
+    conf = get_config(guild.id)
+    cid = conf.get("trial_channel") or conf.get("stats_channel")
+    return guild.get_channel(cid) if cid else None
+
+def trial_tally(rev):
+    counts = {k: 0 for k in TRIAL_CHOICES}
+    for v in rev["votes"].values():
+        if v.get("v") in counts:
+            counts[v["v"]] += 1
+    return counts, sum(counts.values())
+
+def trial_bar(counts, total, width=20):
+    """Coloured bar with exactly `width` blocks (largest-remainder rounding)."""
+    if not total:
+        return "⬛" * width
+    raw = {k: counts[k] / total * width for k in counts}
+    n = {k: int(raw[k]) for k in counts}
+    for k in sorted(counts, key=lambda k: raw[k] - n[k], reverse=True)[: width - sum(n.values())]:
+        n[k] += 1
+    return "".join(TRIAL_CHOICES[k]["block"] * n[k] for k in ("keep", "idk", "sweep"))
+
+def turnout_bar(done, goal, width=10):
+    goal = max(goal, 1)
+    filled = min(width, round(done / goal * width))
+    return "▰" * filled + "▱" * (width - filled)
+
+def trial_verdict(rev):
+    """-> (verdict, reason). verdict is 'promote', 'demote' or 'undecided'."""
+    counts, total = trial_tally(rev)
+    need = min(TRIAL_MIN_VOTES, max(1, len(rev["electorate"])))
+    if total < need:
+        return "undecided", f"only {total} vote{'s' if total != 1 else ''} came in (needed {need})"
+    if counts["keep"] / total >= TRIAL_PASS_SHARE:
+        return "promote", f"Keep reached {round(counts['keep'] / total * 100)}%"
+    if counts["sweep"] / total >= TRIAL_PASS_SHARE:
+        return "demote", f"Sweep reached {round(counts['sweep'] / total * 100)}%"
+    return "undecided", f"no side reached {round(TRIAL_PASS_SHARE * 100)}%"
+
+def trial_open_embed(rev):
+    host = rev["host_id"]
+    counts, total = trial_tally(rev)
+    goal = max(len(rev["electorate"]), total)
+    emb = discord.Embed(color=0x5865F2)
+    emb.description = (
+        f"# ⚖️ Trial Review\n"
+        f"### <@{host}> has finished their trial.\n"
+        f"Now the people who were there decide.\n{DIV}\n"
+        f"🎓 **Candidate** · <@{host}>\n"
+        f"🎪 **Trial event** · {rev['event_name']}\n"
+        f"👥 **Players** · {rev['players']}  ·  ⏱️ **Ran** · {rev['hours']}h\n{DIV}\n"
+        f"### 🔒 The ballot is sealed\n"
+        f"Results stay hidden until the review closes. Only turnout is shown."
+    )
+    emb.add_field(name="🗳️ Turnout", value=f"`{turnout_bar(total, goal)}` **{total}** / {goal} voices", inline=False)
+    emb.add_field(name="⏳ Closes", value=f"<t:{rev['ends_at']}:R>", inline=True)
+    emb.add_field(name="🗝️ Who can vote", value="Players from the trial event + staff", inline=True)
+    emb.add_field(
+        name="How to vote",
+        value="✅ **Keep** = promote\n🤔 **IDK** = unsure\n🧹 **Sweep** = demote\n"
+              "Every vote needs a reason. You can change your vote until it closes.",
+        inline=False)
+    emb.set_footer(text=f"Votes are anonymous to the public · staff can read reasons · {BRAND}")
+    return emb
+
+def trial_reveal_embed(rev, step):
+    host = rev["host_id"]
+    counts, total = trial_tally(rev)
+    if step == "unsealing":
+        emb = discord.Embed(color=0x2B2D31)
+        emb.description = f"# 🔓 Unsealing the ballot…\n### <@{host}>\n{DIV}\n{'⬛' * 20}\nCounting every voice."
+        return emb
+    lines = "\n".join(
+        f"{TRIAL_CHOICES[k]['emoji']} **{TRIAL_CHOICES[k]['label']}** · **{counts[k]}** · "
+        f"{round(counts[k] / total * 100) if total else 0}%"
+        for k in ("keep", "idk", "sweep"))
+    bar = trial_bar(counts, total)
+    if step == "counting":
+        emb = discord.Embed(color=0x2B2D31)
+        emb.description = f"# 🧮 Counting…\n### <@{host}>\n{DIV}\n{bar}\n{lines}"
+        return emb
+    verdict, why = trial_verdict(rev)
+    banner = {
+        "promote": (0x2ECC71, "# 🎖️ PROMOTED", f"### <@{host}> earned the Host role."),
+        "demote": (0xE74C3C, "# 🧹 SWEPT", f"### <@{host}> won't continue as a host."),
+        "undecided": (0xF1C40F, "# 🤔 UNDECIDED", "### The voices were split. Staff will decide."),
+    }[verdict]
+    emb = discord.Embed(color=banner[0])
+    emb.description = f"{banner[1]}\n{banner[2]}\n{DIV}\n{bar}\n{lines}"
+    emb.add_field(name="🗳️ Voices", value=f"**{total}** of {max(len(rev['electorate']), total)}", inline=True)
+    emb.add_field(name="🎪 Trial event", value=rev["event_name"], inline=True)
+    emb.set_footer(text=f"{why} · staff make it official · {BRAND}")
+    return emb
+
+def trial_reason_pages(rev):
+    pages = []
+    for key in ("keep", "idk", "sweep"):
+        c = TRIAL_CHOICES[key]
+        rows = [(uid, v) for uid, v in rev["votes"].items() if v.get("v") == key]
+        if not rows:
+            continue
+        buf = f"## {c['emoji']} {c['label']} · {len(rows)}\n"
+        for uid, v in rows:
+            line = f"<@{uid}> — {v['why']}\n"
+            if len(buf) + len(line) > 1800:
+                pages.append((c, buf))
+                buf = f"## {c['emoji']} {c['label']} (continued)\n"
+            buf += line
+        pages.append((c, buf))
+    return pages
+
+async def refresh_trial_message(rev, **kwargs):
+    ch = bot.get_channel(rev["channel_id"])
+    if not ch:
+        return False
+    try:
+        await ch.get_partial_message(int(rev["message_id"])).edit(**kwargs)
+        return True
+    except discord.HTTPException as e:
+        print("trial message edit failed:", e)
+        return False
+
+def start_trial_reveal(rev_id):
+    rev = db["trials"].get(rev_id)
+    if not rev or rev["status"] == "closed":
+        return
+    rev["status"] = "closing"
+    rev["closing_at"] = int(time.time())
+    save_db(db)
+    task = asyncio.create_task(run_trial_reveal(rev_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+async def run_trial_reveal(rev_id):
+    rev = db["trials"].get(rev_id)
+    if not rev:
+        return
+    try:
+        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "unsealing"), view=None)
+        await asyncio.sleep(2.5)
+        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "counting"), view=None)
+        await asyncio.sleep(2.5)
+        verdict, _ = trial_verdict(rev)
+        rev["verdict"] = verdict
+        rev["status"] = "closed"
+        rev["closed_at"] = int(time.time())
+        guild = bot.get_guild(rev["guild_id"])
+        if guild:
+            set_trial_state(guild.id, rev["host_id"], status="decided", verdict=verdict)
+        save_db(db)
+        await refresh_trial_message(rev, embed=trial_reveal_embed(rev, "final"), view=TrialVerdictView(verdict))
+    except Exception as e:
+        print("trial reveal error:", e)
+
+async def close_due_trials():
+    now = int(time.time())
+    for rid, rev in list(db["trials"].items()):
+        due = ((rev["status"] == "open" and rev["ends_at"] <= now) or
+               (rev["status"] == "closing" and now - rev.get("closing_at", 0) > 120))  # recover after a restart
+        if due:
+            start_trial_reveal(rid)
+
+async def maybe_open_trial_review(guild, info):
+    """Called when an event is concluded. Opens the sealed ballot if it was a trial host's trial event."""
+    host_id = info["host_id"]
+    st = trial_state(guild.id, host_id)
+    if not info.get("trial") or not st or st.get("status") != "trial":
+        return
+    ch = trial_channel_for(guild)
+    if not ch:
+        print("trial review skipped: no trial/stats channel configured")
+        return
+    now = int(time.time())
+    skip = {host_id, info.get("cohost_id")}
+    electorate = sorted({int(i) for i in list(info.get("participants", [])) + list(info.get("helpers", []))} - skip)
+    rev = {
+        "guild_id": guild.id, "channel_id": ch.id, "message_id": 0, "host_id": host_id,
+        "event_key": None, "event_name": info["display_name"],
+        "players": info.get("player_count", 0),
+        "hours": round(info.get("duration_seconds", 0) / 3600, 1),
+        "opened_at": now, "ends_at": now + TRIAL_VOTE_HOURS * 3600,
+        "status": "open", "electorate": electorate, "votes": {}, "verdict": None, "applied": False,
+    }
+    try:
+        msg = await ch.send(embed=trial_open_embed(rev), view=TrialVoteView())
+    except discord.HTTPException as e:
+        print("trial review post failed:", e)
+        return
+    rev["message_id"] = msg.id
+    db["trials"][str(msg.id)] = rev
+    set_trial_state(guild.id, host_id, status="review", review=msg.id, review_channel=ch.id)
+    save_db(db)
+
+async def apply_trial_verdict(guild, rev, actor):
+    """Staff pressed 'Make it official'. Returns a short note describing what happened."""
+    conf = get_config(guild.id)
+    host = guild.get_member(rev["host_id"])
+    trial_role = guild.get_role(conf.get("trial_role") or 0)
+    host_role = guild.get_role(conf.get("host_role") or 0)
+    verdict = rev["verdict"] or "undecided"
+    problems = []
+    now = int(time.time())
+
+    async def swap(add=None, remove=None):
+        if not host:
+            problems.append("They're no longer in the server, so no roles were changed.")
+            return
+        try:
+            if remove and remove in host.roles:
+                await host.remove_roles(remove, reason=f"Trial verdict by {actor}")
+            if add and add not in host.roles:
+                await host.add_roles(add, reason=f"Trial verdict by {actor}")
+        except discord.HTTPException:
+            problems.append("I couldn't change their roles. Check that my role is above theirs.")
+
+    if verdict == "promote":
+        if not host_role:
+            problems.append("No Host role is set in /setup, so none was given.")
+        await swap(add=host_role, remove=trial_role)
+        set_trial_state(guild.id, rev["host_id"], status="host", decided_at=now)
+        note = f"🎖️ <@{rev['host_id']}> is now a full host."
+    elif verdict == "demote":
+        await swap(remove=trial_role)
+        set_trial_state(guild.id, rev["host_id"], status="demoted", decided_at=now)
+        note = f"🧹 <@{rev['host_id']}> was swept and is no longer on trial."
+    else:
+        set_trial_state(guild.id, rev["host_id"], status="trial", review=None)
+        note = f"🔁 Trial extended. <@{rev['host_id']}>'s next event will be reviewed."
+    save_db(db)
+    return note + ("".join(f"\n⚠️ {p}" for p in problems))
+
+class TrialWhyModal(discord.ui.Modal):
+    def __init__(self, rev_id, choice, prev=None):
+        c = TRIAL_CHOICES[choice]
+        super().__init__(title=f"Why {c['label']}? ({c['meaning']})"[:45])
+        self.rev_id, self.choice = rev_id, choice
+        self.why = discord.ui.TextInput(
+            label=c["ask"], style=discord.TextStyle.paragraph, required=True,
+            min_length=TRIAL_REASON_MIN, max_length=400,
+            placeholder="Be honest and specific. Staff read every reason.",
+            default=prev["why"] if prev and prev.get("v") == choice else None)
+        self.add_item(self.why)
+
+    async def on_submit(self, interaction):
+        rev = db["trials"].get(self.rev_id)
+        if not rev or rev["status"] != "open":
+            await interaction.response.send_message("The ballot closed while you were writing.", ephemeral=True)
+            return
+        why = " ".join(self.why.value.split())
+        if len(why) < TRIAL_REASON_MIN:
+            await interaction.response.send_message("Give a real reason (a few words at least).", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        changed = uid in rev["votes"]
+        rev["votes"][uid] = {"v": self.choice, "why": why, "at": int(time.time())}
+        save_db(db)
+        c = TRIAL_CHOICES[self.choice]
+        emb = discord.Embed(color=c["color"],
+                            description=f"## 🔏 Ballot {'updated' if changed else 'sealed'}\n{DIV}\n"
+                                        f"{c['emoji']} **{c['label']}** · {c['meaning']}\n> {why}")
+        emb.set_footer(text="Anonymous to the public. Staff can read reasons. You can change this until the ballot closes.")
+        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await refresh_trial_message(rev, embed=trial_open_embed(rev))
+
+class TrialVoteView(GuardedView):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _vote(self, interaction, choice):
+        rev_id = str(interaction.message.id)
+        rev = db["trials"].get(rev_id)
+        if not rev:
+            await interaction.response.send_message("This review no longer exists.", ephemeral=True)
+            return
+        if rev["status"] != "open":
+            await interaction.response.send_message("The ballot is closed.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if uid in (rev["host_id"],):
+            await interaction.response.send_message("You can't vote on your own trial.", ephemeral=True)
+            return
+        if uid not in rev["electorate"] and not can_run_trials(interaction.user):
+            await interaction.response.send_message(
+                "Only players from the trial event (and staff) can vote on this one.", ephemeral=True)
+            return
+        await interaction.response.send_modal(TrialWhyModal(rev_id, choice, rev["votes"].get(str(uid))))
+
+    @discord.ui.button(label="Keep", emoji="✅", style=discord.ButtonStyle.success, custom_id="trial_keep")
+    async def keep(self, interaction, btn):
+        await self._vote(interaction, "keep")
+
+    @discord.ui.button(label="IDK", emoji="🤔", style=discord.ButtonStyle.secondary, custom_id="trial_idk")
+    async def idk(self, interaction, btn):
+        await self._vote(interaction, "idk")
+
+    @discord.ui.button(label="Sweep", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="trial_sweep")
+    async def sweep(self, interaction, btn):
+        await self._vote(interaction, "sweep")
+
+    @discord.ui.button(label="Seal & Reveal", emoji="🔓", style=discord.ButtonStyle.secondary, custom_id="trial_seal", row=1)
+    async def seal(self, interaction, btn):
+        if not can_run_trials(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+        rev_id = str(interaction.message.id)
+        rev = db["trials"].get(rev_id)
+        if not rev or rev["status"] != "open":
+            await interaction.response.send_message("This ballot is already closing or closed.", ephemeral=True)
+            return
+        await interaction.response.send_message("🔓 Unsealing the ballot now.", ephemeral=True)
+        start_trial_reveal(rev_id)
+
+class TrialVerdictView(GuardedView):
+    def __init__(self, verdict="undecided", applied=False):
+        super().__init__(timeout=None)
+        label, emoji = {"promote": ("Make it official", "🎖️"), "demote": ("Make it official", "🧹")}.get(
+            verdict, ("Extend trial", "🔁"))
+        self.official.label, self.official.emoji, self.official.disabled = label, emoji, applied
+
+    @discord.ui.button(label="Reasons", emoji="📜", style=discord.ButtonStyle.secondary, custom_id="trial_reasons")
+    async def reasons(self, interaction, btn):
+        rev = db["trials"].get(str(interaction.message.id))
+        if not rev:
+            await interaction.response.send_message("This review no longer exists.", ephemeral=True)
+            return
+        if not can_run_trials(interaction.user):
+            await interaction.response.send_message("Reasons are for staff only.", ephemeral=True)
+            return
+        pages = trial_reason_pages(rev)
+        if not pages:
+            await interaction.response.send_message("No votes were cast.", ephemeral=True)
+            return
+        embeds = [discord.Embed(description=text, color=c["color"]) for c, text in pages]
+        groups = [embeds[i:i + 3] for i in range(0, len(embeds), 3)]  # keeps each message under Discord's size limit
+        await interaction.response.send_message(embeds=groups[0], ephemeral=True)
+        for g in groups[1:]:
+            await interaction.followup.send(embeds=g, ephemeral=True)
+
+    @discord.ui.button(label="Make it official", emoji="🎖️", style=discord.ButtonStyle.success, custom_id="trial_official")
+    async def official(self, interaction, btn):
+        rev = db["trials"].get(str(interaction.message.id))
+        if not rev or rev["status"] != "closed":
+            await interaction.response.send_message("This review isn't finished yet.", ephemeral=True)
+            return
+        if not can_run_trials(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+        if rev.get("applied"):
+            await interaction.response.send_message("Already done.", ephemeral=True)
+            return
+        rev["applied"] = True  # set first so a double click can't run it twice
+        await interaction.response.defer(ephemeral=True)
+        note = await apply_trial_verdict(interaction.guild, rev, interaction.user)
+        save_db(db)
+        emb = interaction.message.embeds[0]
+        emb.add_field(name="📌 Made official", value=f"{note}\nby {interaction.user.mention} · <t:{int(time.time())}:R>", inline=False)
+        try:
+            await interaction.message.edit(embed=emb, view=TrialVerdictView(rev["verdict"], applied=True))
+        except discord.HTTPException as e:
+            print("trial verdict edit failed:", e)
+        await interaction.followup.send(note, ephemeral=True)
+
+trial_group = app_commands.Group(name="trial", description="Trial host system", guild_only=True)
+bot.tree.add_command(trial_group)
+
+@trial_group.command(name="appoint", description="Start a trial for a new host")
+async def trial_appoint(interaction: discord.Interaction, member: discord.Member):
+    if not can_run_trials(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    role = interaction.guild.get_role(get_config(interaction.guild_id).get("trial_role") or 0)
+    if not role:
+        await interaction.response.send_message("Set a **Trial Host role** in /setup first.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.response.send_message("Bots can't be hosts.", ephemeral=True)
+        return
+    cur = trial_state(interaction.guild_id, member.id)
+    if cur and cur.get("status") in ("trial", "review"):
+        await interaction.response.send_message(f"{member.mention} is already on trial.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await member.add_roles(role, reason=f"Trial started by {interaction.user}")
+    except discord.HTTPException:
+        await interaction.followup.send("I couldn't give them the role. Check that my role is above it.", ephemeral=True)
+        return
+    set_trial_state(interaction.guild_id, member.id, status="trial", since=int(time.time()),
+                    review=None, appointed_by=interaction.user.id)
+    save_db(db)
+    ch = trial_channel_for(interaction.guild)
+    if ch:
+        emb = discord.Embed(color=0x5865F2, description=(
+            f"# 🎓 A new trial begins\n### {member.mention}\n{DIV}\n"
+            f"Their first event will be judged by the people who play in it.\n"
+            f"✅ **Keep** · 🤔 **IDK** · 🧹 **Sweep**"))
+        emb.set_footer(text=BRAND)
+        try:
+            await ch.send(embed=emb)
+        except discord.HTTPException:
+            pass
+    await interaction.followup.send(f"🎓 {member.mention} is now on trial. Their next event will be a trial event.", ephemeral=True)
+
+@trial_group.command(name="status", description="See where a host is in their trial")
+async def trial_status(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    st = trial_state(interaction.guild_id, member.id)
+    if not st:
+        await interaction.response.send_message(f"{member.mention} has no trial on record.", ephemeral=True)
+        return
+    stage = {
+        "trial": "🎓 On trial. Their trial event hasn't ended yet.",
+        "review": "⚖️ Review in progress. The ballot is open.",
+        "decided": "🔒 The ballot closed. Staff haven't made it official yet.",
+        "host": "🎖️ Full host.",
+        "demoted": "🧹 Swept. No longer on trial.",
+    }.get(st.get("status"), "Unknown")
+    text = f"## {member.display_name}\n{stage}"
+    if st.get("review") and st.get("review_channel"):
+        text += f"\n[Jump to the review](https://discord.com/channels/{interaction.guild_id}/{st['review_channel']}/{st['review']})"
+    emb = discord.Embed(description=text, color=0x5865F2)
+    emb.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+# ==========================================
 # /setup: modern step-by-step dashboard
 # ==========================================
 SETUP_STEPS = [
     {"key": "host_role", "kind": "role", "icon": "🎤", "title": "Host role", "required": False,
      "desc": "Members with this role can create events and open the Host panel. Admins can always do both."},
+    {"key": "trial_role", "kind": "role", "icon": "🎓", "title": "Trial Host role", "required": False,
+     "desc": "Given to new hosts while they're on trial. They can host their trial event, then the players vote on whether they stay."},
     {"key": "event_role", "kind": "role", "icon": "🎟️", "title": "Event role", "required": False,
      "desc": "Given to players while they hold a spot, and removed when they leave or the event ends."},
     {"key": "superpower_role", "kind": "role", "icon": "⭐", "title": "VIP role", "required": False,
@@ -3251,6 +3715,8 @@ SETUP_STEPS = [
      "desc": "Swap requests are posted here so the other player can accept or decline."},
     {"key": "stats_channel", "kind": "channel", "icon": "📊", "title": "Stats channel", "required": True,
      "desc": "Event results and the rate-your-host button are posted here when an event is concluded."},
+    {"key": "trial_channel", "kind": "channel", "icon": "⚖️", "title": "Trial review channel", "required": False,
+     "desc": "Trial reviews (sealed ballots and verdicts) are posted here. If you skip it, they go to the stats channel."},
     {"key": "achievement_roles", "kind": "achievement", "icon": "🏆", "title": "Achievement roles", "required": False,
      "desc": "Create and sync every Host Assistant achievement role. Existing roles are reused, so running setup again will not duplicate them."},
 ]
@@ -3309,7 +3775,7 @@ def setup_checks(guild, conf):
             continue
         if st["kind"] == "role":
             r = guild.get_role(v)
-            if r and st["key"] in {"event_role", "achievement_roles"} and r >= me.top_role:
+            if r and st["key"] in {"event_role", "achievement_roles", "trial_role"} and r >= me.top_role:
                 out.append(f"⚠️ **{st['title']}** is above my role, so I may not be able to manage it")
         else:
             ch = guild.get_channel(v)
@@ -3568,6 +4034,11 @@ async def refresh_timers():
         except Exception as e:
             print("refresh_timers error:", e)
 
+    try:
+        await close_due_trials()
+    except Exception as e:
+        print("close_due_trials error:", e)
+
     # Housekeeping so these dicts don't grow forever.
     cutoff = time.time() - 3600
     for d in (user_cooldowns, swap_cooldowns):
@@ -3586,6 +4057,8 @@ async def setup_hook():
     global ai_worker_task
     bot.add_view(EventButtonsView())
     bot.add_view(EventLogView())
+    bot.add_view(TrialVoteView())
+    bot.add_view(TrialVerdictView())
     refresh_timers.start()
     ai_worker_task = asyncio.create_task(process_ai_queue())
 
@@ -3678,6 +4151,9 @@ async def create_ev(interaction: discord.Interaction, name: str, starts_in: str,
         "cancelled": False, "player_count": 0, "swaps_completed": 0, "waitlist_fills": 0,
         "helpers": [], "logs": []
     }
+
+    st = trial_state(interaction.guild_id, interaction.user.id)
+    db["events"][key]["trial"] = bool(st and st.get("status") == "trial")
 
     embs = build_embed(name, db["events"][key], interaction.guild)
     try:
