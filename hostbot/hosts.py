@@ -9,7 +9,8 @@ from discord import app_commands
 
 from hostbot.core import BOT_OWNER_IDS, _bg_tasks, bot, db, get_config, is_trusted, save_db
 from hostbot.shared import (
-    BRAND, DIV, GuardedView, add_footer_divider, is_authorized_manager, is_server_admin,
+    BRAND, DIV, GuardedView, add_footer_divider, event_in_guild, is_authorized_manager,
+    is_server_admin,
 )
 
 # ==========================================
@@ -498,6 +499,14 @@ def can_run_trials(member):
     return is_server_admin(member) or is_trusted(member)
 
 
+def can_review_trials(member):
+    """Admins, bot owners, trusted users and members with the Event Manager role."""
+    if can_run_trials(member):
+        return True
+    r_id = get_config(member.guild.id).get("event_manager_role")
+    return bool(r_id) and any(r.id == r_id for r in getattr(member, "roles", []))
+
+
 def trial_state(guild_id, host_id):
     return db["trial_hosts"].get(str(guild_id), {}).get(str(host_id))
 
@@ -779,15 +788,15 @@ async def close_due_trials():
 
 
 async def maybe_open_trial_review(guild, info):
-    """Called when an event ends. Opens the public feedback vote for a trial host."""
+    """Opens the public feedback vote for a trial host's event. Returns None on success, or a reason text."""
     host_id = info["host_id"]
     st = trial_state(guild.id, host_id)
     if not info.get("trial") or not st or st.get("status") != "trial":
-        return
+        return "That host isn't waiting for a trial review."
     ch = trial_channel_for(guild)
     if not ch:
         print("trial review skipped: no public trial review/stats channel configured")
-        return
+        return "No trial review or stats channel is set up. Set one in /setup first."
     now = int(time.time())
     skip = {host_id, info.get("cohost_id")}
     electorate = sorted({int(i) for i in list(info.get("participants", [])) + list(info.get("helpers", []))} - skip)
@@ -804,12 +813,13 @@ async def maybe_open_trial_review(guild, info):
         msg = await ch.send(embed=trial_open_embed(rev), view=TrialVoteView())
     except discord.HTTPException as e:
         print("trial review post failed:", e)
-        return
+        return "I couldn't post the vote there. Check my permissions in the review channel."
     rev["message_id"] = msg.id
     db["trials"][str(msg.id)] = rev
     set_trial_state(guild.id, host_id, status="review", review=msg.id, review_channel=ch.id)
     save_db(db)
     await spawn_trial_log(guild, rev)
+    return None
 
 class TrialWhyModal(discord.ui.Modal):
     def __init__(self, rev_id, choice, prev=None):
@@ -928,26 +938,36 @@ async def trial_appoint(interaction: discord.Interaction, member: discord.Member
             await ch.send(embed=emb)
         except discord.HTTPException:
             pass
-    await interaction.followup.send(f"🎓 {member.mention} is now on trial. Their next event will be a trial event.", ephemeral=True)
+    await interaction.followup.send(f"🎓 {member.mention} is now on trial. Their next event will be a trial event. When it ends, use `/trial review` to open the vote.", ephemeral=True)
 
-@trial_group.command(name="status", description="See where a host is in their trial")
-async def trial_status(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    st = trial_state(interaction.guild_id, member.id)
-    if not st:
-        await interaction.response.send_message(f"{member.mention} has no trial on record.", ephemeral=True)
+
+@trial_group.command(name="review", description="Open the vote on a trial host's latest event")
+@app_commands.describe(host="The trial host whose event just ended")
+async def trial_review(interaction: discord.Interaction, host: discord.Member):
+    if not can_review_trials(interaction.user):
+        await interaction.response.send_message("Admins and Event Managers only.", ephemeral=True)
         return
-    stage = {
-        "trial": "🎓 On trial. Their trial event hasn't ended yet.",
-        "review": "⚖️ Trial review in progress, or awaiting the team's manual decision after voting closes.",
-        "decided": "🔒 The ballot closed. The team decides the next step manually.",
-        "host": "🎖️ Full host.",
-        "demoted": "🧹 Swept. No longer on trial.",
-    }.get(st.get("status"), "Unknown")
-    text = f"## {member.display_name}\n{stage}"
-    if st.get("review") and st.get("review_channel"):
-        text += f"\n[Jump to the review](https://discord.com/channels/{interaction.guild_id}/{st['review_channel']}/{st['review']})"
-    emb = discord.Embed(description=text, color=0x5865F2)
-    add_footer_divider(emb)
-    emb.set_footer(text=BRAND)
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    st = trial_state(interaction.guild_id, host.id)
+    if st and st.get("status") == "review" and st.get("review") and st.get("review_channel"):
+        link = f"https://discord.com/channels/{interaction.guild_id}/{st['review_channel']}/{st['review']}"
+        await interaction.response.send_message(f"{host.mention} already has a vote open: {link}", ephemeral=True)
+        return
+    if not st or st.get("status") != "trial":
+        await interaction.response.send_message(f"{host.mention} isn't on trial right now.", ephemeral=True)
+        return
+    evs = [e for e in db["events"].values()
+           if event_in_guild(e, interaction.guild_id) and e.get("host_id") == host.id
+           and e.get("trial") and e.get("concluded") and not e.get("cancelled")]
+    if not evs:
+        await interaction.response.send_message(
+            f"{host.mention} hasn't finished a trial event yet. They need to press Conclude Event first.",
+            ephemeral=True)
+        return
+    info = max(evs, key=lambda e: e.get("concluded_at", 0))
+    await interaction.response.defer(ephemeral=True)
+    err = await maybe_open_trial_review(interaction.guild, info)
+    if err:
+        await interaction.followup.send(f"❌ {err}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"⚖️ Vote opened for {host.mention}'s event **{info['display_name']}**.", ephemeral=True)
