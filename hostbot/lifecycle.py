@@ -8,7 +8,7 @@ from discord.ext import tasks
 
 from hostbot.ai import process_ai_queue
 from hostbot.core import (
-    _bg_tasks, ai_history, bot, db, enforce_existing_guilds_safely,
+    _bg_tasks, ai_history, bot, db, enforce_existing_guilds_safely, get_config, save_db,
     schedule_whitelist_enforcement, swap_cooldowns, user_cooldowns,
 )
 from hostbot.events import EventButtonsView
@@ -21,6 +21,32 @@ from hostbot import core
 event_phase = {}
 event_refresh_fails = {}
 
+async def clear_participant_roles(info):
+    """After the rating hour: take the Event Participant role from the people who played,
+    unless they are in another event that is still running."""
+    guild = bot.get_guild(int(info.get("guild_id") or 0))
+    if not guild:
+        return
+    r_id = get_config(guild.id).get("event_role")
+    role = guild.get_role(r_id) if r_id else None
+    if not role:
+        return
+    still_playing = set()
+    for e in db["events"].values():
+        if e is not info and not e.get("concluded") and e.get("guild_id") == guild.id:
+            still_playing |= {int(u["discord_id"]) for u in e.get("reservations", {}).values()}
+    for uid in info.get("participants", []):
+        if int(uid) in still_playing:
+            continue
+        mem = guild.get_member(int(uid))
+        if mem and role in mem.roles:
+            try:
+                await mem.remove_roles(role, reason="Rating window over")
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.3)
+
+
 @tasks.loop(seconds=30)
 async def refresh_timers():
     now = int(time.time())
@@ -28,6 +54,11 @@ async def refresh_timers():
     for key, info in list(db["events"].items()):
         try:
             if info.get("concluded"):
+                # Events concluded after this update carry role_cleared=False until the hour is up.
+                if info.get("role_cleared") is False and now >= info.get("role_clear_at", 0):
+                    await clear_participant_roles(info)
+                    info["role_cleared"] = True
+                    save_db(db)
                 event_phase.pop(key, None)
                 event_refresh_fails.pop(key, None)
                 continue
