@@ -10,7 +10,7 @@ from hostbot.core import (
     save_db, swap_cooldowns,
 )
 from hostbot.hosts import (
-    check_and_announce_achievements, check_host, maybe_open_trial_review, trial_state,
+    check_and_announce_achievements, check_host, trial_state,
 )
 from hostbot.shared import (
     DIV, GuardedView, add_event_role, build_embed, event_in_guild, event_log,
@@ -397,26 +397,6 @@ class HostActionsView(GuardedView):
         await interaction.response.send_message("Admins or managers only.", ephemeral=True)
         return False
 
-    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=1)
-    async def clear_roles(self, interaction, btn):
-        await interaction.response.defer(ephemeral=True)
-        r_id = get_config(interaction.guild_id).get("event_role")
-        role = interaction.guild.get_role(r_id) if r_id else None
-
-        if not role:
-            await interaction.followup.send("Event role not setup.", ephemeral=True)
-            return
-
-        count = 0
-        for mem in list(role.members):
-            try: 
-                await mem.remove_roles(role)
-                count += 1
-            except discord.HTTPException: 
-                pass
-
-        await interaction.followup.send(f"Removed role from {count} members.", ephemeral=True)
-
     @discord.ui.button(label="Conclude Event", style=discord.ButtonStyle.danger, row=1)
     async def conclude(self, interaction, btn):
         await interaction.response.defer(ephemeral=True)
@@ -436,12 +416,10 @@ class HostActionsView(GuardedView):
         # Remember who played, so only they can rate the host.
         info["participants"] = [u["discord_id"] for u in info["reservations"].values()]
 
-        r_id = get_config(interaction.guild_id).get("event_role")
-        role = interaction.guild.get_role(r_id) if r_id else None
-        if role:
-            for mem in list(role.members):
-                try: await mem.remove_roles(role)
-                except discord.HTTPException: pass
+        # The Event Participant role stays for the 1-hour rating window; the background timer
+        # in lifecycle.py removes it afterwards.
+        info["role_clear_at"] = now + 3600
+        info["role_cleared"] = False
 
         await refresh_event_message(info, interaction.guild, remove_view=True)
 
@@ -479,7 +457,6 @@ class HostActionsView(GuardedView):
                 print("stats post failed:", e)
 
         await check_and_announce_achievements(interaction.guild, info["host_id"], s_ch)
-        await maybe_open_trial_review(interaction.guild, info)
         await interaction.followup.send("Event concluded and stats posted.", ephemeral=True)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> concluded the event · {p_count} players · {dur}h live")
         if info.get("helpers"):
