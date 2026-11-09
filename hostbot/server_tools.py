@@ -28,7 +28,7 @@ SETUP_STEPS = [
     {"key": "double_booster_role", "kind": "role", "icon": "🖼️", "title": "Double Booster role", "required": False,
      "desc": "If your server has a Double Booster role, set it here. Only members with this role can send images for Host Assistant to analyze."},
     {"key": "staff_role", "kind": "role", "icon": "🛡️", "title": "Staff role", "required": False,
-     "desc": "Members with this role can use normal AI chat and image vision, plus timeout/mute moderation. They cannot use other AI admin actions. Server admins and bot owners are always allowed."},
+     "desc": "Members with this role can use normal AI chat and image vision. AI moderation (timeouts, roles and so on) only works if they also have the matching Discord permission. Server admins and bot owners are always allowed."},
     {"key": "event_manager_role", "kind": "role", "icon": "🗂️", "title": "Event Manager role", "required": False,
      "desc": "Optional role setting for your server's Event Managers. Trial outcomes are decided manually by your team; the bot only records votes."},
     {"key": "log_channel", "kind": "channel", "icon": "📜", "title": "Event log channel", "required": True,
@@ -244,7 +244,7 @@ class SetupRolePick(discord.ui.RoleSelect):
         elif self.st["key"] == "double_booster_role":
             extra = "🖼️ Image analysis is now restricted to members with this role."
         elif self.st["key"] == "staff_role":
-            extra = "🛡️ Staff can use AI chat + image vision and timeout/mute moderation. Other AI admin actions stay admin/owner-only."
+            extra = "🛡️ Staff can use AI chat + image vision. AI moderation needs the matching Discord permission."
         elif self.st["key"] == "superpower_role":
             extra = "🤖 AI access is now available to this VIP role."
         await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
