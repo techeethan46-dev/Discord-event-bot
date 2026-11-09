@@ -17,8 +17,8 @@ from hostbot.core import (
     AI_COOLDOWN, ALLOWED_USER_IDS, BOT_OWNER_IDS, GIF_ADDON, GIF_CHANCE, GIF_TAG_RE, GIPHY_KEY,
     GROQ_MAX_IMAGE_CHARS, GROQ_VISION_MODELS, MAX_WORDS, OPENROUTER_FREE_MODELS,
     OPENROUTER_VISION_MODELS, PERSONA_BESTIE, PERSONA_ROAST, SOFT_WORDS, TYPING_DELAY,
-    _bg_tasks, _queue_notices, ai_history, ai_queue, bot, get_config, groq_client, has_role_id,
-    is_disabled_guild, is_trusted, is_whitelisted_guild, openrouter_client, user_cooldowns,
+    _bg_tasks, _queue_notices, ai_history, ai_queue, bot, db, get_config, groq_client, has_role_id,
+    is_disabled_guild, is_trusted, is_whitelisted_guild, openrouter_client, save_db, user_cooldowns,
 )
 from hostbot.shared import (
     DIV, GuardedView, add_footer_divider, dm_owners, log_action, safe_reply, send_notice,
@@ -127,28 +127,39 @@ class AdminCtx:
         self.reason = f"Requested by {msg.author} via Host Assistant"
 
 def has_perm(member, perm):
-    # Full AI admin actions are reserved for the bot owner and real server admins.
+    """Bot owners and real admins can do anything. Everyone else needs the matching
+    Discord permission themselves (Moderate Members for timeouts, Manage Roles for roles...)."""
     if member is None:
         return False
     if member.id in BOT_OWNER_IDS:
         return True
     gp = getattr(member, "guild_permissions", None)
-    return bool(gp and gp.administrator)
+    return bool(gp and (gp.administrator or getattr(gp, perm, False)))
 
-def can_staff_timeout(member):
-    """Staff may use the AI only for timeout/untimeout moderation."""
-    if member is None:
-        return False
-    if member.id in BOT_OWNER_IDS or member.id in ALLOWED_USER_IDS:
-        return True
-    gp = getattr(member, "guild_permissions", None)
-    if gp and gp.administrator:
-        return True
-    guild = getattr(member, "guild", None)
-    if guild:
-        staff_role = get_config(guild.id).get("staff_role")
-        return has_role_id(member, staff_role)
-    return False
+# A non-admin who asks for a mute without the permission gets muted instead.
+MUTE_STRIKE_RESET_HOURS = 24          # strikes reset after this long without another attempt
+MUTE_STRIKE_MAX_MINUTES = 40320       # Discord's 28-day timeout limit
+
+async def punish_mute_attempt(ctx):
+    """1 min the first time, then 2, 4, 8... doubling with every attempt."""
+    g, m = ctx.guild, ctx.author
+    strikes = db.setdefault("mute_strikes", {}).setdefault(str(g.id), {})
+    rec = strikes.get(str(m.id)) or {"count": 0, "last": 0}
+    now = time.time()
+    if now - rec.get("last", 0) > MUTE_STRIKE_RESET_HOURS * 3600:
+        rec["count"] = 0
+    rec["count"] += 1
+    rec["last"] = int(now)
+    strikes[str(m.id)] = rec
+    save_db(db)
+    mins = min(MUTE_STRIKE_MAX_MINUTES, 2 ** (rec["count"] - 1))
+    try:
+        await m.timeout(datetime.timedelta(minutes=mins),
+                        reason="Tried to mute someone without permission (via Host Assistant)")
+    except discord.HTTPException:
+        return "❌ You don't have permission to mute people. (I couldn't mute you back.)"
+    return (f"🔇 You don't have permission to mute people, so I muted **you** for {mins} min. "
+            "Try it again and it gets longer.")
 
 def is_staff(member):
     """Server admins, trusted users, or the configured Staff role."""
@@ -356,9 +367,20 @@ def check_member(ctx, m):
 def pick_channel(ctx, a, kinds=None, key="channel"):
     ref = a.get(key)
     if ref:
-        return find_channel(ctx.guild, ref, kinds)
-    ch = ctx.msg.channel
-    return ch if (kinds is None or isinstance(ch, kinds)) else None
+        ch = find_channel(ctx.guild, ref, kinds)
+    else:
+        ch = ctx.msg.channel
+        ch = ch if (kinds is None or isinstance(ch, kinds)) else None
+    # Non-admins can't use me on channels they can't even see.
+    if ch is not None and not _author_has_in(ctx, ch, "view_channel"):
+        return None
+    return ch
+
+def _author_has_in(ctx, ch, perm):
+    if ctx.author.id in BOT_OWNER_IDS:
+        return True
+    p = ch.permissions_for(ctx.author)
+    return bool(p.administrator or getattr(p, perm, False))
 
 TEXT_KINDS = (discord.TextChannel,)
 VOICE_KINDS = (discord.VoiceChannel, discord.StageChannel)
@@ -715,6 +737,8 @@ async def act_purge(ctx, a):
     ch = pick_channel(ctx, a, TEXT_KINDS)
     if not ch:
         return False, "Couldn't find that text channel."
+    if not _author_has_in(ctx, ch, "manage_messages"):
+        return False, "You need **manage messages** in that channel."
     n = max(1, min(100, _to_int(a.get("count"), 10)))
     target = find_member(ctx.guild, a.get("member")) if a.get("member") else None
     before = ctx.msg if ch.id == ctx.msg.channel.id else None
@@ -728,6 +752,8 @@ async def act_send_message(ctx, a):
         return False, "Couldn't find that text channel."
     if not text:
         return False, "Nothing to send."
+    if not _author_has_in(ctx, ch, "send_messages"):
+        return False, "You can't send messages in that channel yourself."
     await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
     return True, f"Sent your message in {ch.mention}"
 
@@ -954,9 +980,27 @@ async def run_admin_flow(msg, txt):
             await ai_queue.put((msg, txt, uid))
             return
 
-        if any(needs_confirm(a) for a in plan):
+        ctx = AdminCtx(msg)
+        lines = []
+        runnable = []
+        for a in plan:
+            name = a["action"].strip().lower()
+            if name not in ADMIN_ACTIONS:
+                lines.append(f"❌ I can't do `{name}`.")
+                continue
+            perm = PERM_FOR.get(name)
+            if perm and not has_perm(msg.author, perm):
+                if name == "timeout":
+                    lines.append(await punish_mute_attempt(ctx))
+                else:
+                    lines.append(f"❌ You need the **{perm.replace('_', ' ')}** permission for that.")
+                continue
+            runnable.append((name, a))
+
+        prompt = None
+        if any(needs_confirm(a) for _, a in runnable):
             emb = discord.Embed(description="## ⚠️ Confirm these actions\n" + DIV + "\n" +
-                                "\n".join(f"• {summarize(a)}" for a in plan), color=0xF1C40F)
+                                "\n".join(f"• {summarize(a)}" for _, a in runnable), color=0xF1C40F)
             add_footer_divider(emb)
             emb.set_footer(text="Confirm within 30 seconds")
             view = ConfirmView(uid)
@@ -975,31 +1019,16 @@ async def run_admin_flow(msg, txt):
                 except discord.HTTPException:
                     pass
                 return
+            emb.description = emb.description.replace("## ⚠️ Confirm these actions", "## ⏳ Working on it")
+            emb.set_footer(text="Running...")
             try:
-                await prompt.edit(view=None)
+                await prompt.edit(embed=emb, view=None)
             except discord.HTTPException:
                 pass
 
-        ctx = AdminCtx(msg)
-        lines, ok_count = [], 0
-        owner_or_admin = (msg.author.id in BOT_OWNER_IDS or
-                          bool(getattr(msg.author.guild_permissions, "administrator", False)))
-        staff_only = not owner_or_admin and can_staff_timeout(msg.author)
-        for a in plan:
-            name = a["action"].strip().lower()
-            if staff_only and name not in {"timeout", "untimeout"}:
-                lines.append(f"❌ Staff can only timeout or untimeout members. `{name}` is not allowed.")
-                continue
-            handler = ADMIN_ACTIONS.get(name)
-            if not handler:
-                lines.append(f"❌ I can't do `{name}`.")
-                continue
-            perm = PERM_FOR.get(name)
-            if perm and not has_perm(msg.author, perm):
-                # Staff timeout/untimeout is intentionally allowed through the role gate.
-                if not (staff_only and name in {"timeout", "untimeout"}):
-                    lines.append(f"❌ You need the **{perm.replace('_', ' ')}** permission for that.")
-                    continue
+        ok_count = 0
+        for name, a in runnable:
+            handler = ADMIN_ACTIONS[name]
             try:
                 ok, text = await handler(ctx, a)
             except discord.Forbidden:
@@ -1019,12 +1048,19 @@ async def run_admin_flow(msg, txt):
             title, color = "❌ Couldn't do that", 0xE74C3C
         else:
             title, color = "⚠️ Partly done", 0xE67E22
-        emb = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
-        add_footer_divider(emb)
-        emb.set_footer(text=f"Requested by {msg.author.display_name}")
-        await safe_reply(msg, embed=emb)
+        res = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
+        add_footer_divider(res)
+        res.set_footer(text=f"Requested by {msg.author.display_name}")
+        if prompt is not None:
+            # Update the confirmation message in place instead of posting a new one.
+            try:
+                await prompt.edit(embed=res, view=None)
+            except discord.HTTPException:
+                await safe_reply(msg, embed=res)
+        else:
+            await safe_reply(msg, embed=res)
 
-        if ok_count:
+        if ok_count or any(l.startswith("🔇") for l in lines):
             await log_action(msg.guild, "AI Admin Action",
                              f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500],
                              color=0xE74C3C, channel_key="ai_log_channel")
@@ -1350,18 +1386,13 @@ async def handle_ai_trigger(msg):
 
     uid = msg.author.id
 
-    # Only bot owners and real Discord administrators can use the full AI admin engine.
-    # Staff can still use normal AI chat and image vision, but only timeout/untimeout
-    # requests are allowed through the moderation path.
+    # Everyone who passed the AI-access check above can ask for admin actions, but each action
+    # needs the matching Discord permission (admins and bot owners can do everything).
     if msg.guild and looks_like_admin_request(msg, txt):
-        is_owner_or_admin = (msg.author.id in BOT_OWNER_IDS or
-                             bool(getattr(msg.author.guild_permissions, "administrator", False)))
-        if is_owner_or_admin or can_staff_timeout(msg.author):
-            task = asyncio.create_task(run_admin_flow(msg, txt))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
-            return
-        # anyone else who merely sounds like an admin request falls through to normal chat
+        task = asyncio.create_task(run_admin_flow(msg, txt))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return
 
     now = time.time()
 
