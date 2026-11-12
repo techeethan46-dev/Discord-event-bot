@@ -739,10 +739,21 @@ async def act_purge(ctx, a):
         return False, "Couldn't find that text channel."
     if not _author_has_in(ctx, ch, "manage_messages"):
         return False, "You need **manage messages** in that channel."
+    me = ch.permissions_for(ctx.guild.me)
+    if not (me.manage_messages and me.read_message_history):
+        return False, f"I need **Manage Messages** and **Read Message History** in {ch.mention}."
     n = max(1, min(100, _to_int(a.get("count"), 10)))
     target = find_member(ctx.guild, a.get("member")) if a.get("member") else None
-    before = ctx.msg if ch.id == ctx.msg.channel.id else None
-    deleted = await ch.purge(limit=n, before=before, check=(lambda m: m.author.id == target.id) if target else None)
+    before = discord.Object(id=ctx.msg.id) if ch.id == ctx.msg.channel.id else None
+    check = (lambda m: m.author.id == target.id) if target else (lambda m: True)
+    try:
+        deleted = await ch.purge(limit=n, before=before, check=check)
+    except (discord.Forbidden, discord.HTTPException):
+        raise
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        await dm_owners(f"⚠️ **Purge failed**\nServer: {ctx.guild.name}\nError: `{type(e).__name__}: {str(e)[:500]}`", key="purge_fail")
+        return False, "Something broke on that one."
     return True, f"Deleted {len(deleted)} message(s) in {ch.mention}"
 
 async def act_send_message(ctx, a):
@@ -1037,8 +1048,10 @@ async def run_admin_flow(msg, txt):
                 print(f"admin action {name} failed:", e)
                 ok, text = False, "Discord rejected that request."
             except Exception as e:
-                print(f"admin action {name} crashed:", e)
+                import traceback; traceback.print_exc()
+                print(f"admin action {name} crashed:", repr(e))
                 ok, text = False, "Something broke on that one."
+                await dm_owners(f"⚠️ **AI admin action `{name}` crashed**\nServer: {msg.guild.name}\nError: `{type(e).__name__}: {str(e)[:500]}`", key="admin_action_crash")
             lines.append(f"{'✅' if ok else '❌'} {text}")
             ok_count += 1 if ok else 0
 
