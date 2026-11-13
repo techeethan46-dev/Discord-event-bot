@@ -320,7 +320,11 @@ def build_host_profile_embed(guild, member):
     if member.display_avatar:
         embed.set_thumbnail(url=member.display_avatar.url)
 
-    embed.add_field(name="📅 Events Hosted", value=f"**{total_events:,}**", inline=True)
+    cohosted = sum(1 for e in db["events"].values()
+                   if e.get("guild_id") == guild.id and e.get("cohost_id") == member.id
+                   and e.get("concluded") and not e.get("cancelled"))
+    embed.add_field(name="📅 Events Hosted",
+                    value=f"**{total_events:,}**" + (f"\n+ {cohosted} co-hosted" if cohosted else ""), inline=True)
     embed.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
     embed.add_field(name="⭐ Average Rating", value=f"**{average_rating:.2f}/5**" if ratings else "**No ratings yet**", inline=True)
     embed.add_field(

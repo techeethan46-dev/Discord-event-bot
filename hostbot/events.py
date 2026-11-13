@@ -1,4 +1,5 @@
-"""Event features: buttons, claim/swap/rate modals, host panel, /event, /set_superpowers, /blacklist, /trust, /trusted_list."""
+"""Event features: buttons, claim/swap/rate modals, host panel, /event, /set_superpowers, /cohost, /edit_event,
+/blacklist add/remove/list, /trust, /trusted_list."""
 
 import difflib
 import discord
@@ -13,8 +14,8 @@ from hostbot.hosts import (
     check_and_announce_achievements, check_host, trial_state,
 )
 from hostbot.shared import (
-    DIV, GuardedView, add_event_role, build_embed, event_in_guild, event_log,
-    find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip,
+    BRAND, DIV, GuardedView, add_event_role, add_footer_divider, build_embed, event_in_guild, event_log,
+    find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip, log_action,
     new_event_key, parse_time, process_waitlist, refresh_event_message, remove_event_role,
 )
 
@@ -714,26 +715,273 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
     await refresh_event_message(info, interaction.guild)
     await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set superpowers: {', '.join(sps)}")
 
-@bot.tree.command(name="blacklist", description="Blacklist user")
+# ==========================================
+# /cohost and /edit_event
+# ==========================================
+@bot.tree.command(name="cohost", description="Set or remove the co-host of an event")
 @app_commands.guild_only()
-async def blacklist(interaction: discord.Interaction, user: discord.Member):
+@app_commands.autocomplete(event_name=ev_autocomplete)
+@app_commands.describe(event_name="The event", member="The co-host (leave empty to remove the current one)")
+async def cohost_cmd(interaction: discord.Interaction, event_name: str, member: discord.Member = None):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    key, info = find_active_event(event_name, interaction.guild_id)
+    if not info:
+        await interaction.response.send_message("Event not found.", ephemeral=True)
+        return
+    if member and member.bot:
+        await interaction.response.send_message("Bots can't co-host.", ephemeral=True)
+        return
+    if member and member.id == info["host_id"]:
+        await interaction.response.send_message("That's already the host.", ephemeral=True)
+        return
+    if member:
+        info["cohost_id"] = member.id
+        text = f"{member.mention} is now co-hosting **{info['display_name']}**."
+        log = f"<@{interaction.user.id}> set <@{member.id}> as co-host"
+    else:
+        if not info.get("cohost_id"):
+            await interaction.response.send_message("This event has no co-host.", ephemeral=True)
+            return
+        old = info.pop("cohost_id")
+        text = f"Removed the co-host from **{info['display_name']}**."
+        log = f"<@{interaction.user.id}> removed <@{old}> as co-host"
+    save_db(db)
+    await interaction.response.send_message(text, ephemeral=True)
+    await refresh_event_message(info, interaction.guild)
+    await event_log(interaction.guild, info, "host", log)
+
+
+@bot.tree.command(name="edit_event", description="Change an event's name, times or player limit")
+@app_commands.guild_only()
+@app_commands.autocomplete(event_name=ev_autocomplete)
+@app_commands.describe(
+    event_name="The event to edit",
+    new_name="New name",
+    starts_in="When reservations open, counted from now: 10m, 1h30m, now (the length stays the same)",
+    duration="How long reservations stay open: 30m, 1h",
+    max_players="New player limit (0 = no limit)",
+)
+async def edit_event_cmd(interaction: discord.Interaction, event_name: str, new_name: str = None,
+                         starts_in: str = None, duration: str = None, max_players: int = None):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    key, info = find_active_event(event_name, interaction.guild_id)
+    if not info:
+        await interaction.response.send_message("Event not found.", ephemeral=True)
+        return
+    if new_name is None and starts_in is None and duration is None and max_players is None:
+        await interaction.response.send_message("Tell me at least one thing to change.", ephemeral=True)
+        return
+
+    changes = []
+    if new_name is not None:
+        new_name = " ".join(new_name.split())[:100]
+        if not new_name:
+            await interaction.response.send_message("The new name can't be empty.", ephemeral=True)
+            return
+        _, other = find_active_event(new_name, interaction.guild_id)
+        if other and other is not info:
+            await interaction.response.send_message("An active event with that name already exists.", ephemeral=True)
+            return
+
+    start, end = info["start_time"], info["end_time"]
+    if starts_in is not None or duration is not None:
+        s_off = parse_time(starts_in) if starts_in is not None else None
+        d_sec = parse_time(duration) if duration is not None else None
+        if (starts_in is not None and s_off is None) or (duration is not None and d_sec is None):
+            await interaction.response.send_message(
+                "I couldn't read that time. Use things like `10m`, `1h30m`, `2d` (or `now` for the start).", ephemeral=True)
+            return
+        length = end - start
+        if s_off is not None:
+            start = int(time.time()) + s_off
+        if d_sec is not None:
+            length = d_sec if d_sec > 0 else 1800
+        end = start + length
+        if end <= time.time():
+            await interaction.response.send_message("That would end the event in the past.", ephemeral=True)
+            return
+
+    if new_name is not None and new_name != info["display_name"]:
+        changes.append(f"name **{info['display_name']}** → **{new_name}**")
+        info["display_name"] = new_name
+    if start != info["start_time"]:
+        changes.append(f"opens <t:{start}:f>")
+        info["start_time"] = start
+    if end != info["end_time"]:
+        changes.append(f"closes <t:{end}:f>")
+        info["end_time"] = end
+        info.pop("reminded", None)  # the reminder follows the new time
+    if max_players is not None and max(0, max_players) != info.get("max_players", 0):
+        changes.append(f"max players **{max(0, max_players) or 'no limit'}**")
+        info["max_players"] = max(0, max_players)
+
+    if not changes:
+        await interaction.response.send_message("Nothing changed, those are already the event's settings.", ephemeral=True)
+        return
+    save_db(db)
+    await interaction.response.send_message("✏️ Updated: " + ", ".join(changes), ephemeral=True)
+
+    # More room now? Move people up from the waitlist.
+    ch = bot.get_channel(info["channel_id"])
+    cap = info.get("max_players", 0)
+    while info.get("waitlist") and (cap == 0 or len(info["reservations"]) < cap):
+        before = len(info["waitlist"])
+        await process_waitlist(info, "", interaction.guild, ch)
+        if len(info["waitlist"]) == before:
+            break
+    save_db(db)
+    await refresh_event_message(info, interaction.guild)
+    await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> edited the event: " + ", ".join(changes))
+    if cap and len(info["reservations"]) > cap:
+        await interaction.followup.send(
+            f"Heads up: {len(info['reservations'])} people already have spots, which is more than the new limit of {cap}. "
+            "Nobody was removed; new players just can't claim until it drops below the limit.", ephemeral=True)
+
+
+# ==========================================
+# /blacklist add · remove · list
+# ==========================================
+def blacklist_info(guild_id):
+    return db.setdefault("blacklist_info", {}).setdefault(str(guild_id), {})
+
+
+def unblacklist(guild_id, user_id):
+    lst = db["blacklists"].get(str(guild_id), [])
+    if user_id in lst:
+        lst.remove(user_id)
+    blacklist_info(guild_id).pop(str(user_id), None)
+
+
+async def remove_from_active_events(guild, user_id):
+    """A newly blacklisted player loses their spots and waitlist places in running events."""
+    removed = []
+    for info in db["events"].values():
+        if info.get("concluded") or info.get("guild_id") != guild.id:
+            continue
+        changed = False
+        for country, u in list(info.get("reservations", {}).items()):
+            if u["discord_id"] == user_id:
+                del info["reservations"][country]
+                changed = True
+                ch = bot.get_channel(info["channel_id"])
+                await process_waitlist(info, country, guild, ch)
+        wait = info.get("waitlist", [])
+        if any(w["discord_id"] == user_id for w in wait):
+            info["waitlist"] = [w for w in wait if w["discord_id"] != user_id]
+            changed = True
+        if changed:
+            removed.append(info)
+    if removed:
+        await remove_event_role(guild, user_id)
+        save_db(db)
+        for info in removed:
+            await refresh_event_message(info, guild)
+            await event_log(guild, info, "host", f"<@{user_id}> was removed (blacklisted)")
+    return removed
+
+
+blacklist_group = app_commands.Group(name="blacklist", description="Keep players out of events", guild_only=True)
+bot.tree.add_command(blacklist_group)
+
+
+@blacklist_group.command(name="add", description="Blacklist a player from events")
+@app_commands.describe(user="Who to blacklist", reason="Why (shown in the list and the log)",
+                       duration="How long, like 3d or 12h (leave empty for permanent)")
+async def blacklist_add(interaction: discord.Interaction, user: discord.Member, reason: str = None, duration: str = None):
     if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
+    if user.bot:
+        await interaction.response.send_message("Bots don't join events.", ephemeral=True)
+        return
+    until = None
+    if duration:
+        secs = parse_time(duration)
+        if not secs:
+            await interaction.response.send_message("I couldn't read that duration. Use things like `12h`, `3d`, `1d12h`.", ephemeral=True)
+            return
+        until = int(time.time()) + secs
+    reason = (reason or "").strip()[:200] or None
 
-    gid = str(interaction.guild_id)
-    if gid not in db["blacklists"]: 
-        db["blacklists"][gid] = []
-
-    if user.id in db["blacklists"][gid]:
-        db["blacklists"][gid].remove(user.id)
-        msg = f"Unblacklisted {user.mention}."
-    else:
-        db["blacklists"][gid].append(user.id)
-        msg = f"Blacklisted {user.mention}."
-
+    lst = db["blacklists"].setdefault(str(interaction.guild_id), [])
+    updating = user.id in lst
+    if not updating:
+        lst.append(user.id)
+    blacklist_info(interaction.guild_id)[str(user.id)] = {
+        "reason": reason, "by": interaction.user.id, "at": int(time.time()), "until": until}
     save_db(db)
-    await interaction.response.send_message(msg, ephemeral=True)
+
+    length = f"until <t:{until}:f> (<t:{until}:R>)" if until else "permanently"
+    await interaction.response.send_message(
+        f"⛔ {user.mention} is {'now ' if not updating else 'still '}blacklisted {length}."
+        + (f"\n**Reason:** {reason}" if reason else ""), ephemeral=True)
+    removed = await remove_from_active_events(interaction.guild, user.id)
+    if removed:
+        await interaction.followup.send(
+            "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
+    await log_action(interaction.guild, "Player Blacklisted",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Length:** {length}"
+                     + (f"\n**Reason:** {reason}" if reason else ""), color=0xE74C3C)
+
+
+@blacklist_group.command(name="remove", description="Take a player off the blacklist")
+async def blacklist_remove(interaction: discord.Interaction, user: discord.User):
+    if not is_server_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if user.id not in db["blacklists"].get(str(interaction.guild_id), []):
+        await interaction.response.send_message(f"{user.mention} isn't blacklisted.", ephemeral=True)
+        return
+    unblacklist(interaction.guild_id, user.id)
+    save_db(db)
+    await interaction.response.send_message(f"✅ {user.mention} can join events again.", ephemeral=True)
+    await log_action(interaction.guild, "Player Unblacklisted",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}", color=0x2ECC71)
+
+
+@blacklist_group.command(name="list", description="See who is blacklisted and why")
+async def blacklist_list(interaction: discord.Interaction):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    ids = db["blacklists"].get(str(interaction.guild_id), [])
+    meta = blacklist_info(interaction.guild_id)
+    lines = []
+    for uid in ids:
+        m = meta.get(str(uid), {})
+        until = m.get("until")
+        line = f"• <@{uid}> · " + (f"ends <t:{until}:R>" if until else "permanent")
+        if m.get("reason"):
+            line += f"\n  ↳ {m['reason']}"
+        if m.get("by"):
+            line += f"\n  ↳ by <@{m['by']}> <t:{m.get('at', 0)}:R>"
+        lines.append(line)
+    body = "\n".join(lines) if lines else "*Nobody is blacklisted.*"
+    if len(body) > 3800:
+        body = body[:3800] + "\n*…and more*"
+    emb = discord.Embed(description=f"# ⛔ Blacklist · {len(ids)}\n{DIV}\n{body}", color=0xE74C3C)
+    add_footer_divider(emb)
+    emb.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+def expire_blacklists():
+    """Remove timed blacklists that have run out. Returns True if anything changed."""
+    now = time.time()
+    changed = False
+    for gid, meta in list(db.get("blacklist_info", {}).items()):
+        for uid, m in list(meta.items()):
+            if m.get("until") and m["until"] <= now:
+                unblacklist(int(gid), int(uid))
+                changed = True
+    if changed:
+        save_db(db)
+    return changed
+
 
 @bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list in THIS server")
 @app_commands.guild_only()

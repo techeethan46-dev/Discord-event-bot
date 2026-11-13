@@ -11,7 +11,7 @@ from hostbot.core import (
     _bg_tasks, ai_history, bot, db, enforce_existing_guilds_safely, get_config, save_db,
     schedule_whitelist_enforcement, swap_cooldowns, user_cooldowns,
 )
-from hostbot.events import EventButtonsView, RateBtnView
+from hostbot.events import EventButtonsView, RateBtnView, expire_blacklists
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
 from hostbot.routines import cleanup_old_events, post_weekly_summaries, send_due_reminders
 from hostbot.server_tools import _talk_cooldowns, _talk_pings
@@ -89,6 +89,10 @@ async def refresh_timers():
             await job()
         except Exception as e:
             print(f"{job.__name__} error:", e)
+    try:
+        expire_blacklists()
+    except Exception as e:
+        print("expire_blacklists error:", e)
     try:
         cleanup_old_events()
     except Exception as e:
