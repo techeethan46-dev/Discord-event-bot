@@ -118,7 +118,7 @@ async def send_notice(msg, title, text, ttl=10, key="notice", every=60):
     if len(_notice_last) > 500:
         _notice_last.clear()
     _notice_last[k] = now
-    emb = discord.Embed(title=title, description=text, color=0x2B2D31)
+    emb = discord.Embed(description=f"**{title}**\n{text}", color=0x2B2D31)
     emb.set_footer(text=BRAND)
     return await safe_reply(msg, embed=emb, delete_after=ttl)
 
@@ -190,7 +190,7 @@ async def dm_owners(text, key=None, cooldown=300):
         except Exception as e:
             print("Failed to DM owner:", e)
 
-async def log_action(guild, title, desc, color=0x3498DB, channel_key=None):
+async def log_action(guild, title, desc, color=0x5865F2, channel_key=None):
     # AI Admin actions have their own setup channel.  Everything else keeps using
     # the normal event log channel, so existing logging is unchanged.
     log_id = get_config(guild.id).get(channel_key or "log_channel")
@@ -208,18 +208,16 @@ async def log_action(guild, title, desc, color=0x3498DB, channel_key=None):
         except discord.HTTPException: 
             pass
 
-# One solid, straight divider. (~~ strikethrough over blank Braille characters draws a continuous line;
-# the box-drawing dashes it replaces rendered as broken segments on phones.)
-DIV = "~~" + "\u2800" * 25 + "~~"
-SECTION_SEP = f"\n{DIV}\n"
+# Minimal look: sections are separated by white space instead of drawn lines.
+# DIV is an invisible spacer line, so "\n{DIV}\n" leaves one clean empty line.
+DIV = "\u200b"
+SECTION_SEP = "\n\n"
 
 
 def add_footer_divider(embed, minimum_length=280):
-    """Add the shared divider before footer metadata on medium/long embeds."""
-    description = embed.description or ""
-    fields_length = sum(len(field.name or "") + len(field.value or "") for field in embed.fields)
-    if len(description) + fields_length >= minimum_length and description and not description.endswith(DIV):
-        embed.description = description.rstrip() + f"\n{DIV}"
+    """Kept for compatibility: the minimal style has no divider above the footer."""
+    if embed.description:
+        embed.description = embed.description.rstrip("\n\u200b ")
     return embed
 BRAND = "AbyssalNoob1 is the Best"
 EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
@@ -239,26 +237,26 @@ def build_embed(name, info, guild=None):
     sp_lines, reg_lines = [], []
     for country, u in res.items():
         uid = u["discord_id"]
-        line = f"• **{country}** · `{u['roblox']}` · <@{uid}>"
+        line = f"**{country}** · <@{uid}> · `{u['roblox']}`"
         (sp_lines if country.title() in sp_set else reg_lines).append(line)
 
     if info.get("concluded"):
-        emoji, color, status = "🔒", 0xE74C3C, "🔒 Concluded"
+        emoji, color, status = "🔒", 0x4E5058, "Concluded"
     elif now >= end:
-        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ Live · reservations closed <t:{end}:R>"
+        emoji, color, status = "⚔️", 0xFEE75C, f"Live · reservations closed <t:{end}:R>"
     elif now < start:
-        emoji, color, status = "🕒", 0x3498DB, f"🕒 Opens <t:{start}:R>"
+        emoji, color, status = "🕒", 0x5865F2, f"Opens <t:{start}:R>"
     else:
-        emoji, color, status = "🚩", 0x2ECC71, f"🟢 Open · closes <t:{end}:R>"
+        emoji, color, status = "🟢", 0x57F287, f"Open · closes <t:{end}:R>"
 
-    # Headings (not the embed title) so the name and status render large.
+    # Big name, small status line, then one compact block of details.
     h_str = f"<@{host}>" + (f" & <@{cohost}>" if cohost else "")
-    head = (f"# {emoji} {name}{_PART}\n## {status}{SECTION_SEP}"
-            f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
+    head = (f"## {emoji} {name}{_PART}\n-# {status}\n\n"
+            f"**Host** {h_str}\n**Starts** <t:{start}:f>\n**Ends** <t:{end}:f>")
     if info.get("trial"):
-        head += "\n• **🎓 Trial event:** players can leave feedback on this trial host"
+        head += "\n**Trial event** · players can give feedback on this host"
     if helpers:
-        head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
+        head += "\n**Helpers** " + ", ".join(f"<@{i}>" for i in helpers[:15])
     head += SECTION_SEP
 
     sp_sec = ""
@@ -266,38 +264,38 @@ def build_embed(name, info, guild=None):
         unclaimed = [s for s in sps if s.title() not in res]
         body = "\n".join(sp_lines)
         if unclaimed:
-            body += ("\n" if body else "") + "*Available:* " + ", ".join(f"**{s}**" for s in unclaimed)
+            body += ("\n" if body else "") + "-# Available: " + ", ".join(s.title() for s in unclaimed)
         sp_sec = f"### ⭐ Superpowers\n{body}{SECTION_SEP}"
 
     wait_sec = ""
     if wait:
-        w_lines = [f"• **{w['country']}** · <@{w['discord_id']}>" for w in wait[:5]]
-        more = f"\n*+{len(wait) - 5} more*" if len(wait) > 5 else ""
-        wait_sec = f"### ⏳ Waitlist ({len(wait)})\n" + "\n".join(w_lines) + more
+        w_lines = [f"**{w['country']}** · <@{w['discord_id']}>" for w in wait[:5]]
+        more = f"\n-# +{len(wait) - 5} more" if len(wait) > 5 else ""
+        wait_sec = f"### Waitlist · {len(wait)}\n" + "\n".join(w_lines) + more
 
     chunks = []
-    cur = head + sp_sec + f"### 📋 Reservations ({len(reg_lines)})\n"
+    cur = head + sp_sec + f"### Reservations · {len(reg_lines)}\n"
     if not reg_lines:
-        cur += "*No reservations yet*"
+        cur += "-# No reservations yet"
     shown = 0
     for ln in reg_lines:
         if len(cur) + len(ln) + 1 > EMBED_CHUNK:
             if chunks:  # max two embeds per message
                 break
             chunks.append(cur.rstrip("\n"))
-            cur = f"# {emoji} {name}{_PART}\n### 📋 Reservations (continued)\n"
+            cur = f"## {emoji} {name}{_PART}\n### Reservations (continued)\n"
         cur += ln + "\n"
         shown += 1
     if shown < len(reg_lines):
-        cur += f"*…and {len(reg_lines) - shown} more*\n"
+        cur += f"-# …and {len(reg_lines) - shown} more\n"
     cur = cur.rstrip("\n")
     if wait_sec:
         if len(cur) + len(wait_sec) + 2 > EMBED_CHUNK and not chunks:
             chunks.append(cur)
-            cur = f"# {emoji} {name}{_PART}\n" + wait_sec
+            cur = f"## {emoji} {name}{_PART}\n" + wait_sec
         else:
             cur += "\n\n" + wait_sec
-    chunks.append(cur + SECTION_SEP.rstrip("\n"))  # closing line above the footer
+    chunks.append(cur)
     chunks = [c[:EMBED_CHUNK + 250] for c in chunks]
 
     n = len(chunks)
@@ -306,7 +304,7 @@ def build_embed(name, info, guild=None):
         d = d.replace(_PART, f" · Part {i + 1}/{n}" if n > 1 else "")
         embs.append(discord.Embed(color=color, description=d))
     add_footer_divider(embs[-1])
-    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live · {BRAND}")
+    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} spots taken  ·  {BRAND}")
     return embs
 
 # ==========================================
@@ -320,7 +318,7 @@ LOG_CATS = {
 }
 LOG_OPTIONS = [("all", "All activity", "📜"), ("reservation", "Reservations", "📋"),
                ("waitlist", "Waitlist", "⏳"), ("swap", "Swaps", "🔄"), ("host", "Host actions", "🛠️")]
-LOG_BLUE = 0x3498DB
+LOG_BLUE = 0x5865F2
 LOG_PAGE_SIZE = 5
 
 def _fmt_ts(t):
@@ -348,16 +346,15 @@ def build_log_embed(info):
     cat, page, pages, rows = log_state(info)
     logs = info.get("logs", [])
     counts = {c: sum(1 for e in logs if e["c"] == c) for c in LOG_CATS}
-    host = f"👑 **Host** · <@{info['host_id']}>" + (f" & <@{info['cohost_id']}>" if info.get("cohost_id") else "")
-    stats = "\n".join(f"{LOG_CATS[c][0]} **{LOG_CATS[c][1]}** · {counts[c]}" for c in LOG_CATS)
-    sec = "🕒 Latest activity" if cat == "all" else f"{LOG_CATS[cat][0]} {LOG_CATS[cat][1]}"
-    body = "\n".join(_log_line(e) for e in rows[page * LOG_PAGE_SIZE:(page + 1) * LOG_PAGE_SIZE]) or "*Nothing here yet*"
-    desc = (f"# 📜 Event Log · {info['display_name']}\n{DIV}\n"
-            f"### 📊 Overview\n{host}\n{stats}\n{DIV}\n"
+    host = f"**Host** <@{info['host_id']}>" + (f" & <@{info['cohost_id']}>" if info.get("cohost_id") else "")
+    stats = "  ·  ".join(f"{LOG_CATS[c][0]} {counts[c]}" for c in LOG_CATS)
+    sec = "Latest activity" if cat == "all" else f"{LOG_CATS[cat][0]} {LOG_CATS[cat][1]}"
+    body = "\n".join(_log_line(e) for e in rows[page * LOG_PAGE_SIZE:(page + 1) * LOG_PAGE_SIZE]) or "-# Nothing here yet"
+    desc = (f"## 📜 {info['display_name']}\n-# Event log\n\n"
+            f"{host}\n{stats}\n\n"
             f"### {sec}\n{body}")
     if info.get("helpers"):
-        desc += f"\n{DIV}\n### 🤝 Helpers\n" + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
-    desc += f"\n{DIV}"
+        desc += "\n\n**Helpers** " + ", ".join(f"<@{i}>" for i in info["helpers"][:20])
     emb = discord.Embed(color=LOG_BLUE, description=desc[:4000])
     state = "🔒 Concluded" if info.get("concluded") else "🟢 Live"
     add_footer_divider(emb)
@@ -506,8 +503,19 @@ async def process_waitlist(info, opened, guild, channel):
 
     await add_event_role(guild, promo["discord_id"])
 
-    if channel:
-        try: 
-            await channel.send(f"🔔 <@{promo['discord_id']}> **{promo['country'].title()}** opened up and you got it!")
-        except discord.HTTPException: 
+    # Tell the promoted player privately; only if their DMs are closed, ping them in the
+    # event channel with a note that cleans itself up after 2 minutes.
+    note = f"🔔 **{promo['country'].title()}** opened up in **{info['display_name']}** and you got it!"
+    member = guild.get_member(int(promo["discord_id"]))
+    dm_sent = False
+    if member:
+        try:
+            await member.send(note)
+            dm_sent = True
+        except discord.HTTPException:
+            pass
+    if not dm_sent and channel:
+        try:
+            await channel.send(f"<@{promo['discord_id']}> {note}", delete_after=120)
+        except discord.HTTPException:
             pass

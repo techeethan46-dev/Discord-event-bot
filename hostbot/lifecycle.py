@@ -14,7 +14,7 @@ from hostbot.core import (
 from hostbot.events import EventButtonsView, RateBtnView
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
 from hostbot.routines import cleanup_old_events, post_weekly_summaries, send_due_reminders
-from hostbot.server_tools import _talk_cooldowns
+from hostbot.server_tools import _talk_cooldowns, _talk_pings
 from hostbot.shared import EventLogView, is_server_admin, refresh_event_message
 from hostbot import core
 
@@ -103,6 +103,8 @@ async def refresh_timers():
         ai_history.pop(next(iter(ai_history)))
     for uid in [uid for uid, ts in _talk_cooldowns.items() if ts < cutoff]:
         _talk_cooldowns.pop(uid, None)
+    for uid in [uid for uid, ts in _talk_pings.items() if not ts or ts[-1] < cutoff]:
+        _talk_pings.pop(uid, None)
 
 @refresh_timers.before_loop
 async def before_refresh_timers():
@@ -151,7 +153,7 @@ async def on_ready():
 @commands.guild_only()
 async def sync(ctx):
     if not is_server_admin(ctx.author):
-        await ctx.send("Admins only.")
+        await ctx.send("Admins only.", delete_after=10)
         return
     s = await bot.tree.sync()
-    await ctx.send(f"Synced {len(s)} commands.")
+    await ctx.send(f"Synced {len(s)} commands.", delete_after=10)

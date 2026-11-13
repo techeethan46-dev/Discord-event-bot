@@ -2,6 +2,7 @@
 
 import datetime
 import discord
+import re
 import time
 from discord import app_commands
 
@@ -9,7 +10,7 @@ from hostbot.core import ALLOWED_USER_IDS, BOT_OWNER_IDS, bot, db, get_config, i
 from hostbot.hosts import ACHIEVEMENT_DEFS, ensure_achievement_roles
 from hostbot.shared import (
     DIV, GuardedView, add_footer_divider, emergency_rate_limit_shutdown, has_host_role,
-    is_server_admin,
+    is_server_admin, log_action,
 )
 from hostbot import core
 
@@ -170,7 +171,7 @@ class SetupWizard(GuardedView):
         if self.step < t:
             st = SETUP_STEPS[self.step]
             bar = "▰" * (self.step + 1) + "▱" * (t - self.step - 1)
-            desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
+            desc = f"## ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
             if self.note:
                 desc += f"{self.note}\n\n"
             desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}\n{DIV}"
@@ -191,7 +192,7 @@ class SetupWizard(GuardedView):
             f"⚖️ **Trial decisions:** Reviewed and decided manually by your team\n"
             f"💬 **/talk audit:** {'Configured' if conf.get('talk_log_channel') else 'Optional / not configured'}"
         )
-        desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
+        desc = (f"## ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
                 f"### 🎭 Roles\n{roles}\n{DIV}\n"
                 f"### 🤖 AI & Security\n{security}\n{DIV}\n"
                 f"### 📡 Channels\n{chans}\n{DIV}\n"
@@ -293,8 +294,8 @@ class SetupNav(discord.ui.Button):
         else:
             conf = get_config(view.guild.id)
             done = sum(1 for s in SETUP_STEPS if _setup_step_configured(view.guild, s, conf))
-            emb = discord.Embed(color=0x2ECC71, description=(
-                f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
+            emb = discord.Embed(color=0x57F287, description=(
+                f"## ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
                 "Run **/setup** any time to change something."))
             await interaction.response.edit_message(embed=emb, view=None)
             view.stop()
@@ -321,7 +322,55 @@ async def setup_cmd(interaction: discord.Interaction):
 TALK_COOLDOWN = 4
 _talk_cooldowns = {}
 
-async def log_talk_usage(guild, author, channel, message):
+# Ping protection for /talk with mentions on: more than 10 pings in 2 minutes = muted for 20 minutes.
+TALK_PING_LIMIT = 10
+TALK_PING_WINDOW = 120
+TALK_PING_MUTE_MINUTES = 20
+_talk_pings = {}  # user id -> timestamps, one per ping sent
+
+
+def talk_pings(message, member, channel):
+    """Work out who a /talk message may ping. @everyone/@here are never allowed; roles only if
+    they're mentionable or the author could ping them themselves."""
+    guild = channel.guild
+    user_ids = [int(i) for i in re.findall(r"<@!?(\d+)>", message)]
+    can_ping_any_role = channel.permissions_for(member).mention_everyone
+    roles = []
+    for rid in re.findall(r"<@&(\d+)>", message):
+        role = guild.get_role(int(rid))
+        if role and (role.mentionable or can_ping_any_role):
+            roles.append(role)
+    users = [discord.Object(id=i) for i in dict.fromkeys(user_ids)]
+    allowed = discord.AllowedMentions(everyone=False, users=users, roles=list(dict.fromkeys(roles)))
+    return len(user_ids) + len(roles), allowed
+
+
+async def punish_ping_spam(interaction):
+    """Mute the author for 20 minutes and announce it, in the same style as the AI's
+    'no permission to mute' message."""
+    member, channel = interaction.user, interaction.channel
+    try:
+        await member.timeout(datetime.timedelta(minutes=TALK_PING_MUTE_MINUTES),
+                             reason=f"More than {TALK_PING_LIMIT} pings in {TALK_PING_WINDOW // 60} min with /talk")
+    except discord.HTTPException:
+        return False
+    emb = discord.Embed(color=0xED4245, description=(
+        f"## ❌ Couldn't do that\n\n"
+        f"🔇 You pinged people more than {TALK_PING_LIMIT} times in {TALK_PING_WINDOW // 60} minutes, "
+        f"so I muted **you** for {TALK_PING_MUTE_MINUTES} min."))
+    emb.set_footer(text=f"Requested by {member.display_name}")
+    try:
+        await channel.send(content=member.mention, embed=emb,
+                           allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
+    except discord.HTTPException:
+        pass
+    await log_action(interaction.guild, "/talk ping spam",
+                     f"{member.mention} was muted for {TALK_PING_MUTE_MINUTES} min in {channel.mention} "
+                     f"for pinging more than {TALK_PING_LIMIT} times in {TALK_PING_WINDOW // 60} min.",
+                     color=0xED4245, channel_key="talk_log_channel")
+    return True
+
+async def log_talk_usage(guild, author, channel, message, pings=False):
     """Write a polished audit card for every successful /talk message."""
     log_id = get_config(guild.id).get("talk_log_channel")
     if not log_id:
@@ -342,6 +391,7 @@ async def log_talk_usage(guild, author, channel, message):
         embed.set_author(name=str(author))
     embed.add_field(name="👤 Author", value=f"{author.mention}\n`{author.id}`", inline=True)
     embed.add_field(name="📍 Channel", value=f"{channel.mention}\n`{channel.id}`", inline=True)
+    embed.add_field(name="🔔 Pings", value="On" if pings else "Off", inline=True)
     add_footer_divider(embed)
     embed.set_footer(text=f"Host Assistant · {guild.name}")
     try:
@@ -368,8 +418,9 @@ def can_use_talk(member, guild_id):
 
 @bot.tree.command(name="talk", description="Make Host Assistant send a message as the bot")
 @app_commands.guild_only()
-@app_commands.describe(message="Exactly what Host Assistant should say")
-async def talk_cmd(interaction: discord.Interaction, message: str):
+@app_commands.describe(message="Exactly what Host Assistant should say",
+                       mentions="Turn on to actually ping the people and roles you mention (off by default)")
+async def talk_cmd(interaction: discord.Interaction, message: str, mentions: bool = False):
     if core.RATE_LIMIT_TRIGGERED:
         await interaction.response.send_message("⚠️ Host Assistant is temporarily paused after a Discord rate limit.", ephemeral=True)
         return
@@ -396,15 +447,26 @@ async def talk_cmd(interaction: discord.Interaction, message: str):
         return
     _talk_cooldowns[interaction.user.id] = now
 
+    allowed = discord.AllowedMentions.none()
+    if mentions:
+        count, allowed = talk_pings(message, interaction.user, interaction.channel)
+        recent = [t for t in _talk_pings.get(interaction.user.id, []) if now - t < TALK_PING_WINDOW]
+        if len(recent) + count > TALK_PING_LIMIT:
+            _talk_pings.pop(interaction.user.id, None)
+            muted = await punish_ping_spam(interaction)
+            await interaction.response.send_message(
+                f"🔇 Too many pings, so the message wasn't sent and you were muted for {TALK_PING_MUTE_MINUTES} min."
+                if muted else f"❌ Too many pings ({TALK_PING_LIMIT} per {TALK_PING_WINDOW // 60} min). The message wasn't sent.",
+                ephemeral=True)
+            return
+        _talk_pings[interaction.user.id] = recent + [now] * count
+
     # Defer invisibly, then send the actual content as a normal bot message.
     # The slash command itself is not echoed, so the channel only sees the bot's message.
     await interaction.response.defer(ephemeral=True)
     try:
-        await interaction.channel.send(
-            message,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-        await log_talk_usage(interaction.guild, interaction.user, interaction.channel, message)
+        await interaction.channel.send(message, allowed_mentions=allowed)
+        await log_talk_usage(interaction.guild, interaction.user, interaction.channel, message, pings=mentions)
         await interaction.edit_original_response(content="✨ Sent successfully.")
     except discord.HTTPException as e:
         if getattr(e, "status", None) == 429:

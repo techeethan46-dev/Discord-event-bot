@@ -55,7 +55,8 @@ async def send_due_reminders():
         ping, allowed = _reminder_ping(guild, info, ch)
         text = random.choice(REMINDER_LINES).format(ping=ping, name=info["display_name"], when=f"<t:{live_at}:R>")
         try:
-            await ch.send(text, allowed_mentions=allowed)
+            # The reminder only matters until the event starts, so it tidies itself up afterwards.
+            await ch.send(text, allowed_mentions=allowed, delete_after=REMINDER_SECONDS + 600)
         except discord.HTTPException as e:
             print("event reminder failed:", e)
 
@@ -125,14 +126,14 @@ def build_weekly_summary(guild, start, end):
     regulars = sorted(((n, u) for u, n in played.items() if n > 1), reverse=True)[:3]
 
     emb = discord.Embed(color=0x5865F2, description=(
-        f"# 📅 Weekly Summary\n"
-        f"<t:{start}:D> → <t:{end - 1}:D>\n{DIV}"))
+        f"## 📅 Weekly Summary\n"
+        f"-# <t:{start}:D> → <t:{end - 1}:D>"))
     emb.add_field(name="🎪 Events", value=f"**{len(week)}**", inline=True)
     emb.add_field(name="👥 Players", value=f"**{players}**", inline=True)
     emb.add_field(name="📈 Avg / Event", value=f"**{players / len(week):.1f}**", inline=True)
     emb.add_field(name="🧍 Different Players", value=f"**{len(played)}**", inline=True)
     emb.add_field(name="🆕 New Players", value=f"**{len(new_players)}**", inline=True)
-    emb.add_field(name="​", value="​", inline=True)
+    emb.add_field(name="🔁 Returning", value=f"**{len(played) - len(new_players)}**", inline=True)
     emb.add_field(name="🏟️ Biggest Event",
                   value=f"**{biggest['display_name']}** · {event_player_count(biggest)} players · <@{biggest['host_id']}>",
                   inline=False)

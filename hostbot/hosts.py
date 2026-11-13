@@ -207,7 +207,7 @@ async def ensure_achievement_roles(guild):
         try:
             role = await guild.create_role(
                 name=role_name,
-                color=discord.Color(ACHIEVEMENT_ROLE_COLORS.get(data["tier"], 0x3498DB)),
+                color=discord.Color(ACHIEVEMENT_ROLE_COLORS.get(data["tier"], 0x5865F2)),
                 mentionable=False,
                 reason="Host Assistant achievement role setup"
             )
@@ -259,7 +259,7 @@ async def check_and_announce_achievements(guild, host_id, channel=None):
                 embed=discord.Embed(
                     title="🏆 Achievement Unlocked",
                     description=f"<@{host_id}> earned:\n\n" + "\n".join(lines),
-                    color=0xF1C40F
+                    color=0xFEE75C
                 )
             )
         except discord.HTTPException:
@@ -367,7 +367,7 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
         description=(f"**Level {level} Host** · {points:,} points\n"
                      f"`{progress_bar(level_progress)}` **{round(level_progress * 100)}%**\n\n"
                      + "\n".join(lines))[:4000],
-        color=0xF1C40F
+        color=0xFEE75C
     )
     add_footer_divider(emb)
     emb.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENT_DEFS)} unlocked · Host Assistant")
@@ -462,7 +462,7 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
         row[1] += event_player_count(e)
     host_rows = sorted(per_host.items(), key=lambda kv: (kv[1][0], kv[1][1]), reverse=True)
 
-    emb = discord.Embed(title="📊 Host Assistant · Analytics", color=0x3498DB)
+    emb = discord.Embed(title="📊 Host Assistant · Analytics", color=0x5865F2)
     emb.description = f"**Period:** {'All Time' if days == 0 else f'Last {days} Days'}\n{DIV}"
     emb.add_field(name="🎪 Events", value=f"**{total_events}**", inline=True)
     emb.add_field(name="👥 Players", value=f"**{total_players:,}**", inline=True)
@@ -486,11 +486,11 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
 TRIAL_VOTE_HOURS = 24      # how long voting stays open
 TRIAL_REASON_MIN = 8
 TRIAL_CHOICES = {
-    "keep":  {"label": "Keep",  "emoji": "✅", "block": "🟩", "color": 0x2ECC71, "meaning": "promote",
+    "keep":  {"label": "Keep",  "emoji": "✅", "block": "🟩", "color": 0x57F287, "meaning": "promote",
               "ask": "What did they do well?"},
-    "idk":   {"label": "IDK",   "emoji": "🤔", "block": "🟨", "color": 0xF1C40F, "meaning": "unsure",
+    "idk":   {"label": "IDK",   "emoji": "🤔", "block": "🟨", "color": 0xFEE75C, "meaning": "unsure",
               "ask": "What left you unsure?"},
-    "sweep": {"label": "Sweep", "emoji": "🧹", "block": "🟥", "color": 0xE74C3C, "meaning": "demote",
+    "sweep": {"label": "Sweep", "emoji": "🧹", "block": "🟥", "color": 0xED4245, "meaning": "demote",
               "ask": "What needs to change?"},
 }
 
@@ -540,9 +540,9 @@ def trial_open_embed(rev):
     counts, total = trial_tally(rev)
     is_closed = rev.get("status") == "closed"
     state = "🔒 Voting closed" if is_closed else "🟢 Voting open"
-    emb = discord.Embed(color=0x5865F2 if not is_closed else 0x3498DB)
+    emb = discord.Embed(color=0x5865F2 if not is_closed else 0x5865F2)
     emb.description = (
-        f"# ⚖️ Trial Review\n"
+        f"## ⚖️ Trial Review\n"
         f"### <@{host}> has finished their trial.\n"
         f"{state} · " + ("Voting period ended" if is_closed else f"Closes <t:{rev['ends_at']}:R>") + f"\n{DIV}\n"
         f"🎓 **Candidate** · <@{host}>\n"
@@ -641,11 +641,11 @@ def trial_log_embed(rev):
         for entry in page_rows
     ) or "*No reasons submitted yet*"
     description = (
-        f"# 📜 Trial Log · {rev['event_name']}\n{DIV}\n"
+        f"## 📜 Trial Log · {rev['event_name']}\n{DIV}\n"
         f"### 📊 Overview\n{host}\n🎪 **Trial event** · {rev['event_name']}\n"
         f"{overview}\n{DIV}\n### {section}\n{body}\n{DIV}"
     )
-    embed = discord.Embed(color=0x3498DB, description=description[:4000])
+    embed = discord.Embed(color=0x5865F2, description=description[:4000])
     state_label = ("🔒 Concluded" if closed else
                    "🔓 Closing" if rev.get("status") == "closing" else "🟢 Voting open")
     add_footer_divider(embed)
@@ -931,7 +931,7 @@ async def trial_appoint(interaction: discord.Interaction, member: discord.Member
     ch = trial_channel_for(interaction.guild)
     if ch:
         emb = discord.Embed(color=0x5865F2, description=(
-            f"# 🎓 A new trial begins\n### {member.mention}\n{DIV}\n"
+            f"## 🎓 A new trial begins\n### {member.mention}\n{DIV}\n"
             f"Their first event will be judged by the people who play in it.\n"
             f"✅ **Keep** · 🤔 **IDK** · 🧹 **Sweep**"))
         add_footer_divider(emb)
