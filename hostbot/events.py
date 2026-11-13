@@ -161,8 +161,9 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
             await remove_event_role(interaction.guild, interaction.user.id)
             save_db(db)
 
-            await refresh_event_message(info, interaction.guild)
+            # Answer first: Discord only allows 3 seconds before the first reply.
             await interaction.response.send_message(f"Spot taken/full! Added to waitlist for {c_title}.", ephemeral=True)
+            await refresh_event_message(info, interaction.guild)
             await event_log(interaction.guild, info, "waitlist", f"<@{interaction.user.id}> joined the waitlist for **{c_title}**")
             return
 
@@ -339,6 +340,9 @@ class KickSelect(discord.ui.Select):
         if not info or c_title not in info["reservations"]:
             await interaction.followup.send("That spot is already gone.", ephemeral=True)
             return
+        if info.get("concluded"):
+            await interaction.followup.send("This event has already concluded.", ephemeral=True)
+            return
 
         uid = info["reservations"][c_title]["discord_id"]
         del info["reservations"][c_title]
@@ -354,13 +358,18 @@ class KickSelect(discord.ui.Select):
         await interaction.followup.send(f"Kicked **{c_title}**.", ephemeral=True)
 
 class RateBtnView(GuardedView):
-    def __init__(self, h_id, e_key):
-        super().__init__(timeout=3600)
-        self.h_id, self.e_key = h_id, e_key
+    """Persistent (survives restarts): the event is looked up from the stats message the button is on."""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success, custom_id="rate_host_btn")
     async def rate(self, i, b):
-        await i.response.send_modal(RateModal(self.h_id, self.e_key))
+        found = next(((k, e) for k, e in db["events"].items() if e.get("rate_msg") == i.message.id), None)
+        if not found:
+            await i.response.send_message("This rating is no longer available.", ephemeral=True)
+            return
+        key, info = found
+        await i.response.send_modal(RateModal(info["host_id"], key))
 
 class HelperSelect(discord.ui.UserSelect):
     def __init__(self, key):
@@ -452,7 +461,9 @@ class HostActionsView(GuardedView):
             if info.get("helpers"):
                 emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
             try:
-                await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
+                stats_msg = await s_ch.send(embed=emb, view=RateBtnView())
+                info["rate_msg"] = stats_msg.id
+                save_db(db)
             except discord.HTTPException as e:
                 print("stats post failed:", e)
 
@@ -622,8 +633,8 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
     info["superpowers"] = sps
     save_db(db)
 
-    await refresh_event_message(info, interaction.guild)
     await interaction.response.send_message(f"Superpowers set: {', '.join(sps)}", ephemeral=True)
+    await refresh_event_message(info, interaction.guild)
     await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set superpowers: {', '.join(sps)}")
 
 @bot.tree.command(name="blacklist", description="Blacklist user")

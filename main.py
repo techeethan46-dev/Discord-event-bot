@@ -15,7 +15,9 @@ tk = os.environ.get("BOT_TOKEN")
 if tk:
     keep_alive()
     try:
-        bot.run(tk, reconnect=False)
+        # reconnect=True lets discord.py resume after normal gateway drops. A 429 at login
+        # still raises below, so the safe-hold behaviour for rate limits is unchanged.
+        bot.run(tk, reconnect=True)
     except discord.HTTPException as e:
         if getattr(e, "status", None) == 429:
             core.RATE_LIMIT_TRIGGERED = True

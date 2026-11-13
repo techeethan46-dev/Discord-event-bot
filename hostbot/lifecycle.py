@@ -11,7 +11,7 @@ from hostbot.core import (
     _bg_tasks, ai_history, bot, db, enforce_existing_guilds_safely, get_config, save_db,
     schedule_whitelist_enforcement, swap_cooldowns, user_cooldowns,
 )
-from hostbot.events import EventButtonsView
+from hostbot.events import EventButtonsView, RateBtnView
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
 from hostbot.server_tools import _talk_cooldowns
 from hostbot.shared import EventLogView, is_server_admin, refresh_event_message
@@ -100,6 +100,7 @@ async def before_refresh_timers():
 async def setup_hook():
     bot.add_view(EventButtonsView())
     bot.add_view(EventLogView())
+    bot.add_view(RateBtnView())
     bot.add_view(TrialVoteView())
     bot.add_view(TrialLogView())
     refresh_timers.start()

@@ -764,7 +764,9 @@ def close_trial_voting(rev_id):
     rev["closed_at"] = int(time.time())
     guild = bot.get_guild(rev["guild_id"])
     if guild:
-        set_trial_state(guild.id, rev["host_id"], status="review", review=rev.get("message_id"))
+        # The vote is over: mark the trial finished so the host can be re-appointed later.
+        # Roles are still handed out manually; nothing is promoted or demoted here.
+        set_trial_state(guild.id, rev["host_id"], status="done", review=rev.get("message_id"))
     save_db(db)
     task = asyncio.create_task(_finish_trial_closure(rev_id))
     _bg_tasks.add(task)

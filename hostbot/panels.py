@@ -115,12 +115,14 @@ class SectionModal(discord.ui.Modal):
         self.index = index
         cur = builder.sections[index] if index is not None else {"title": "", "body": ""}
         self.heading_in = discord.ui.TextInput(
-            label="Heading (optional)", default=cur["title"], required=False,
+            label="Heading (optional)", default=cur["title"][:100], required=False,
             max_length=100, placeholder="📌 Server Information")
         self.body_in = discord.ui.TextInput(
             label="Text (clear both boxes to delete)" if index is not None else "Text",
-            style=discord.TextStyle.paragraph, default=cur["body"], required=False,
-            max_length=3500, placeholder="Write your message here. **bold**, `code`, > quotes all work.")
+            # Posted text can be longer than what was typed ({#channel} expands to a mention),
+            # and Discord rejects a modal whose default is longer than max_length, so clamp it.
+            style=discord.TextStyle.paragraph, default=cur["body"][:4000], required=False,
+            max_length=4000, placeholder="Write your message here. **bold**, `code`, > quotes all work.")
         self.add_item(self.heading_in)
         self.add_item(self.body_in)
 
