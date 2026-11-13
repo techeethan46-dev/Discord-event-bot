@@ -13,6 +13,7 @@ from hostbot.core import (
 )
 from hostbot.events import EventButtonsView, RateBtnView
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
+from hostbot.routines import cleanup_old_events, post_weekly_summaries, send_due_reminders
 from hostbot.server_tools import _talk_cooldowns
 from hostbot.shared import EventLogView, is_server_admin, refresh_event_message
 from hostbot import core
@@ -82,6 +83,16 @@ async def refresh_timers():
         await close_due_trials()
     except Exception as e:
         print("close_due_trials error:", e)
+
+    for job in (send_due_reminders, post_weekly_summaries):
+        try:
+            await job()
+        except Exception as e:
+            print(f"{job.__name__} error:", e)
+    try:
+        cleanup_old_events()
+    except Exception as e:
+        print("cleanup_old_events error:", e)
 
     # Housekeeping so these dicts don't grow forever.
     cutoff = time.time() - 3600

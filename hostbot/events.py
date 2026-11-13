@@ -389,6 +389,69 @@ class HelperSelect(discord.ui.UserSelect):
         await refresh_event_message(info, interaction.guild)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set helpers: {names or 'none'}")
 
+async def cancel_event(guild, key):
+    """Delete an event completely: its embed, its log, the participant roles and the record itself,
+    so nothing from it counts towards stats, achievements, profiles or summaries."""
+    info = db["events"].pop(key, None)
+    if not info:
+        return False
+    save_db(db)
+
+    # Take the Event Participant role back, unless the player is in another running event.
+    still_playing = set()
+    for e in db["events"].values():
+        if not e.get("concluded") and e.get("guild_id") == guild.id:
+            still_playing |= {int(u["discord_id"]) for u in e.get("reservations", {}).values()}
+    for u in info.get("reservations", {}).values():
+        if int(u["discord_id"]) not in still_playing:
+            await remove_event_role(guild, int(u["discord_id"]))
+
+    ch = bot.get_channel(info.get("channel_id"))
+    for mid in info.get("message_ids") or []:
+        if ch:
+            try:
+                await ch.get_partial_message(int(mid)).delete()
+            except discord.HTTPException:
+                pass
+    lm = info.get("log_msg") or {}
+    log_ch = bot.get_channel(lm.get("ch")) if lm else None
+    if log_ch:
+        try:
+            await log_ch.get_partial_message(int(lm["id"])).delete()
+        except discord.HTTPException:
+            pass
+    return True
+
+
+class CancelConfirmView(GuardedView):
+    def __init__(self, key):
+        super().__init__(timeout=60)
+        self.key = key
+
+    @discord.ui.button(label="Yes, cancel and delete it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, btn):
+        if not is_authorized_manager(interaction.user):
+            await interaction.response.send_message("Admins or managers only.", ephemeral=True)
+            return
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.edit_message(content="That event no longer exists.", view=None)
+            return
+        if info.get("concluded"):
+            await interaction.response.edit_message(content="This event already concluded, so it can't be cancelled.", view=None)
+            return
+        name = info.get("display_name", "event")
+        await interaction.response.edit_message(content=f"Cancelling **{name}**...", view=None)
+        await cancel_event(interaction.guild, self.key)
+        await interaction.edit_original_response(content=f"🗑️ **{name}** was cancelled and deleted. Nothing from it will be counted.")
+        self.stop()
+
+    @discord.ui.button(label="Keep the event", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction, btn):
+        await interaction.response.edit_message(content="Okay, the event stays.", view=None)
+        self.stop()
+
+
 class HostActionsView(GuardedView):
     def __init__(self, key):
         super().__init__(timeout=300)
@@ -405,6 +468,20 @@ class HostActionsView(GuardedView):
             return True
         await interaction.response.send_message("Admins or managers only.", ephemeral=True)
         return False
+
+    @discord.ui.button(label="Cancel Event", style=discord.ButtonStyle.secondary, emoji="🗑️", row=1)
+    async def cancel(self, interaction, btn):
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.send_message("Event not found.", ephemeral=True)
+            return
+        if info.get("concluded"):
+            await interaction.response.send_message("This event already concluded, so it can't be cancelled.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Cancel **{info['display_name']}**? This deletes the event message and its log, removes the "
+            f"Event Participant role from the players, and nothing from it will be counted. This can't be undone.",
+            view=CancelConfirmView(self.key), ephemeral=True)
 
     @discord.ui.button(label="Conclude Event", style=discord.ButtonStyle.danger, row=1)
     async def conclude(self, interaction, btn):
