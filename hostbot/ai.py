@@ -1016,7 +1016,7 @@ async def run_admin_flow(msg, txt):
         prompt = None
         if any(needs_confirm(a) for _, a in runnable):
             emb = discord.Embed(description="## ⚠️ Confirm these actions\n" + DIV + "\n" +
-                                "\n".join(f"• {summarize(a)}" for _, a in runnable), color=0xFEE75C)
+                                "\n".join(f"• {summarize(a)}" for _, a in runnable), color=0xF1C40F)
             add_footer_divider(emb)
             emb.set_footer(text="Confirm within 30 seconds")
             view = ConfirmView(uid)
@@ -1027,7 +1027,7 @@ async def run_admin_flow(msg, txt):
             if not view.value:
                 emb.description = emb.description.replace(
                     "## ⚠️ Confirm these actions", "## ❌ Cancelled" if view.value is False else "## ⌛ Timed out")
-                emb.color = 0x4E5058
+                emb.color = 0x95A5A6
                 add_footer_divider(emb)
                 emb.set_footer(text="Nothing was changed")
                 try:
@@ -1061,11 +1061,11 @@ async def run_admin_flow(msg, txt):
             ok_count += 1 if ok else 0
 
         if ok_count == len(plan):
-            title, color = "✅ Done", 0x57F287
+            title, color = "✅ Done", 0x2ECC71
         elif ok_count == 0:
-            title, color = "❌ Couldn't do that", 0xED4245
+            title, color = "❌ Couldn't do that", 0xE74C3C
         else:
-            title, color = "⚠️ Partly done", 0xF0B232
+            title, color = "⚠️ Partly done", 0xE67E22
         res = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
         add_footer_divider(res)
         res.set_footer(text=f"Requested by {msg.author.display_name}")
@@ -1081,7 +1081,7 @@ async def run_admin_flow(msg, txt):
         if ok_count or any(l.startswith("🔇") for l in lines):
             await log_action(msg.guild, "AI Admin Action",
                              f"<@{uid}> asked:\n> {txt[:300]}\n\n" + "\n".join(lines)[:1500],
-                             color=0xED4245, channel_key="ai_log_channel")
+                             color=0xE74C3C, channel_key="ai_log_channel")
     except Exception as e:
         print("run_admin_flow error:", e)
         await dm_owners(f"⚠️ **Admin flow exception:** `{e}`", key="admin_exc")

@@ -171,7 +171,7 @@ class SetupWizard(GuardedView):
         if self.step < t:
             st = SETUP_STEPS[self.step]
             bar = "▰" * (self.step + 1) + "▱" * (t - self.step - 1)
-            desc = f"## ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
+            desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
             if self.note:
                 desc += f"{self.note}\n\n"
             desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}\n{DIV}"
@@ -192,7 +192,7 @@ class SetupWizard(GuardedView):
             f"⚖️ **Trial decisions:** Reviewed and decided manually by your team\n"
             f"💬 **/talk audit:** {'Configured' if conf.get('talk_log_channel') else 'Optional / not configured'}"
         )
-        desc = (f"## ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
+        desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
                 f"### 🎭 Roles\n{roles}\n{DIV}\n"
                 f"### 🤖 AI & Security\n{security}\n{DIV}\n"
                 f"### 📡 Channels\n{chans}\n{DIV}\n"
@@ -294,8 +294,8 @@ class SetupNav(discord.ui.Button):
         else:
             conf = get_config(view.guild.id)
             done = sum(1 for s in SETUP_STEPS if _setup_step_configured(view.guild, s, conf))
-            emb = discord.Embed(color=0x57F287, description=(
-                f"## ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
+            emb = discord.Embed(color=0x2ECC71, description=(
+                f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
                 "Run **/setup** any time to change something."))
             await interaction.response.edit_message(embed=emb, view=None)
             view.stop()
@@ -354,10 +354,11 @@ async def punish_ping_spam(interaction):
                              reason=f"More than {TALK_PING_LIMIT} pings in {TALK_PING_WINDOW // 60} min with /talk")
     except discord.HTTPException:
         return False
-    emb = discord.Embed(color=0xED4245, description=(
-        f"## ❌ Couldn't do that\n\n"
+    emb = discord.Embed(color=0xE74C3C, description=(
+        f"## ❌ Couldn't do that\n{DIV}\n"
         f"🔇 You pinged people more than {TALK_PING_LIMIT} times in {TALK_PING_WINDOW // 60} minutes, "
         f"so I muted **you** for {TALK_PING_MUTE_MINUTES} min."))
+    add_footer_divider(emb)
     emb.set_footer(text=f"Requested by {member.display_name}")
     try:
         await channel.send(content=member.mention, embed=emb,
@@ -367,7 +368,7 @@ async def punish_ping_spam(interaction):
     await log_action(interaction.guild, "/talk ping spam",
                      f"{member.mention} was muted for {TALK_PING_MUTE_MINUTES} min in {channel.mention} "
                      f"for pinging more than {TALK_PING_LIMIT} times in {TALK_PING_WINDOW // 60} min.",
-                     color=0xED4245, channel_key="talk_log_channel")
+                     color=0x5865F2, channel_key="talk_log_channel")
     return True
 
 async def log_talk_usage(guild, author, channel, message, pings=False):

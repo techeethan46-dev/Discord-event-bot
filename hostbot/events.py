@@ -234,7 +234,7 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
             await interaction.response.send_message("Swap channel missing.", ephemeral=True)
             return
 
-        emb = discord.Embed(title="🔄 Swap Request", description=f"<@{interaction.user.id}> wants to swap with <@{t_id}>!\n\nGives: **{u_c}**\nGets: **{t_c}**", color=0xFEE75C)
+        emb = discord.Embed(title="🔄 Swap Request", description=f"<@{interaction.user.id}> wants to swap with <@{t_id}>!\n\nGives: **{u_c}**\nGets: **{t_c}**", color=0xF1C40F)
         view = SwapAcceptView(self.key, interaction.user.id, t_id, u_c, t_c)
         try:
             view.message = await swap_ch.send(content=f"<@{t_id}>", embed=emb, view=view)
@@ -261,7 +261,7 @@ class SwapAcceptView(GuardedView):
             child.disabled = True
         if self.message and self.message.embeds:
             emb = self.message.embeds[0]
-            emb.color = 0x4E5058
+            emb.color = 0x95A5A6
             emb.title = "⌛ Swap Expired"
             try:
                 await self.message.edit(embed=emb, view=self)
@@ -301,7 +301,7 @@ class SwapAcceptView(GuardedView):
             child.disabled = True
 
         emb = interaction.message.embeds[0]
-        emb.color = 0x57F287
+        emb.color = 0x2ECC71
         emb.title = "✅ Swap Completed"
         await interaction.response.edit_message(embed=emb, view=self)
         self.stop()
@@ -318,7 +318,7 @@ class SwapAcceptView(GuardedView):
             child.disabled = True
 
         emb = interaction.message.embeds[0]
-        emb.color = 0xED4245
+        emb.color = 0xE74C3C
         emb.title = "❌ Swap Declined"
         await interaction.response.edit_message(embed=emb, view=self)
         self.stop()
@@ -530,13 +530,13 @@ class HostActionsView(GuardedView):
         s_id = get_config(interaction.guild_id).get("stats_channel")
         s_ch = interaction.guild.get_channel(s_id) if s_id else None
         if s_ch:
-            emb = discord.Embed(description=f"## 📊 {info['display_name']}\n-# Event results", color=0x5865F2)
+            emb = discord.Embed(description=f"## 📊 Event Results\n{DIV}", color=0xF1C40F)
+            emb.add_field(name="Event", value=f"**{info['display_name']}**", inline=False)
             emb.add_field(name="Host", value=f"<@{info['host_id']}>", inline=True)
-            emb.add_field(name="Players", value=f"**{p_count}**", inline=True)
-            emb.add_field(name="Live for", value=f"**{dur}h**", inline=True)
+            emb.add_field(name="Duration", value=f"{dur} Hours", inline=True)
+            emb.add_field(name="Players", value=f"{p_count}", inline=True)
             if info.get("helpers"):
-                emb.add_field(name="Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
-            emb.set_footer(text="Played in this event? Rate the host below · open for 1 hour")
+                emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
             try:
                 stats_msg = await s_ch.send(embed=emb, view=RateBtnView())
                 info["rate_msg"] = stats_msg.id

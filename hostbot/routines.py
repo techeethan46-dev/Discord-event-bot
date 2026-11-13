@@ -125,15 +125,15 @@ def build_weekly_summary(guild, start, end):
 
     regulars = sorted(((n, u) for u, n in played.items() if n > 1), reverse=True)[:3]
 
-    emb = discord.Embed(color=0x5865F2, description=(
-        f"## 📅 Weekly Summary\n"
-        f"-# <t:{start}:D> → <t:{end - 1}:D>"))
+    emb = discord.Embed(color=0x3498DB, description=(
+        f"# 📅 Weekly Summary\n"
+        f"<t:{start}:D> → <t:{end - 1}:D>\n{DIV}"))
     emb.add_field(name="🎪 Events", value=f"**{len(week)}**", inline=True)
     emb.add_field(name="👥 Players", value=f"**{players}**", inline=True)
     emb.add_field(name="📈 Avg / Event", value=f"**{players / len(week):.1f}**", inline=True)
     emb.add_field(name="🧍 Different Players", value=f"**{len(played)}**", inline=True)
     emb.add_field(name="🆕 New Players", value=f"**{len(new_players)}**", inline=True)
-    emb.add_field(name="🔁 Returning", value=f"**{len(played) - len(new_players)}**", inline=True)
+    emb.add_field(name="​", value="​", inline=True)
     emb.add_field(name="🏟️ Biggest Event",
                   value=f"**{biggest['display_name']}** · {event_player_count(biggest)} players · <@{biggest['host_id']}>",
                   inline=False)

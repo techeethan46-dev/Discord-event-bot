@@ -35,7 +35,7 @@ def build_player_profile_embed(guild, member):
                     key=lambda e: e.get("concluded_at", 0))
     helped = sum(1 for e in counted_events(guild.id) if uid in {int(i) for i in e.get("helpers", [])})
 
-    emb = discord.Embed(title=f"🎮 {member.display_name} · Player Profile", color=0x57F287)
+    emb = discord.Embed(title=f"🎮 {member.display_name} · Player Profile", color=0x2ECC71)
     if member.display_avatar:
         emb.set_thumbnail(url=member.display_avatar.url)
 
