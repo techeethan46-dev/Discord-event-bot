@@ -506,8 +506,19 @@ async def process_waitlist(info, opened, guild, channel):
 
     await add_event_role(guild, promo["discord_id"])
 
-    if channel:
-        try: 
-            await channel.send(f"🔔 <@{promo['discord_id']}> **{promo['country'].title()}** opened up and you got it!")
-        except discord.HTTPException: 
+    # Tell the promoted player privately; only if their DMs are closed, ping them in the
+    # event channel with a note that cleans itself up after 2 minutes.
+    note = f"🔔 **{promo['country'].title()}** opened up in **{info['display_name']}** and you got it!"
+    member = guild.get_member(int(promo["discord_id"]))
+    dm_sent = False
+    if member:
+        try:
+            await member.send(note)
+            dm_sent = True
+        except discord.HTTPException:
+            pass
+    if not dm_sent and channel:
+        try:
+            await channel.send(f"<@{promo['discord_id']}> {note}", delete_after=120)
+        except discord.HTTPException:
             pass

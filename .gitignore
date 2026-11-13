@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+events_data.json
+events_data.json.tmp

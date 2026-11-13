@@ -1,4 +1,5 @@
-"""Event features: buttons, claim/swap/rate modals, host panel, /event, /set_superpowers, /blacklist, /trust, /trusted_list."""
+"""Event features: buttons, claim/swap/rate modals, host panel, /event, /set_superpowers, /cohost, /edit_event,
+/blacklist add/remove/list, /trust, /trusted_list."""
 
 import difflib
 import discord
@@ -13,8 +14,8 @@ from hostbot.hosts import (
     check_and_announce_achievements, check_host, trial_state,
 )
 from hostbot.shared import (
-    DIV, GuardedView, add_event_role, build_embed, event_in_guild, event_log,
-    find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip,
+    BRAND, DIV, GuardedView, add_event_role, add_footer_divider, build_embed, event_in_guild, event_log,
+    find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip, log_action,
     new_event_key, parse_time, process_waitlist, refresh_event_message, remove_event_role,
 )
 
@@ -161,8 +162,9 @@ class ClaimModal(discord.ui.Modal, title="Claim Spot"):
             await remove_event_role(interaction.guild, interaction.user.id)
             save_db(db)
 
-            await refresh_event_message(info, interaction.guild)
+            # Answer first: Discord only allows 3 seconds before the first reply.
             await interaction.response.send_message(f"Spot taken/full! Added to waitlist for {c_title}.", ephemeral=True)
+            await refresh_event_message(info, interaction.guild)
             await event_log(interaction.guild, info, "waitlist", f"<@{interaction.user.id}> joined the waitlist for **{c_title}**")
             return
 
@@ -339,6 +341,9 @@ class KickSelect(discord.ui.Select):
         if not info or c_title not in info["reservations"]:
             await interaction.followup.send("That spot is already gone.", ephemeral=True)
             return
+        if info.get("concluded"):
+            await interaction.followup.send("This event has already concluded.", ephemeral=True)
+            return
 
         uid = info["reservations"][c_title]["discord_id"]
         del info["reservations"][c_title]
@@ -354,13 +359,18 @@ class KickSelect(discord.ui.Select):
         await interaction.followup.send(f"Kicked **{c_title}**.", ephemeral=True)
 
 class RateBtnView(GuardedView):
-    def __init__(self, h_id, e_key):
-        super().__init__(timeout=3600)
-        self.h_id, self.e_key = h_id, e_key
+    """Persistent (survives restarts): the event is looked up from the stats message the button is on."""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Rate Host", style=discord.ButtonStyle.success, custom_id="rate_host_btn")
     async def rate(self, i, b):
-        await i.response.send_modal(RateModal(self.h_id, self.e_key))
+        found = next(((k, e) for k, e in db["events"].items() if e.get("rate_msg") == i.message.id), None)
+        if not found:
+            await i.response.send_message("This rating is no longer available.", ephemeral=True)
+            return
+        key, info = found
+        await i.response.send_modal(RateModal(info["host_id"], key))
 
 class HelperSelect(discord.ui.UserSelect):
     def __init__(self, key):
@@ -380,6 +390,69 @@ class HelperSelect(discord.ui.UserSelect):
         await refresh_event_message(info, interaction.guild)
         await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set helpers: {names or 'none'}")
 
+async def cancel_event(guild, key):
+    """Delete an event completely: its embed, its log, the participant roles and the record itself,
+    so nothing from it counts towards stats, achievements, profiles or summaries."""
+    info = db["events"].pop(key, None)
+    if not info:
+        return False
+    save_db(db)
+
+    # Take the Event Participant role back, unless the player is in another running event.
+    still_playing = set()
+    for e in db["events"].values():
+        if not e.get("concluded") and e.get("guild_id") == guild.id:
+            still_playing |= {int(u["discord_id"]) for u in e.get("reservations", {}).values()}
+    for u in info.get("reservations", {}).values():
+        if int(u["discord_id"]) not in still_playing:
+            await remove_event_role(guild, int(u["discord_id"]))
+
+    ch = bot.get_channel(info.get("channel_id"))
+    for mid in info.get("message_ids") or []:
+        if ch:
+            try:
+                await ch.get_partial_message(int(mid)).delete()
+            except discord.HTTPException:
+                pass
+    lm = info.get("log_msg") or {}
+    log_ch = bot.get_channel(lm.get("ch")) if lm else None
+    if log_ch:
+        try:
+            await log_ch.get_partial_message(int(lm["id"])).delete()
+        except discord.HTTPException:
+            pass
+    return True
+
+
+class CancelConfirmView(GuardedView):
+    def __init__(self, key):
+        super().__init__(timeout=60)
+        self.key = key
+
+    @discord.ui.button(label="Yes, cancel and delete it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, btn):
+        if not is_authorized_manager(interaction.user):
+            await interaction.response.send_message("Admins or managers only.", ephemeral=True)
+            return
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.edit_message(content="That event no longer exists.", view=None)
+            return
+        if info.get("concluded"):
+            await interaction.response.edit_message(content="This event already concluded, so it can't be cancelled.", view=None)
+            return
+        name = info.get("display_name", "event")
+        await interaction.response.edit_message(content=f"Cancelling **{name}**...", view=None)
+        await cancel_event(interaction.guild, self.key)
+        await interaction.edit_original_response(content=f"🗑️ **{name}** was cancelled and deleted. Nothing from it will be counted.")
+        self.stop()
+
+    @discord.ui.button(label="Keep the event", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction, btn):
+        await interaction.response.edit_message(content="Okay, the event stays.", view=None)
+        self.stop()
+
+
 class HostActionsView(GuardedView):
     def __init__(self, key):
         super().__init__(timeout=300)
@@ -396,6 +469,20 @@ class HostActionsView(GuardedView):
             return True
         await interaction.response.send_message("Admins or managers only.", ephemeral=True)
         return False
+
+    @discord.ui.button(label="Cancel Event", style=discord.ButtonStyle.secondary, emoji="🗑️", row=1)
+    async def cancel(self, interaction, btn):
+        info = db["events"].get(self.key)
+        if not info:
+            await interaction.response.send_message("Event not found.", ephemeral=True)
+            return
+        if info.get("concluded"):
+            await interaction.response.send_message("This event already concluded, so it can't be cancelled.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Cancel **{info['display_name']}**? This deletes the event message and its log, removes the "
+            f"Event Participant role from the players, and nothing from it will be counted. This can't be undone.",
+            view=CancelConfirmView(self.key), ephemeral=True)
 
     @discord.ui.button(label="Conclude Event", style=discord.ButtonStyle.danger, row=1)
     async def conclude(self, interaction, btn):
@@ -452,7 +539,9 @@ class HostActionsView(GuardedView):
             if info.get("helpers"):
                 emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
             try:
-                await s_ch.send(embed=emb, view=RateBtnView(info["host_id"], self.key))
+                stats_msg = await s_ch.send(embed=emb, view=RateBtnView())
+                info["rate_msg"] = stats_msg.id
+                save_db(db)
             except discord.HTTPException as e:
                 print("stats post failed:", e)
 
@@ -622,30 +711,403 @@ async def set_sp(interaction: discord.Interaction, event_name: str, nations: str
     info["superpowers"] = sps
     save_db(db)
 
-    await refresh_event_message(info, interaction.guild)
     await interaction.response.send_message(f"Superpowers set: {', '.join(sps)}", ephemeral=True)
+    await refresh_event_message(info, interaction.guild)
     await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> set superpowers: {', '.join(sps)}")
 
-@bot.tree.command(name="blacklist", description="Blacklist user")
+# ==========================================
+# /cohost and /edit_event
+# ==========================================
+@bot.tree.command(name="cohost", description="Set or remove the co-host of an event")
 @app_commands.guild_only()
-async def blacklist(interaction: discord.Interaction, user: discord.Member):
+@app_commands.autocomplete(event_name=ev_autocomplete)
+@app_commands.describe(event_name="The event", member="The co-host (leave empty to remove the current one)")
+async def cohost_cmd(interaction: discord.Interaction, event_name: str, member: discord.Member = None):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    key, info = find_active_event(event_name, interaction.guild_id)
+    if not info:
+        await interaction.response.send_message("Event not found.", ephemeral=True)
+        return
+    if member and member.bot:
+        await interaction.response.send_message("Bots can't co-host.", ephemeral=True)
+        return
+    if member and member.id == info["host_id"]:
+        await interaction.response.send_message("That's already the host.", ephemeral=True)
+        return
+    if member:
+        info["cohost_id"] = member.id
+        text = f"{member.mention} is now co-hosting **{info['display_name']}**."
+        log = f"<@{interaction.user.id}> set <@{member.id}> as co-host"
+    else:
+        if not info.get("cohost_id"):
+            await interaction.response.send_message("This event has no co-host.", ephemeral=True)
+            return
+        old = info.pop("cohost_id")
+        text = f"Removed the co-host from **{info['display_name']}**."
+        log = f"<@{interaction.user.id}> removed <@{old}> as co-host"
+    save_db(db)
+    await interaction.response.send_message(text, ephemeral=True)
+    await refresh_event_message(info, interaction.guild)
+    await event_log(interaction.guild, info, "host", log)
+
+
+@bot.tree.command(name="edit_event", description="Change an event's name, times or player limit")
+@app_commands.guild_only()
+@app_commands.autocomplete(event_name=ev_autocomplete)
+@app_commands.describe(
+    event_name="The event to edit",
+    new_name="New name",
+    starts_in="When reservations open, counted from now: 10m, 1h30m, now (the length stays the same)",
+    duration="How long reservations stay open: 30m, 1h",
+    max_players="New player limit (0 = no limit)",
+)
+async def edit_event_cmd(interaction: discord.Interaction, event_name: str, new_name: str = None,
+                         starts_in: str = None, duration: str = None, max_players: int = None):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    key, info = find_active_event(event_name, interaction.guild_id)
+    if not info:
+        await interaction.response.send_message("Event not found.", ephemeral=True)
+        return
+    if new_name is None and starts_in is None and duration is None and max_players is None:
+        await interaction.response.send_message("Tell me at least one thing to change.", ephemeral=True)
+        return
+
+    changes = []
+    if new_name is not None:
+        new_name = " ".join(new_name.split())[:100]
+        if not new_name:
+            await interaction.response.send_message("The new name can't be empty.", ephemeral=True)
+            return
+        _, other = find_active_event(new_name, interaction.guild_id)
+        if other and other is not info:
+            await interaction.response.send_message("An active event with that name already exists.", ephemeral=True)
+            return
+
+    start, end = info["start_time"], info["end_time"]
+    if starts_in is not None or duration is not None:
+        s_off = parse_time(starts_in) if starts_in is not None else None
+        d_sec = parse_time(duration) if duration is not None else None
+        if (starts_in is not None and s_off is None) or (duration is not None and d_sec is None):
+            await interaction.response.send_message(
+                "I couldn't read that time. Use things like `10m`, `1h30m`, `2d` (or `now` for the start).", ephemeral=True)
+            return
+        length = end - start
+        if s_off is not None:
+            start = int(time.time()) + s_off
+        if d_sec is not None:
+            length = d_sec if d_sec > 0 else 1800
+        end = start + length
+        if end <= time.time():
+            await interaction.response.send_message("That would end the event in the past.", ephemeral=True)
+            return
+
+    if new_name is not None and new_name != info["display_name"]:
+        changes.append(f"name **{info['display_name']}** → **{new_name}**")
+        info["display_name"] = new_name
+    if start != info["start_time"]:
+        changes.append(f"opens <t:{start}:f>")
+        info["start_time"] = start
+    if end != info["end_time"]:
+        changes.append(f"closes <t:{end}:f>")
+        info["end_time"] = end
+        info.pop("reminded", None)  # the reminder follows the new time
+    if max_players is not None and max(0, max_players) != info.get("max_players", 0):
+        changes.append(f"max players **{max(0, max_players) or 'no limit'}**")
+        info["max_players"] = max(0, max_players)
+
+    if not changes:
+        await interaction.response.send_message("Nothing changed, those are already the event's settings.", ephemeral=True)
+        return
+    save_db(db)
+    await interaction.response.send_message("✏️ Updated: " + ", ".join(changes), ephemeral=True)
+
+    # More room now? Move people up from the waitlist.
+    ch = bot.get_channel(info["channel_id"])
+    cap = info.get("max_players", 0)
+    while info.get("waitlist") and (cap == 0 or len(info["reservations"]) < cap):
+        before = len(info["waitlist"])
+        await process_waitlist(info, "", interaction.guild, ch)
+        if len(info["waitlist"]) == before:
+            break
+    save_db(db)
+    await refresh_event_message(info, interaction.guild)
+    await event_log(interaction.guild, info, "host", f"<@{interaction.user.id}> edited the event: " + ", ".join(changes))
+    if cap and len(info["reservations"]) > cap:
+        await interaction.followup.send(
+            f"Heads up: {len(info['reservations'])} people already have spots, which is more than the new limit of {cap}. "
+            "Nobody was removed; new players just can't claim until it drops below the limit.", ephemeral=True)
+
+
+# ==========================================
+# /blacklist add · remove · list
+# ==========================================
+def blacklist_info(guild_id):
+    return db.setdefault("blacklist_info", {}).setdefault(str(guild_id), {})
+
+
+def unblacklist(guild_id, user_id):
+    lst = db["blacklists"].get(str(guild_id), [])
+    if user_id in lst:
+        lst.remove(user_id)
+    blacklist_info(guild_id).pop(str(user_id), None)
+
+
+async def remove_from_active_events(guild, user_id):
+    """A newly blacklisted player loses their spots and waitlist places in running events."""
+    removed = []
+    for info in db["events"].values():
+        if info.get("concluded") or info.get("guild_id") != guild.id:
+            continue
+        changed = False
+        for country, u in list(info.get("reservations", {}).items()):
+            if u["discord_id"] == user_id:
+                del info["reservations"][country]
+                changed = True
+                ch = bot.get_channel(info["channel_id"])
+                await process_waitlist(info, country, guild, ch)
+        wait = info.get("waitlist", [])
+        if any(w["discord_id"] == user_id for w in wait):
+            info["waitlist"] = [w for w in wait if w["discord_id"] != user_id]
+            changed = True
+        if changed:
+            removed.append(info)
+    if removed:
+        await remove_event_role(guild, user_id)
+        save_db(db)
+        for info in removed:
+            await refresh_event_message(info, guild)
+            await event_log(guild, info, "host", f"<@{user_id}> was removed (blacklisted)")
+    return removed
+
+
+def add_blacklist(guild_id, user_id, by_id, reason=None, until=None):
+    """Put someone on the blacklist (or update their entry). Returns True if they were already on it."""
+    lst = db["blacklists"].setdefault(str(guild_id), [])
+    already = user_id in lst
+    if not already:
+        lst.append(user_id)
+    blacklist_info(guild_id)[str(user_id)] = {"reason": reason, "by": by_id, "at": int(time.time()), "until": until}
+    save_db(db)
+    return already
+
+
+blacklist_group = app_commands.Group(name="blacklist", description="Keep players out of events", guild_only=True)
+bot.tree.add_command(blacklist_group)
+
+
+@blacklist_group.command(name="add", description="Blacklist a player from events")
+@app_commands.describe(user="Who to blacklist", reason="Why (shown in the list and the log)",
+                       duration="How long, like 3d or 12h (leave empty for permanent)")
+async def blacklist_add(interaction: discord.Interaction, user: discord.Member, reason: str = None, duration: str = None):
     if not is_server_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
+    if user.bot:
+        await interaction.response.send_message("Bots don't join events.", ephemeral=True)
+        return
+    until = None
+    if duration:
+        secs = parse_time(duration)
+        if not secs:
+            await interaction.response.send_message("I couldn't read that duration. Use things like `12h`, `3d`, `1d12h`.", ephemeral=True)
+            return
+        until = int(time.time()) + secs
+    reason = (reason or "").strip()[:200] or None
 
-    gid = str(interaction.guild_id)
-    if gid not in db["blacklists"]: 
-        db["blacklists"][gid] = []
+    updating = add_blacklist(interaction.guild_id, user.id, interaction.user.id, reason, until)
 
-    if user.id in db["blacklists"][gid]:
-        db["blacklists"][gid].remove(user.id)
-        msg = f"Unblacklisted {user.mention}."
-    else:
-        db["blacklists"][gid].append(user.id)
-        msg = f"Blacklisted {user.mention}."
+    length = f"until <t:{until}:f> (<t:{until}:R>)" if until else "permanently"
+    await interaction.response.send_message(
+        f"⛔ {user.mention} is {'now ' if not updating else 'still '}blacklisted {length}."
+        + (f"\n**Reason:** {reason}" if reason else ""), ephemeral=True)
+    removed = await remove_from_active_events(interaction.guild, user.id)
+    if removed:
+        await interaction.followup.send(
+            "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
+    await log_action(interaction.guild, "Player Blacklisted",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Length:** {length}"
+                     + (f"\n**Reason:** {reason}" if reason else ""), color=0xE74C3C)
 
+
+@blacklist_group.command(name="remove", description="Take a player off the blacklist")
+async def blacklist_remove(interaction: discord.Interaction, user: discord.User):
+    if not is_server_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if user.id not in db["blacklists"].get(str(interaction.guild_id), []):
+        await interaction.response.send_message(f"{user.mention} isn't blacklisted.", ephemeral=True)
+        return
+    unblacklist(interaction.guild_id, user.id)
     save_db(db)
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.response.send_message(f"✅ {user.mention} can join events again.", ephemeral=True)
+    await log_action(interaction.guild, "Player Unblacklisted",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}", color=0x2ECC71)
+
+
+@blacklist_group.command(name="list", description="See who is blacklisted and why")
+async def blacklist_list(interaction: discord.Interaction):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Managers only.", ephemeral=True)
+        return
+    ids = db["blacklists"].get(str(interaction.guild_id), [])
+    meta = blacklist_info(interaction.guild_id)
+    lines = []
+    for uid in ids:
+        m = meta.get(str(uid), {})
+        until = m.get("until")
+        line = f"• <@{uid}> · " + (f"ends <t:{until}:R>" if until else "permanent")
+        if m.get("reason"):
+            line += f"\n  ↳ {m['reason']}"
+        if m.get("by"):
+            line += f"\n  ↳ by <@{m['by']}> <t:{m.get('at', 0)}:R>"
+        lines.append(line)
+    body = "\n".join(lines) if lines else "*Nobody is blacklisted.*"
+    if len(body) > 3800:
+        body = body[:3800] + "\n*…and more*"
+    emb = discord.Embed(description=f"# ⛔ Blacklist · {len(ids)}\n{DIV}\n{body}", color=0xE74C3C)
+    add_footer_divider(emb)
+    emb.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ==========================================
+# /warn · /warnings · /unwarn
+# ==========================================
+WARN_LIMIT = 5                 # this many warnings...
+WARN_WINDOW_DAYS = 30          # ...within this many days...
+WARN_BLACKLIST_DAYS = 7        # ...means a blacklist of this long
+
+
+def warn_list(guild_id, user_id):
+    return db.setdefault("warns", {}).setdefault(str(guild_id), {}).setdefault(str(user_id), [])
+
+
+def active_warns(guild_id, user_id):
+    """Warnings from the last 30 days that haven't already led to a blacklist."""
+    cutoff = time.time() - WARN_WINDOW_DAYS * 86400
+    return [w for w in db.get("warns", {}).get(str(guild_id), {}).get(str(user_id), [])
+            if w["at"] >= cutoff and not w.get("used")]
+
+
+@bot.tree.command(name="warn", description="Warn a player (5 warnings in 30 days = 1 week blacklist)")
+@app_commands.guild_only()
+@app_commands.describe(user="Who to warn", reason="What they did")
+async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reason: str):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    if user.bot or user.id == interaction.user.id:
+        await interaction.response.send_message("You can't warn that person.", ephemeral=True)
+        return
+    if is_server_admin(user):
+        await interaction.response.send_message("Admins can't be warned.", ephemeral=True)
+        return
+    reason = reason.strip()[:200] or "No reason given"
+    warn_list(interaction.guild_id, user.id).append({"reason": reason, "by": interaction.user.id, "at": int(time.time())})
+    save_db(db)
+    active = active_warns(interaction.guild_id, user.id)
+    count = len(active)
+
+    blacklisted = False
+    if count >= WARN_LIMIT:
+        for w in active:
+            w["used"] = True  # these warnings are now "spent", the count starts again from 0
+        until = int(time.time()) + WARN_BLACKLIST_DAYS * 86400
+        current = blacklist_info(interaction.guild_id).get(str(user.id))
+        on_list = user.id in db["blacklists"].get(str(interaction.guild_id), [])
+        # Never shorten a blacklist that's already longer (or permanent).
+        if not on_list or (current and current.get("until") and current["until"] < until):
+            add_blacklist(interaction.guild_id, user.id, interaction.user.id,
+                          f"Reached {WARN_LIMIT} warnings in {WARN_WINDOW_DAYS} days", until)
+        blacklisted = True
+
+    try:
+        await user.send(
+            f"⚠️ You were warned in **{interaction.guild.name}**.\n**Reason:** {reason}\n"
+            + (f"That was your {WARN_LIMIT}th warning in {WARN_WINDOW_DAYS} days, so you're blacklisted from events "
+               f"for {WARN_BLACKLIST_DAYS} days." if blacklisted
+               else f"Warnings: **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days. "
+                    f"At {WARN_LIMIT} you get blacklisted from events for {WARN_BLACKLIST_DAYS} days."))
+    except discord.HTTPException:
+        pass
+
+    if blacklisted:
+        await interaction.response.send_message(
+            f"⚠️ Warned {user.mention}. That's **{WARN_LIMIT}/{WARN_LIMIT}**, so they're now ⛔ blacklisted for "
+            f"{WARN_BLACKLIST_DAYS} days.", ephemeral=True)
+        removed = await remove_from_active_events(interaction.guild, user.id)
+        if removed:
+            await interaction.followup.send(
+                "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"⚠️ Warned {user.mention} · **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days.", ephemeral=True)
+
+    await log_action(interaction.guild, "Player Warned",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Reason:** {reason}\n"
+                     f"**Warnings:** {count}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days)"
+                     + (f"\n⛔ **Blacklisted for {WARN_BLACKLIST_DAYS} days**" if blacklisted else ""),
+                     color=0xF1C40F)
+
+
+@bot.tree.command(name="warnings", description="See a player's warnings")
+@app_commands.guild_only()
+async def warnings_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
+    active = active_warns(interaction.guild_id, user.id)
+    lines = []
+    for w in reversed(allw[-15:]):
+        tag = "" if w in active else " · *expired*" if not w.get("used") else " · *led to blacklist*"
+        lines.append(f"• <t:{w['at']}:d> · {w['reason']}\n  ↳ by <@{w['by']}>{tag}")
+    body = "\n".join(lines) or "*No warnings.*"
+    emb = discord.Embed(color=0xF1C40F, description=(
+        f"# ⚠️ Warnings · {user.display_name}\n{DIV}\n"
+        f"**Active:** {len(active)}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days) · **All time:** {len(allw)}\n{DIV}\n{body}"))
+    add_footer_divider(emb)
+    emb.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="unwarn", description="Remove a player's most recent warning")
+@app_commands.guild_only()
+async def unwarn_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
+    if not allw:
+        await interaction.response.send_message(f"{user.mention} has no warnings.", ephemeral=True)
+        return
+    w = allw.pop()
+    save_db(db)
+    await interaction.response.send_message(
+        f"Removed {user.mention}'s latest warning (*{w['reason']}*). "
+        f"They now have **{len(active_warns(interaction.guild_id, user.id))}/{WARN_LIMIT}** active.", ephemeral=True)
+    await log_action(interaction.guild, "Warning Removed",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Removed:** {w['reason']}",
+                     color=0xF1C40F)
+
+
+def expire_blacklists():
+    """Remove timed blacklists that have run out. Returns True if anything changed."""
+    now = time.time()
+    changed = False
+    for gid, meta in list(db.get("blacklist_info", {}).items()):
+        for uid, m in list(meta.items()):
+            if m.get("until") and m["until"] <= now:
+                unblacklist(int(gid), int(uid))
+                changed = True
+    if changed:
+        save_db(db)
+    return changed
+
 
 @bot.tree.command(name="trust", description="Owner only: add/remove someone from the bot's admin list in THIS server")
 @app_commands.guild_only()

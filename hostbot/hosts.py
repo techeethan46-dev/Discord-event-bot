@@ -320,7 +320,11 @@ def build_host_profile_embed(guild, member):
     if member.display_avatar:
         embed.set_thumbnail(url=member.display_avatar.url)
 
-    embed.add_field(name="📅 Events Hosted", value=f"**{total_events:,}**", inline=True)
+    cohosted = sum(1 for e in db["events"].values()
+                   if e.get("guild_id") == guild.id and e.get("cohost_id") == member.id
+                   and e.get("concluded") and not e.get("cancelled"))
+    embed.add_field(name="📅 Events Hosted",
+                    value=f"**{total_events:,}**" + (f"\n+ {cohosted} co-hosted" if cohosted else ""), inline=True)
     embed.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
     embed.add_field(name="⭐ Average Rating", value=f"**{average_rating:.2f}/5**" if ratings else "**No ratings yet**", inline=True)
     embed.add_field(
@@ -764,7 +768,9 @@ def close_trial_voting(rev_id):
     rev["closed_at"] = int(time.time())
     guild = bot.get_guild(rev["guild_id"])
     if guild:
-        set_trial_state(guild.id, rev["host_id"], status="review", review=rev.get("message_id"))
+        # The vote is over: mark the trial finished so the host can be re-appointed later.
+        # Roles are still handed out manually; nothing is promoted or demoted here.
+        set_trial_state(guild.id, rev["host_id"], status="done", review=rev.get("message_id"))
     save_db(db)
     task = asyncio.create_task(_finish_trial_closure(rev_id))
     _bg_tasks.add(task)

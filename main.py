@@ -9,13 +9,15 @@ from hostbot.core import bot, keep_alive
 from hostbot import core
 
 # Importing these registers every command, event and view with the bot.
-from hostbot import ai, events, hosts, server_tools, lifecycle, panels  # noqa: F401
+from hostbot import ai, events, hosts, server_tools, lifecycle, panels, players  # noqa: F401
 
 tk = os.environ.get("BOT_TOKEN")
 if tk:
     keep_alive()
     try:
-        bot.run(tk, reconnect=False)
+        # reconnect=True lets discord.py resume after normal gateway drops. A 429 at login
+        # still raises below, so the safe-hold behaviour for rate limits is unchanged.
+        bot.run(tk, reconnect=True)
     except discord.HTTPException as e:
         if getattr(e, "status", None) == 429:
             core.RATE_LIMIT_TRIGGERED = True

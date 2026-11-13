@@ -11,9 +11,10 @@ from hostbot.core import (
     _bg_tasks, ai_history, bot, db, enforce_existing_guilds_safely, get_config, save_db,
     schedule_whitelist_enforcement, swap_cooldowns, user_cooldowns,
 )
-from hostbot.events import EventButtonsView
+from hostbot.events import EventButtonsView, RateBtnView, expire_blacklists
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
-from hostbot.server_tools import _talk_cooldowns
+from hostbot.routines import cleanup_old_events, post_weekly_summaries, send_due_reminders
+from hostbot.server_tools import _talk_cooldowns, _talk_pings
 from hostbot.shared import EventLogView, is_server_admin, refresh_event_message
 from hostbot import core
 
@@ -83,6 +84,20 @@ async def refresh_timers():
     except Exception as e:
         print("close_due_trials error:", e)
 
+    for job in (send_due_reminders, post_weekly_summaries):
+        try:
+            await job()
+        except Exception as e:
+            print(f"{job.__name__} error:", e)
+    try:
+        expire_blacklists()
+    except Exception as e:
+        print("expire_blacklists error:", e)
+    try:
+        cleanup_old_events()
+    except Exception as e:
+        print("cleanup_old_events error:", e)
+
     # Housekeeping so these dicts don't grow forever.
     cutoff = time.time() - 3600
     for d in (user_cooldowns, swap_cooldowns):
@@ -92,6 +107,8 @@ async def refresh_timers():
         ai_history.pop(next(iter(ai_history)))
     for uid in [uid for uid, ts in _talk_cooldowns.items() if ts < cutoff]:
         _talk_cooldowns.pop(uid, None)
+    for uid in [uid for uid, ts in _talk_pings.items() if not ts or ts[-1] < cutoff]:
+        _talk_pings.pop(uid, None)
 
 @refresh_timers.before_loop
 async def before_refresh_timers():
@@ -100,6 +117,7 @@ async def before_refresh_timers():
 async def setup_hook():
     bot.add_view(EventButtonsView())
     bot.add_view(EventLogView())
+    bot.add_view(RateBtnView())
     bot.add_view(TrialVoteView())
     bot.add_view(TrialLogView())
     refresh_timers.start()
@@ -139,7 +157,7 @@ async def on_ready():
 @commands.guild_only()
 async def sync(ctx):
     if not is_server_admin(ctx.author):
-        await ctx.send("Admins only.")
+        await ctx.send("Admins only.", delete_after=10)
         return
     s = await bot.tree.sync()
-    await ctx.send(f"Synced {len(s)} commands.")
+    await ctx.send(f"Synced {len(s)} commands.", delete_after=10)

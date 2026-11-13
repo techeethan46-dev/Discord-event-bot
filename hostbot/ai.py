@@ -743,7 +743,12 @@ async def act_purge(ctx, a):
     if not (me.manage_messages and me.read_message_history):
         return False, f"I need **Manage Messages** and **Read Message History** in {ch.mention}."
     n = max(1, min(100, _to_int(a.get("count"), 10)))
-    target = find_member(ctx.guild, a.get("member")) if a.get("member") else None
+    target = None
+    if a.get("member"):
+        target = find_member(ctx.guild, a.get("member"))
+        if not target:
+            # Never fall back to deleting everyone's messages when the named member can't be found.
+            return False, "Couldn't find that member, so I didn't delete anything."
     before = discord.Object(id=ctx.msg.id) if ch.id == ctx.msg.channel.id else None
     check = (lambda m: m.author.id == target.id) if target else (lambda m: True)
     try:
@@ -982,7 +987,7 @@ async def run_admin_flow(msg, txt):
             plan = await parse_admin_request(txt, image_urls=image_urls)
 
         if plan is None:
-            await safe_reply(msg, "⚠️ Couldn't reach my brain right now, try again in a sec.")
+            await safe_reply(msg, "⚠️ Couldn't reach my brain right now, try again in a sec.", delete_after=15)
             return
 
         if not plan:
@@ -1310,7 +1315,7 @@ async def process_ai_queue():
                         f"• OpenRouter Error: `{openrouter_err or 'None'}`\n• User Message: `{txt[:300]}`",
                         key="ai_fail")
                     # Send clean generic message in public channel
-                    await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.")
+                    await safe_reply(msg, "⚠️ My brain laggin right now, try again in a sec bro.", delete_after=15)
                     continue
 
                 tag = GIF_TAG_RE.search(ans)
@@ -1339,7 +1344,7 @@ async def process_ai_queue():
         except Exception as e:
             print("AI Chat Error:", e)
             await dm_owners(f"⚠️ **Critical AI Exception:** `{e}`", key="ai_crash")
-            await safe_reply(msg, "⚠️ Something went wrong, my bad bro.")
+            await safe_reply(msg, "⚠️ Something went wrong, my bad bro.", delete_after=15)
         finally:
             ai_queue.task_done()
             await asyncio.sleep(2)
@@ -1363,6 +1368,9 @@ async def handle_ai_trigger(msg):
 
     # Host Assistant AI is intentionally gated. The bot owners/admins always pass;
     # normal AI access is VIP or Staff. Image vision is a separate Double Booster perk.
+    # In DMs there is no server role to check, so only bot owners and allowed users may chat there.
+    if not msg.guild and msg.author.id not in BOT_OWNER_IDS and msg.author.id not in ALLOWED_USER_IDS:
+        return
     if msg.guild and not is_ai_user(msg.author, msg.guild.id):
         # Replying to one of our own notices must not trigger another one (no notice chains).
         if is_reply and ref.embeds and (ref.embeds[0].title or "").startswith("🔒"):
@@ -1392,20 +1400,12 @@ async def handle_ai_trigger(msg):
         return
 
     if not txt and not has_image:
-        await safe_reply(msg, "tf you want bro?")
+        await safe_reply(msg, "tf you want bro?", delete_after=10)
         return
     if not txt and has_image:
         txt = "Please look at the attached image and tell me what you see."
 
     uid = msg.author.id
-
-    # Everyone who passed the AI-access check above can ask for admin actions, but each action
-    # needs the matching Discord permission (admins and bot owners can do everything).
-    if msg.guild and looks_like_admin_request(msg, txt):
-        task = asyncio.create_task(run_admin_flow(msg, txt))
-        _bg_tasks.add(task)
-        task.add_done_callback(_bg_tasks.discard)
-        return
 
     now = time.time()
 
@@ -1425,6 +1425,14 @@ async def handle_ai_trigger(msg):
         return
 
     user_cooldowns[uid] = now
+
+    # Everyone who passed the AI-access check above can ask for admin actions (cooldown applies too), but each action
+    # needs the matching Discord permission (admins and bot owners can do everything).
+    if msg.guild and looks_like_admin_request(msg, txt):
+        task = asyncio.create_task(run_admin_flow(msg, txt))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return
 
     q_size = ai_queue.qsize()
     await ai_queue.put((msg, txt, uid))
