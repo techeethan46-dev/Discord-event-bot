@@ -11,7 +11,8 @@ hostbot/
                         event banner embed, per-event log + waitlist
   events.py             event buttons, claim/swap/rate, host panel (conclude/cancel),
                         /event /set_superpowers /cohost /edit_event
-                        /blacklist add|remove|list /trust /trusted_list
+                        /blacklist add|remove|list /warn /warnings /unwarn
+                        /trust /trusted_list
   hosts.py              achievements, /host /me /achievements /analytics,
                         server enable/disable, trial-host voting
   ai.py                 chatbot, /clearchat, Groq/OpenRouter, AI admin engine

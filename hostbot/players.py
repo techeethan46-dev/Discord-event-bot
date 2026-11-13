@@ -6,7 +6,8 @@ import discord
 import time
 from discord import app_commands
 
-from hostbot.core import bot
+from hostbot.core import bot, db
+from hostbot.events import WARN_LIMIT, WARN_WINDOW_DAYS, active_warns
 from hostbot.routines import counted_events, event_players
 from hostbot.shared import BRAND, add_footer_divider
 
@@ -39,8 +40,14 @@ def build_player_profile_embed(guild, member):
     if member.display_avatar:
         emb.set_thumbnail(url=member.display_avatar.url)
 
+    warns = len(active_warns(guild.id, uid))
+    blacklisted = uid in db["blacklists"].get(str(guild.id), [])
     if not events:
         emb.description = f"<@{uid}>\n\nNo events played yet. Claim a spot in the next one!"
+        if warns or blacklisted:
+            emb.add_field(name="⚠️ Warnings", value=f"**{warns}/{WARN_LIMIT}** · last {WARN_WINDOW_DAYS} days", inline=True)
+        if blacklisted:
+            emb.add_field(name="⛔ Status", value="**Blacklisted**", inline=True)
         add_footer_divider(emb)
         emb.set_footer(text=BRAND)
         return emb
@@ -74,6 +81,9 @@ def build_player_profile_embed(guild, member):
     if hosts:
         (host, n), = hosts.most_common(1)
         emb.add_field(name="🎤 Favourite Host", value=f"<@{host}> · {n} events", inline=True)
+    emb.add_field(name="⚠️ Warnings", value=f"**{warns}/{WARN_LIMIT}** · last {WARN_WINDOW_DAYS} days", inline=True)
+    if blacklisted:
+        emb.add_field(name="⛔ Status", value="**Blacklisted**", inline=True)
     add_footer_divider(emb)
     emb.set_footer(text=BRAND)
     return emb

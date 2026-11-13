@@ -884,6 +884,17 @@ async def remove_from_active_events(guild, user_id):
     return removed
 
 
+def add_blacklist(guild_id, user_id, by_id, reason=None, until=None):
+    """Put someone on the blacklist (or update their entry). Returns True if they were already on it."""
+    lst = db["blacklists"].setdefault(str(guild_id), [])
+    already = user_id in lst
+    if not already:
+        lst.append(user_id)
+    blacklist_info(guild_id)[str(user_id)] = {"reason": reason, "by": by_id, "at": int(time.time()), "until": until}
+    save_db(db)
+    return already
+
+
 blacklist_group = app_commands.Group(name="blacklist", description="Keep players out of events", guild_only=True)
 bot.tree.add_command(blacklist_group)
 
@@ -907,13 +918,7 @@ async def blacklist_add(interaction: discord.Interaction, user: discord.Member, 
         until = int(time.time()) + secs
     reason = (reason or "").strip()[:200] or None
 
-    lst = db["blacklists"].setdefault(str(interaction.guild_id), [])
-    updating = user.id in lst
-    if not updating:
-        lst.append(user.id)
-    blacklist_info(interaction.guild_id)[str(user.id)] = {
-        "reason": reason, "by": interaction.user.id, "at": int(time.time()), "until": until}
-    save_db(db)
+    updating = add_blacklist(interaction.guild_id, user.id, interaction.user.id, reason, until)
 
     length = f"until <t:{until}:f> (<t:{until}:R>)" if until else "permanently"
     await interaction.response.send_message(
@@ -967,6 +972,127 @@ async def blacklist_list(interaction: discord.Interaction):
     add_footer_divider(emb)
     emb.set_footer(text=BRAND)
     await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ==========================================
+# /warn · /warnings · /unwarn
+# ==========================================
+WARN_LIMIT = 5                 # this many warnings...
+WARN_WINDOW_DAYS = 30          # ...within this many days...
+WARN_BLACKLIST_DAYS = 7        # ...means a blacklist of this long
+
+
+def warn_list(guild_id, user_id):
+    return db.setdefault("warns", {}).setdefault(str(guild_id), {}).setdefault(str(user_id), [])
+
+
+def active_warns(guild_id, user_id):
+    """Warnings from the last 30 days that haven't already led to a blacklist."""
+    cutoff = time.time() - WARN_WINDOW_DAYS * 86400
+    return [w for w in db.get("warns", {}).get(str(guild_id), {}).get(str(user_id), [])
+            if w["at"] >= cutoff and not w.get("used")]
+
+
+@bot.tree.command(name="warn", description="Warn a player (5 warnings in 30 days = 1 week blacklist)")
+@app_commands.guild_only()
+@app_commands.describe(user="Who to warn", reason="What they did")
+async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reason: str):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    if user.bot or user.id == interaction.user.id:
+        await interaction.response.send_message("You can't warn that person.", ephemeral=True)
+        return
+    if is_server_admin(user):
+        await interaction.response.send_message("Admins can't be warned.", ephemeral=True)
+        return
+    reason = reason.strip()[:200] or "No reason given"
+    warn_list(interaction.guild_id, user.id).append({"reason": reason, "by": interaction.user.id, "at": int(time.time())})
+    save_db(db)
+    active = active_warns(interaction.guild_id, user.id)
+    count = len(active)
+
+    blacklisted = False
+    if count >= WARN_LIMIT:
+        for w in active:
+            w["used"] = True  # these warnings are now "spent", the count starts again from 0
+        until = int(time.time()) + WARN_BLACKLIST_DAYS * 86400
+        current = blacklist_info(interaction.guild_id).get(str(user.id))
+        on_list = user.id in db["blacklists"].get(str(interaction.guild_id), [])
+        # Never shorten a blacklist that's already longer (or permanent).
+        if not on_list or (current and current.get("until") and current["until"] < until):
+            add_blacklist(interaction.guild_id, user.id, interaction.user.id,
+                          f"Reached {WARN_LIMIT} warnings in {WARN_WINDOW_DAYS} days", until)
+        blacklisted = True
+
+    try:
+        await user.send(
+            f"⚠️ You were warned in **{interaction.guild.name}**.\n**Reason:** {reason}\n"
+            + (f"That was your {WARN_LIMIT}th warning in {WARN_WINDOW_DAYS} days, so you're blacklisted from events "
+               f"for {WARN_BLACKLIST_DAYS} days." if blacklisted
+               else f"Warnings: **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days. "
+                    f"At {WARN_LIMIT} you get blacklisted from events for {WARN_BLACKLIST_DAYS} days."))
+    except discord.HTTPException:
+        pass
+
+    if blacklisted:
+        await interaction.response.send_message(
+            f"⚠️ Warned {user.mention}. That's **{WARN_LIMIT}/{WARN_LIMIT}**, so they're now ⛔ blacklisted for "
+            f"{WARN_BLACKLIST_DAYS} days.", ephemeral=True)
+        removed = await remove_from_active_events(interaction.guild, user.id)
+        if removed:
+            await interaction.followup.send(
+                "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"⚠️ Warned {user.mention} · **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days.", ephemeral=True)
+
+    await log_action(interaction.guild, "Player Warned",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Reason:** {reason}\n"
+                     f"**Warnings:** {count}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days)"
+                     + (f"\n⛔ **Blacklisted for {WARN_BLACKLIST_DAYS} days**" if blacklisted else ""),
+                     color=0xF1C40F)
+
+
+@bot.tree.command(name="warnings", description="See a player's warnings")
+@app_commands.guild_only()
+async def warnings_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
+    active = active_warns(interaction.guild_id, user.id)
+    lines = []
+    for w in reversed(allw[-15:]):
+        tag = "" if w in active else " · *expired*" if not w.get("used") else " · *led to blacklist*"
+        lines.append(f"• <t:{w['at']}:d> · {w['reason']}\n  ↳ by <@{w['by']}>{tag}")
+    body = "\n".join(lines) or "*No warnings.*"
+    emb = discord.Embed(color=0xF1C40F, description=(
+        f"# ⚠️ Warnings · {user.display_name}\n{DIV}\n"
+        f"**Active:** {len(active)}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days) · **All time:** {len(allw)}\n{DIV}\n{body}"))
+    add_footer_divider(emb)
+    emb.set_footer(text=BRAND)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="unwarn", description="Remove a player's most recent warning")
+@app_commands.guild_only()
+async def unwarn_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_authorized_manager(interaction.user):
+        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        return
+    allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
+    if not allw:
+        await interaction.response.send_message(f"{user.mention} has no warnings.", ephemeral=True)
+        return
+    w = allw.pop()
+    save_db(db)
+    await interaction.response.send_message(
+        f"Removed {user.mention}'s latest warning (*{w['reason']}*). "
+        f"They now have **{len(active_warns(interaction.guild_id, user.id))}/{WARN_LIMIT}** active.", ephemeral=True)
+    await log_action(interaction.guild, "Warning Removed",
+                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Removed:** {w['reason']}",
+                     color=0xF1C40F)
 
 
 def expire_blacklists():
