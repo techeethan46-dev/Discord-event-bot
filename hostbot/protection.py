@@ -572,6 +572,7 @@ class UndoPlan:
         self.created_channels = {}   # channel id -> name
         self.banned = {}             # user id -> name of people they banned (unbanned when undoing)
         self.kicks = 0               # kicks can't be reversed, only reported
+        self.actors = {}             # user id -> number of their actions included
 
     def empty(self):
         return not (self.deleted_roles or self.deleted_channels or self.role_edits or self.channel_edits
@@ -584,11 +585,25 @@ def _get(obj, attr):
 
 
 async def build_undo_plan(guild, user_id, hours):
+    """user_id=None means everyone, except bots, the server owner and trusted users."""
     A = discord.AuditLogAction
+    handled = {A.role_delete, A.role_create, A.role_update, A.channel_delete, A.channel_create, A.channel_update,
+               A.overwrite_create, A.overwrite_update, A.overwrite_delete, A.member_role_update,
+               A.ban, A.unban, A.kick}
     plan = UndoPlan()
     after = discord.utils.utcnow() - datetime.timedelta(hours=hours)
-    async for e in guild.audit_logs(limit=UNDO_MAX_ENTRIES, user=discord.Object(id=user_id), after=after,
-                                    oldest_first=True):
+    kw = {"limit": UNDO_MAX_ENTRIES * (3 if user_id is None else 1), "after": after, "oldest_first": True}
+    if user_id is not None:
+        kw["user"] = discord.Object(id=user_id)
+    async for e in guild.audit_logs(**kw):
+        if e.action not in handled:
+            continue
+        actor = getattr(e.user, "id", None) or getattr(e, "user_id", None)
+        if user_id is None:
+            if actor is None or getattr(e.user, "bot", False) or is_protected(guild, actor):
+                continue
+        if actor:
+            plan.actors[actor] = plan.actors.get(actor, 0) + 1
         tid = _get(e.target, "id")
         b, a = e.before, e.after
         if e.action == A.role_delete:
@@ -848,7 +863,9 @@ class UndoConfirm(GuardedView):
             summary += f"\n⚠️ {d['failed']} thing(s) failed (usually a role above mine)."
         await interaction.edit_original_response(content="✅ " + summary)
         await log_action(interaction.guild, "Actions Undone",
-                         f"**By:** {interaction.user.mention}\n**Undid actions of:** <@{self.target_id}>\n{summary}",
+                         f"**By:** {interaction.user.mention}\n**Undid actions of:** "
+                         + (f"<@{self.target_id}>" if self.target_id else "everyone (except bots, owner, trusted)")
+                         + f"\n{summary}",
                          color=0xE74C3C, channel_key="ai_log_channel")
 
     @discord.ui.button(label="Undo everything", style=discord.ButtonStyle.danger)
@@ -867,20 +884,23 @@ class UndoConfirm(GuardedView):
 
 @bot.tree.command(name="undo", description="Reverse what someone did to the server, using the Audit Log")
 @app_commands.guild_only()
-@app_commands.describe(user="@mention or user ID (an ID works even if they left the server)")
-async def undo_cmd(interaction: discord.Interaction, user: str):
-    hours = 1080  # Discord keeps the Audit Log for 45 days
-    digits = "".join(ch for ch in user if ch.isdigit())
-    if not (17 <= len(digits) <= 20):
-        await interaction.response.send_message(
-            "Give me an @mention or a user ID (right-click them → Copy User ID).", ephemeral=True)
-        return
-    user_id = int(digits)
-    try:
-        user = interaction.guild.get_member(user_id) or await bot.fetch_user(user_id)
-    except discord.HTTPException:
-        await interaction.response.send_message("I couldn't find a Discord user with that ID.", ephemeral=True)
-        return
+@app_commands.describe(
+    user="@mention or user ID. Leave empty to undo EVERYONE's actions (except bots, the owner and trusted users)",
+    hours="How far back to look (default: 24 hours when undoing everyone, 45 days for one person)")
+async def undo_cmd(interaction: discord.Interaction, user: str = None,
+                   hours: app_commands.Range[int, 1, 1080] = None):
+    user_id = None
+    if user:
+        digits = "".join(ch for ch in user if ch.isdigit())
+        if not (17 <= len(digits) <= 20):
+            await interaction.response.send_message(
+                "Give me an @mention or a user ID (Developer Mode on → long-press them → Copy User ID), "
+                "or leave it empty to undo everyone's actions.", ephemeral=True)
+            return
+        user_id = int(digits)
+    hours = hours or (1080 if user_id else 24)
+    who = f"<@{user_id}>" if user_id else "everyone (except bots, the owner and trusted users)"
+    when = f"the last {hours}h" if hours < 1080 else "the last 45 days"
     if not can_restore(interaction.user):
         await interaction.response.send_message("Only the server owner and trusted users can do that.", ephemeral=True)
         return
@@ -888,9 +908,9 @@ async def undo_cmd(interaction: discord.Interaction, user: str):
         await interaction.response.send_message("I need the **View Audit Log** permission for this.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    plan = await build_undo_plan(interaction.guild, user.id, hours)
+    plan = await build_undo_plan(interaction.guild, user_id, hours)
     if plan.empty():
-        await interaction.followup.send(f"I found nothing to undo from {user.mention} in the Audit Log.", ephemeral=True)
+        await interaction.followup.send(f"I found nothing to undo from {who} in {when}.", ephemeral=True)
         return
 
     def names(values, prefix, limit=12):
@@ -918,9 +938,10 @@ async def undo_cmd(interaction: discord.Interaction, user: str):
     notes.append("Messages in deleted channels can't be brought back, and recreated roles start at the bottom "
                  "of the role list, so drag them back into place.")
     emb = discord.Embed(color=0xF1C40F, description=(
-        f"# ↩️ Undo · {user.display_name if hasattr(user, 'display_name') else user}\n"
-        f"-# Everything they did that's still in the Audit Log (up to 45 days)\n{DIV}\n" + "\n".join(lines) + f"\n{DIV}\n"
+        f"# ↩️ Undo\n-# Actions by {who} in {when}\n{DIV}\n"
+        + "### Whose actions\n" + ", ".join(f"<@{u}> ({n})" for u, n in
+                                             sorted(plan.actors.items(), key=lambda kv: -kv[1])[:15]) + "\n" + "\n".join(lines) + f"\n{DIV}\n"
         + "\n".join(f"-# {n}" for n in notes)))
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 3 minutes")
-    await interaction.followup.send(embed=emb, view=UndoConfirm(interaction.user.id, user.id, plan), ephemeral=True)
+    await interaction.followup.send(embed=emb, view=UndoConfirm(interaction.user.id, user_id, plan), ephemeral=True)
