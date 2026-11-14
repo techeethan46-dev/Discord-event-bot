@@ -568,13 +568,15 @@ class UndoPlan:
         self.channel_edits = {}      # channel id -> original values of the fields they changed
         self.overwrites = {}         # (channel id, target id) -> ("remove", None) or ("set", (allow, deny, is_role))
         self.member_roles = {}       # member id -> {"add": set(role ids), "remove": set(role ids)}
-        self.created_roles = []      # names, only reported (undo never deletes anything)
-        self.created_channels = []
-        self.bans = 0
+        self.created_roles = {}      # role id -> name (deleted again when undoing everything)
+        self.created_channels = {}   # channel id -> name
+        self.banned = {}             # user id -> name of people they banned (unbanned when undoing)
+        self.kicks = 0               # kicks can't be reversed, only reported
 
     def empty(self):
         return not (self.deleted_roles or self.deleted_channels or self.role_edits or self.channel_edits
-                    or self.overwrites or self.member_roles)
+                    or self.overwrites or self.member_roles or self.created_roles or self.created_channels
+                    or self.banned)
 
 
 def _get(obj, attr):
@@ -590,21 +592,24 @@ async def build_undo_plan(guild, user_id, hours):
         tid = _get(e.target, "id")
         b, a = e.before, e.after
         if e.action == A.role_delete:
-            plan.deleted_roles[tid] = {f: _get(b, f) for f in _ROLE_FIELDS}
+            if plan.created_roles.pop(tid, None) is None:   # their own new role deleted again = nothing to do
+                plan.deleted_roles[tid] = {f: _get(b, f) for f in _ROLE_FIELDS}
         elif e.action == A.role_create:
-            plan.created_roles.append(_get(a, "name") or "?")
+            plan.created_roles[tid] = _get(a, "name") or "?"
         elif e.action == A.role_update:
             orig = plan.role_edits.setdefault(tid, {})
             for f in _ROLE_FIELDS:
                 if _get(b, f) is not None and f not in orig:
                     orig[f] = _get(b, f)   # keep the value from BEFORE their first change
         elif e.action == A.channel_delete:
+            if plan.created_channels.pop(tid, None) is not None:
+                continue   # their own new channel deleted again = nothing to do
             plan.deleted_channels[tid] = {
                 "name": _get(b, "name"), "type": _get(b, "type"), "position": _get(b, "position"),
                 "parent": _get(b, "parent_id"), "overwrites": _get(b, "overwrites") or [],
                 **{f: _get(b, f) for f in _CHANNEL_FIELDS[1:]}}
         elif e.action == A.channel_create:
-            plan.created_channels.append(_get(a, "name") or "?")
+            plan.created_channels[tid] = _get(a, "name") or "?"
         elif e.action == A.channel_update:
             orig = plan.channel_edits.setdefault(tid, {})
             for f in _CHANNEL_FIELDS:
@@ -632,19 +637,28 @@ async def build_undo_plan(guild, user_id, hours):
                     rec["remove"].discard(r.id)
                 else:
                     rec["add"].add(r.id)
-        elif e.action in (A.ban, A.kick):
-            plan.bans += 1
-    # Something they created and then deleted again doesn't need restoring.
+        elif e.action == A.ban:
+            plan.banned[tid] = str(e.target) if e.target else str(tid)
+        elif e.action == A.unban:
+            plan.banned.pop(tid, None)
+        elif e.action == A.kick:
+            plan.kicks += 1
+    # Settings they changed on things they created don't matter: those get deleted.
+    for cid in plan.created_channels:
+        plan.channel_edits.pop(cid, None)
+    plan.overwrites = {k: v for k, v in plan.overwrites.items() if k[0] not in plan.created_channels}
+    for rid in plan.created_roles:
+        plan.role_edits.pop(rid, None)
     plan.member_roles = {m: r for m, r in plan.member_roles.items() if r["add"] or r["remove"]}
     return plan
 
 
-async def run_undo(guild, plan):
+async def run_undo(guild, plan, remove_created=True):
     me = guild.me
     reason = "Undo via Host Assistant (reversing audit log actions)"
     role_map, chan_map = {}, {}
     done = {"roles": 0, "channels": 0, "role_edits": 0, "channel_edits": 0, "overwrites": 0,
-            "members": 0, "failed": 0}
+            "members": 0, "removed": 0, "unbanned": 0, "failed": 0}
 
     def role(rid):
         return guild.get_role(role_map.get(rid, rid))
@@ -762,7 +776,8 @@ async def run_undo(guild, plan):
         if not m:
             continue
         give = [r for r in (role(i) for i in rec["add"]) if r and r < me.top_role and r not in m.roles]
-        take = [r for r in (role(i) for i in rec["remove"]) if r and r < me.top_role and r in m.roles]
+        take = [r for r in (role(i) for i in rec["remove"])
+                if r and r < me.top_role and r in m.roles and not (remove_created and r.id in plan.created_roles)]
         try:
             if give:
                 await m.add_roles(*give, reason=reason)
@@ -773,6 +788,40 @@ async def run_undo(guild, plan):
         except discord.HTTPException:
             done["failed"] += 1
         await asyncio.sleep(0.5)
+
+    # 6. Unban the people they banned.
+    for uid in plan.banned:
+        try:
+            await guild.unban(discord.Object(id=uid), reason=reason)
+            done["unbanned"] += 1
+        except discord.NotFound:
+            pass  # already unbanned
+        except discord.HTTPException:
+            done["failed"] += 1
+        await asyncio.sleep(0.5)
+
+    # 7. Delete the channels and roles they created (unless asked to keep them).
+    if remove_created:
+        for cid in plan.created_channels:
+            ch = guild.get_channel(cid)
+            if not ch:
+                continue
+            try:
+                await ch.delete(reason=reason)
+                done["removed"] += 1
+            except discord.HTTPException:
+                done["failed"] += 1
+            await asyncio.sleep(0.7)
+        for rid in plan.created_roles:
+            r = guild.get_role(rid)
+            if not r or r.managed or not (r < me.top_role):
+                continue
+            try:
+                await r.delete(reason=reason)
+                done["removed"] += 1
+            except discord.HTTPException:
+                done["failed"] += 1
+            await asyncio.sleep(0.7)
     return done
 
 
@@ -787,20 +836,28 @@ class UndoConfirm(GuardedView):
             return False
         return await super().interaction_check(interaction)
 
-    @discord.ui.button(label="Undo it all", style=discord.ButtonStyle.danger)
-    async def go(self, interaction, btn):
+    async def _run(self, interaction, remove_created):
         await interaction.response.edit_message(content="⏳ Undoing... this can take a few minutes.", embed=None, view=None)
         self.stop()
-        d = await run_undo(interaction.guild, self.plan)
+        d = await run_undo(interaction.guild, self.plan, remove_created)
         summary = (f"Recreated **{d['roles']}** role(s) and **{d['channels']}** channel(s), "
                    f"reverted **{d['role_edits']}** role edit(s), **{d['channel_edits']}** channel edit(s) and "
-                   f"**{d['overwrites']}** channel permission change(s), fixed roles of **{d['members']}** member(s).")
+                   f"**{d['overwrites']}** channel permission change(s), fixed roles of **{d['members']}** member(s), "
+                   f"unbanned **{d['unbanned']}**, deleted **{d['removed']}** thing(s) they created.")
         if d["failed"]:
             summary += f"\n⚠️ {d['failed']} thing(s) failed (usually a role above mine)."
         await interaction.edit_original_response(content="✅ " + summary)
         await log_action(interaction.guild, "Actions Undone",
                          f"**By:** {interaction.user.mention}\n**Undid actions of:** <@{self.target_id}>\n{summary}",
                          color=0xE74C3C, channel_key="ai_log_channel")
+
+    @discord.ui.button(label="Undo everything", style=discord.ButtonStyle.danger)
+    async def everything(self, interaction, btn):
+        await self._run(interaction, remove_created=True)
+
+    @discord.ui.button(label="Undo, but keep what they created", style=discord.ButtonStyle.primary)
+    async def keep_created(self, interaction, btn):
+        await self._run(interaction, remove_created=False)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, btn):
@@ -810,9 +867,9 @@ class UndoConfirm(GuardedView):
 
 @bot.tree.command(name="undo", description="Reverse what someone did to the server, using the Audit Log")
 @app_commands.guild_only()
-@app_commands.describe(user="Whose actions to undo",
-                       hours="How far back to look, in hours (default 24, max 1080 = 45 days)")
-async def undo_cmd(interaction: discord.Interaction, user: discord.User, hours: app_commands.Range[int, 1, 1080] = 24):
+@app_commands.describe(user="Whose actions to undo (everything they did that Discord still remembers, up to 45 days)")
+async def undo_cmd(interaction: discord.Interaction, user: discord.User):
+    hours = 1080  # Discord keeps the Audit Log for 45 days
     if not can_restore(interaction.user):
         await interaction.response.send_message("Only the server owner and trusted users can do that.", ephemeral=True)
         return
@@ -822,7 +879,7 @@ async def undo_cmd(interaction: discord.Interaction, user: discord.User, hours: 
     await interaction.response.defer(ephemeral=True)
     plan = await build_undo_plan(interaction.guild, user.id, hours)
     if plan.empty():
-        await interaction.followup.send(f"I found nothing to undo from {user.mention} in the last {hours}h.", ephemeral=True)
+        await interaction.followup.send(f"I found nothing to undo from {user.mention} in the Audit Log.", ephemeral=True)
         return
 
     def names(values, prefix, limit=12):
@@ -839,19 +896,19 @@ async def undo_cmd(interaction: discord.Interaction, user: discord.User, hours: 
         f"### Role edits to revert · {len(plan.role_edits)}\n{names(edited_roles, '@')}",
         f"### Other changes to revert\n"
         f"• **{len(plan.channel_edits)}** channel edit(s) · **{len(plan.overwrites)}** channel permission change(s)\n"
-        f"• Roles of **{len(plan.member_roles)}** member(s) put back",
+        f"• Roles of **{len(plan.member_roles)}** member(s) put back\n"
+        f"• **{len(plan.banned)}** member(s) unbanned",
+        f"### Things they created (deleted with *Undo everything*) · {len(plan.created_channels) + len(plan.created_roles)}\n"
+        + names([f"#{n}" for n in plan.created_channels.values()] + [f"@{n}" for n in plan.created_roles.values()], ""),
     ]
     notes = []
-    if plan.created_roles or plan.created_channels:
-        notes.append(f"They also created {len(plan.created_roles)} role(s) and {len(plan.created_channels)} channel(s). "
-                     "Undo doesn't delete anything, so remove those yourself if needed.")
-    if plan.bans:
-        notes.append(f"They banned or kicked {plan.bans} member(s). Unban them from Server Settings → Bans.")
+    if plan.kicks:
+        notes.append(f"They kicked {plan.kicks} member(s). Kicks can't be undone, those people need a new invite.")
     notes.append("Messages in deleted channels can't be brought back, and recreated roles start at the bottom "
                  "of the role list, so drag them back into place.")
     emb = discord.Embed(color=0xF1C40F, description=(
         f"# ↩️ Undo · {user.display_name if hasattr(user, 'display_name') else user}\n"
-        f"-# Everything they did in the last {hours}h\n{DIV}\n" + "\n".join(lines) + f"\n{DIV}\n"
+        f"-# Everything they did that's still in the Audit Log (up to 45 days)\n{DIV}\n" + "\n".join(lines) + f"\n{DIV}\n"
         + "\n".join(f"-# {n}" for n in notes)))
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 3 minutes")
