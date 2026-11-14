@@ -21,6 +21,7 @@ hostbot/
   panel_data.py         <- your info panel text lives here
   players.py            /player profiles
   routines.py           event reminders, weekly summary, 90-day cleanup
+  protection.py         anti-nuke, /backup create|list|restore, /undo
   lifecycle.py          timers, on_ready, !sync
 ```
 

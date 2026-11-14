@@ -13,6 +13,7 @@ from hostbot.core import (
 )
 from hostbot.events import EventButtonsView, RateBtnView, expire_blacklists
 from hostbot.hosts import TrialLogView, TrialVoteView, close_due_trials
+from hostbot.protection import cleanup_nuke_tracking, flush_msg_counts, run_daily_backups
 from hostbot.routines import cleanup_old_events, post_weekly_summaries, send_due_reminders
 from hostbot.server_tools import _talk_cooldowns, _talk_pings
 from hostbot.shared import EventLogView, is_server_admin, refresh_event_message
@@ -89,6 +90,14 @@ async def refresh_timers():
             await job()
         except Exception as e:
             print(f"{job.__name__} error:", e)
+    try:
+        flush_msg_counts()
+        cleanup_nuke_tracking()
+        task = asyncio.create_task(run_daily_backups())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except Exception as e:
+        print("protection jobs error:", e)
     try:
         expire_blacklists()
     except Exception as e:
