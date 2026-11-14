@@ -867,9 +867,20 @@ class UndoConfirm(GuardedView):
 
 @bot.tree.command(name="undo", description="Reverse what someone did to the server, using the Audit Log")
 @app_commands.guild_only()
-@app_commands.describe(user="Whose actions to undo (everything they did that Discord still remembers, up to 45 days)")
-async def undo_cmd(interaction: discord.Interaction, user: discord.User):
+@app_commands.describe(user="@mention or user ID (an ID works even if they left the server)")
+async def undo_cmd(interaction: discord.Interaction, user: str):
     hours = 1080  # Discord keeps the Audit Log for 45 days
+    digits = "".join(ch for ch in user if ch.isdigit())
+    if not (17 <= len(digits) <= 20):
+        await interaction.response.send_message(
+            "Give me an @mention or a user ID (right-click them → Copy User ID).", ephemeral=True)
+        return
+    user_id = int(digits)
+    try:
+        user = interaction.guild.get_member(user_id) or await bot.fetch_user(user_id)
+    except discord.HTTPException:
+        await interaction.response.send_message("I couldn't find a Discord user with that ID.", ephemeral=True)
+        return
     if not can_restore(interaction.user):
         await interaction.response.send_message("Only the server owner and trusted users can do that.", ephemeral=True)
         return
