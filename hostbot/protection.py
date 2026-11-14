@@ -621,7 +621,8 @@ async def build_undo_plan(guild, user_id, hours):
                 continue   # their own new channel deleted again = nothing to do
             plan.deleted_channels[tid] = {
                 "name": _get(b, "name"), "type": _get(b, "type"), "position": _get(b, "position"),
-                "parent": _get(b, "parent_id"), "overwrites": _get(b, "overwrites") or [],
+                "parent": _get(b, "parent_id"),
+                "overwrites": {getattr(t, "id", None): ow.pair() for t, ow in (_get(b, "overwrites") or [])},
                 **{f: _get(b, f) for f in _CHANNEL_FIELDS[1:]}}
         elif e.action == A.channel_create:
             plan.created_channels[tid] = _get(a, "name") or "?"
@@ -635,7 +636,7 @@ async def build_undo_plan(guild, user_id, hours):
             key = (tid, _get(target, "id"))
             if key in plan.overwrites:
                 continue  # only the state before their FIRST change matters
-            is_role = isinstance(target, discord.Role) or getattr(target, "type", None) is discord.Role
+            is_role = True  # resolved by ID later, the label isn't reliable
             if e.action == A.overwrite_create:
                 plan.overwrites[key] = ("remove", None)
             else:
@@ -658,6 +659,18 @@ async def build_undo_plan(guild, user_id, hours):
             plan.banned.pop(tid, None)
         elif e.action == A.kick:
             plan.kicks += 1
+    # A channel they edited permissions on and then deleted comes back with the permissions it had
+    # before their first change, not the ones it had when it was deleted.
+    for (cid, tid), (kind, val) in list(plan.overwrites.items()):
+        if cid in plan.deleted_channels:
+            ows = plan.deleted_channels[cid]["overwrites"]
+            if kind == "remove":
+                ows.pop(tid, None)
+            else:
+                allow, deny, _ = val
+                cur_allow, cur_deny = ows.get(tid, (discord.Permissions.none(), discord.Permissions.none()))
+                ows[tid] = (allow if allow is not None else cur_allow, deny if deny is not None else cur_deny)
+            del plan.overwrites[(cid, tid)]
     # Settings they changed on things they created don't matter: those get deleted.
     for cid in plan.created_channels:
         plan.channel_edits.pop(cid, None)
@@ -666,6 +679,29 @@ async def build_undo_plan(guild, user_id, hours):
         plan.role_edits.pop(rid, None)
     plan.member_roles = {m: r for m, r in plan.member_roles.items() if r["add"] or r["remove"]}
     return plan
+
+
+def resolve_target(guild, tid, role_map=None):
+    """Find the role or member an overwrite belongs to, by ID (role and member IDs never clash)."""
+    if tid is None:
+        return None
+    if tid == guild.id:
+        return guild.default_role
+    role_map = role_map or {}
+    return guild.get_role(role_map.get(tid, tid)) or guild.get_member(tid)
+
+
+def build_overwrites(guild, ows, role_map=None):
+    out = {}
+    for tid, (allow, deny) in ows.items():
+        t = resolve_target(guild, tid, role_map)
+        if t:
+            out[t] = discord.PermissionOverwrite.from_pair(allow, deny)
+    return out
+
+
+def _undo_maps(guild_id):
+    return db.setdefault("undo_maps", {}).setdefault(str(guild_id), {"roles": {}, "channels": {}})
 
 
 async def run_undo(guild, plan, remove_created=True):
@@ -710,14 +746,7 @@ async def run_undo(guild, plan, remove_created=True):
         await asyncio.sleep(0.5)
 
     def mapped_overwrites(ows):
-        out = {}
-        for target, ow in ows:
-            tid = getattr(target, "id", None)
-            is_role = isinstance(target, discord.Role) or getattr(target, "type", None) is discord.Role
-            t = (guild.default_role if tid == guild.id else role(tid)) if is_role else guild.get_member(tid)
-            if t:
-                out[t] = ow
-        return out
+        return build_overwrites(guild, ows, role_map)
 
     # 3. Recreate deleted categories first, then the channels inside them.
     items = sorted(plan.deleted_channels.items(),
@@ -751,6 +780,11 @@ async def run_undo(guild, plan, remove_created=True):
             done["failed"] += 1
         await asyncio.sleep(0.7)
 
+    maps = _undo_maps(guild.id)
+    maps["roles"].update({str(k): v for k, v in role_map.items()})
+    maps["channels"].update({str(k): v for k, v in chan_map.items()})
+    save_db(db)
+
     # 4. Put back channel settings and channel permissions they changed.
     for cid, orig in plan.channel_edits.items():
         ch = guild.get_channel(chan_map.get(cid, cid))
@@ -768,11 +802,11 @@ async def run_undo(guild, plan, remove_created=True):
         if not ch or cid in plan.deleted_channels:
             continue  # recreated channels already got their original permissions
         if kind == "remove":
-            target = role(tid) or guild.get_member(tid)
+            target = resolve_target(guild, tid, role_map)
             new_ow = None
         else:
-            allow, deny, is_role = val
-            target = (guild.default_role if tid == guild.id else role(tid)) if is_role else guild.get_member(tid)
+            allow, deny, _ = val
+            target = resolve_target(guild, tid, role_map)
             cur = ch.overwrites_for(target) if target else None
             cur_allow, cur_deny = cur.pair() if cur else (discord.Permissions.none(), discord.Permissions.none())
             new_ow = discord.PermissionOverwrite.from_pair(allow or cur_allow, deny or cur_deny)
@@ -945,3 +979,117 @@ async def undo_cmd(interaction: discord.Interaction, user: str = None,
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 3 minutes")
     await interaction.followup.send(embed=emb, view=UndoConfirm(interaction.user.id, user_id, plan), ephemeral=True)
+
+
+# ==========================================
+# /fix_permissions: put the right permissions back on channels an earlier /undo recreated
+# ==========================================
+def _newest(items):
+    return max(items, key=lambda x: x.id) if items else None
+
+
+def match_recreated(guild, plan):
+    """old role id -> current role id, and old channel id -> current channel, for things /undo recreated."""
+    maps = _undo_maps(guild.id)
+    role_map = {}
+    for old_id, r in plan.deleted_roles.items():
+        new_id = maps["roles"].get(str(old_id))
+        role = guild.get_role(new_id) if new_id else None
+        if not role and r.get("name"):
+            role = _newest([x for x in guild.roles if x.name == r["name"]])
+        if role:
+            role_map[old_id] = role.id
+    chans = {}
+    for old_id, c in plan.deleted_channels.items():
+        new_id = maps["channels"].get(str(old_id))
+        ch = guild.get_channel(new_id) if new_id else None
+        if not ch and c.get("name"):
+            ch = _newest([x for x in guild.channels if x.name == c["name"] and x.type == c["type"]])
+        chans[old_id] = ch
+    return role_map, chans
+
+
+class FixPermsConfirm(GuardedView):
+    def __init__(self, author_id, plan, role_map, chans):
+        super().__init__(timeout=180)
+        self.author_id, self.plan, self.role_map, self.chans = author_id, plan, role_map, chans
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who ran this can confirm it.", ephemeral=True)
+            return False
+        return await super().interaction_check(interaction)
+
+    @discord.ui.button(label="Fix permissions", style=discord.ButtonStyle.danger)
+    async def go(self, interaction, btn):
+        await interaction.response.edit_message(content="⏳ Fixing permissions...", embed=None, view=None)
+        self.stop()
+        fixed, failed = 0, 0
+        for old_id, ch in self.chans.items():
+            if not ch:
+                continue
+            ows = build_overwrites(interaction.guild, self.plan.deleted_channels[old_id]["overwrites"], self.role_map)
+            try:
+                await ch.edit(overwrites=ows, reason="Fix permissions of channels restored by /undo")
+                fixed += 1
+            except discord.HTTPException as e:
+                print("fix_permissions failed:", ch.name, e)
+                failed += 1
+            await asyncio.sleep(0.6)
+        maps = _undo_maps(interaction.guild.id)
+        maps["roles"].update({str(k): v for k, v in self.role_map.items()})
+        maps["channels"].update({str(k): ch.id for k, ch in self.chans.items() if ch})
+        save_db(db)
+        text = f"✅ Fixed permissions on **{fixed}** channel(s)." + (f"\n⚠️ {failed} failed." if failed else "")
+        await interaction.edit_original_response(content=text)
+        await log_action(interaction.guild, "Channel Permissions Fixed", f"**By:** {interaction.user.mention}\n{text}",
+                         color=0xE74C3C, channel_key="ai_log_channel")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, btn):
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+        self.stop()
+
+
+@bot.tree.command(name="fix_permissions",
+                  description="Give channels recreated by /undo the permissions they had before they were deleted")
+@app_commands.guild_only()
+@app_commands.describe(
+    user="Same as in /undo: @mention or user ID, or leave empty for everyone (except bots, owner, trusted)",
+    hours="Same as in /undo (default: 24 hours for everyone, 45 days for one person)")
+async def fix_permissions_cmd(interaction: discord.Interaction, user: str = None,
+                              hours: app_commands.Range[int, 1, 1080] = None):
+    if not can_restore(interaction.user):
+        await interaction.response.send_message("Only the server owner and trusted users can do that.", ephemeral=True)
+        return
+    user_id = None
+    if user:
+        digits = "".join(ch for ch in user if ch.isdigit())
+        if not (17 <= len(digits) <= 20):
+            await interaction.response.send_message("Give me an @mention or a user ID, or leave it empty.", ephemeral=True)
+            return
+        user_id = int(digits)
+    hours = hours or (1080 if user_id else 24)
+    await interaction.response.defer(ephemeral=True)
+    plan = await build_undo_plan(interaction.guild, user_id, hours)
+    if not plan.deleted_channels:
+        await interaction.followup.send("I found no deleted channels in that time range.", ephemeral=True)
+        return
+    role_map, chans = match_recreated(interaction.guild, plan)
+    found = [ch for ch in chans.values() if ch]
+    missing = [plan.deleted_channels[o]["name"] for o, ch in chans.items() if not ch]
+    lines = [f"### Channels to fix · {len(found)}\n" + (", ".join(ch.mention for ch in found[:30]) or "*none*")]
+    if missing:
+        lines.append(f"### Not found · {len(missing)}\n" + ", ".join(f"#{n}" for n in missing[:20])
+                     + "\n-# These weren't recreated (or were renamed), so they're skipped.")
+    emb = discord.Embed(color=0xF1C40F, description=(
+        f"# 🔐 Fix channel permissions\n{DIV}\n" + "\n".join(lines) + f"\n{DIV}\n"
+        "-# Each channel gets exactly the permissions it had before it was deleted. Anything set on it since then "
+        "is replaced."))
+    add_footer_divider(emb)
+    emb.set_footer(text="Confirm within 3 minutes")
+    if not found:
+        await interaction.followup.send(embed=emb, ephemeral=True)
+        return
+    await interaction.followup.send(embed=emb, view=FixPermsConfirm(interaction.user.id, plan, role_map, chans),
+                                    ephemeral=True)
