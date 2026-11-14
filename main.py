@@ -9,7 +9,7 @@ from hostbot.core import bot, keep_alive
 from hostbot import core
 
 # Importing these registers every command, event and view with the bot.
-from hostbot import ai, events, hosts, server_tools, lifecycle, panels, players  # noqa: F401
+from hostbot import ai, events, hosts, server_tools, lifecycle, panels, players, protection  # noqa: F401
 
 tk = os.environ.get("BOT_TOKEN")
 if tk:
