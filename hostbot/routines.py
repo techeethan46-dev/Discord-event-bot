@@ -62,7 +62,7 @@ async def send_due_reminders():
 
 
 # ==========================================
-# WEEKLY SUMMARY (posted every Monday, UTC, in the event log channel)
+# WEEKLY SUMMARY (posted every Monday, UTC, in the weekly summary channel from /setup)
 # ==========================================
 def _week_start(ts):
     d = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).date()
@@ -167,8 +167,8 @@ async def post_weekly_summaries():
             continue
         sent[gid] = this_week
         save_db(db)
-        log_id = get_config(guild.id).get("log_channel")
-        ch = guild.get_channel(log_id) if log_id else None
+        ch_id = get_config(guild.id).get("weekly_summary_channel")
+        ch = guild.get_channel(ch_id) if ch_id else None  # not set in /setup = no weekly summary
         emb = build_weekly_summary(guild, this_week - 7 * 86400, this_week)
         if not ch or not emb:
             continue
