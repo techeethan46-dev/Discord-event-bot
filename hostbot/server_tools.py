@@ -42,6 +42,8 @@ SETUP_STEPS = [
      "desc": "Swap requests are posted here so the other player can accept or decline."},
     {"key": "stats_channel", "kind": "channel", "icon": "📊", "title": "Stats channel", "required": True,
      "desc": "Event results and the rate-your-host button are posted here when an event is concluded."},
+    {"key": "weekly_summary_channel", "kind": "channel", "icon": "📅", "title": "Weekly summary channel", "required": False,
+     "desc": "Every Monday (UTC) a recap of last week's events, players, top host and best-rated event is posted here. If you skip it, no weekly summary is posted."},
     {"key": "trial_channel", "kind": "channel", "icon": "⚖️", "title": "Trial review channel", "required": False,
      "desc": "The public trial announcement and voting card are posted here. If you skip it, they go to the stats channel."},
     {"key": "trial_log_channel", "kind": "channel", "icon": "📜", "title": "Trial Logs channel", "required": False,
