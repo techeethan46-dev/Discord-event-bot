@@ -10,7 +10,7 @@ import time
 from discord import app_commands
 
 from hostbot.core import BOT_OWNER_IDS, ALLOWED_USER_IDS, bot, db, is_trusted, mongo_db, save_db
-from hostbot.shared import BRAND, DIV, GuardedView, add_footer_divider, dm_owners, log_action
+from hostbot.shared import BRAND, DIV, GuardedView, add_footer_divider, dm_owners, log_action, v2
 
 # ==========================================
 # SETTINGS
@@ -449,14 +449,14 @@ class RestoreConfirm(GuardedView):
         return await super().interaction_check(interaction)
 
     async def _run(self, interaction, fix_permissions):
-        await interaction.response.edit_message(content="⏳ Restoring... this can take a few minutes.", embed=None, view=None)
+        await interaction.response.edit_message(**v2("⏳ Restoring... this can take a few minutes.", color=0xF1C40F, edit=True))
         self.stop()
         done = await do_restore(interaction.guild, self.backup["data"], fix_permissions)
         summary = (f"Recreated **{done['roles']}** role(s) and **{done['channels']}** channel(s)"
                    + (f", reset permissions on **{done['perms']}** role(s)" if fix_permissions else "")
                    + f", gave roles back to **{done['member_roles']}** member(s)."
                    + (f"\n⚠️ {done['failed']} thing(s) failed, check that my role is at the top." if done["failed"] else ""))
-        await interaction.edit_original_response(content="✅ " + summary)
+        await interaction.edit_original_response(**v2("✅ " + summary, color=0x2ECC71, edit=True))
         await log_action(interaction.guild, "Server Restored",
                          f"**By:** {interaction.user.mention}\n**Backup from:** <t:{self.backup['created_at']}:f>\n{summary}",
                          color=0xE74C3C, channel_key="ai_log_channel")
@@ -471,7 +471,7 @@ class RestoreConfirm(GuardedView):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, btn):
-        await interaction.response.edit_message(content="Restore cancelled.", embed=None, view=None)
+        await interaction.response.edit_message(**v2("Restore cancelled.", color=0x95A5A6, edit=True))
         self.stop()
 
 
@@ -514,7 +514,7 @@ async def backup_list(interaction: discord.Interaction):
         f"# 💾 Backups · {len(rows)}\n{DIV}\n" + ("\n".join(lines) or "*No backups yet. Use `/backup create`.*")))
     add_footer_divider(emb)
     emb.set_footer(text=f"One automatic backup a day, the last {BACKUP_KEEP} are kept · {BRAND}")
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
 
 
 @backup_group.command(name="restore", description="Rebuild deleted roles and channels from a backup")
@@ -548,7 +548,7 @@ async def backup_restore(interaction: discord.Interaction, backup: str):
         "-# Nothing is ever deleted. Messages in deleted channels can't be brought back."))
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 2 minutes")
-    await interaction.response.send_message(embed=emb, view=RestoreConfirm(interaction.user.id, doc), ephemeral=True)
+    await interaction.response.send_message(**v2(embed=emb, view=RestoreConfirm(interaction.user.id, doc)), ephemeral=True)
 
 
 # ==========================================
@@ -886,7 +886,7 @@ class UndoConfirm(GuardedView):
         return await super().interaction_check(interaction)
 
     async def _run(self, interaction, remove_created):
-        await interaction.response.edit_message(content="⏳ Undoing... this can take a few minutes.", embed=None, view=None)
+        await interaction.response.edit_message(**v2("⏳ Undoing... this can take a few minutes.", color=0xF1C40F, edit=True))
         self.stop()
         d = await run_undo(interaction.guild, self.plan, remove_created)
         summary = (f"Recreated **{d['roles']}** role(s) and **{d['channels']}** channel(s), "
@@ -895,7 +895,7 @@ class UndoConfirm(GuardedView):
                    f"unbanned **{d['unbanned']}**, deleted **{d['removed']}** thing(s) they created.")
         if d["failed"]:
             summary += f"\n⚠️ {d['failed']} thing(s) failed (usually a role above mine)."
-        await interaction.edit_original_response(content="✅ " + summary)
+        await interaction.edit_original_response(**v2("✅ " + summary, color=0x2ECC71, edit=True))
         await log_action(interaction.guild, "Actions Undone",
                          f"**By:** {interaction.user.mention}\n**Undid actions of:** "
                          + (f"<@{self.target_id}>" if self.target_id else "everyone (except bots, owner, trusted)")
@@ -912,7 +912,7 @@ class UndoConfirm(GuardedView):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, btn):
-        await interaction.response.edit_message(content="Undo cancelled.", embed=None, view=None)
+        await interaction.response.edit_message(**v2("Undo cancelled.", color=0x95A5A6, edit=True))
         self.stop()
 
 
@@ -978,7 +978,7 @@ async def undo_cmd(interaction: discord.Interaction, user: str = None,
         + "\n".join(f"-# {n}" for n in notes)))
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 3 minutes")
-    await interaction.followup.send(embed=emb, view=UndoConfirm(interaction.user.id, user_id, plan), ephemeral=True)
+    await interaction.followup.send(**v2(embed=emb, view=UndoConfirm(interaction.user.id, user_id, plan)), ephemeral=True)
 
 
 # ==========================================
@@ -1022,7 +1022,7 @@ class FixPermsConfirm(GuardedView):
 
     @discord.ui.button(label="Fix permissions", style=discord.ButtonStyle.danger)
     async def go(self, interaction, btn):
-        await interaction.response.edit_message(content="⏳ Fixing permissions...", embed=None, view=None)
+        await interaction.response.edit_message(**v2("⏳ Fixing permissions...", color=0xF1C40F, edit=True))
         self.stop()
         fixed, failed = 0, 0
         for old_id, ch in self.chans.items():
@@ -1041,13 +1041,13 @@ class FixPermsConfirm(GuardedView):
         maps["channels"].update({str(k): ch.id for k, ch in self.chans.items() if ch})
         save_db(db)
         text = f"✅ Fixed permissions on **{fixed}** channel(s)." + (f"\n⚠️ {failed} failed." if failed else "")
-        await interaction.edit_original_response(content=text)
+        await interaction.edit_original_response(**v2(text, color=0x2ECC71, edit=True))
         await log_action(interaction.guild, "Channel Permissions Fixed", f"**By:** {interaction.user.mention}\n{text}",
                          color=0xE74C3C, channel_key="ai_log_channel")
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, btn):
-        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+        await interaction.response.edit_message(**v2("Cancelled.", color=0x95A5A6, edit=True))
         self.stop()
 
 
@@ -1089,7 +1089,7 @@ async def fix_permissions_cmd(interaction: discord.Interaction, user: str = None
     add_footer_divider(emb)
     emb.set_footer(text="Confirm within 3 minutes")
     if not found:
-        await interaction.followup.send(embed=emb, ephemeral=True)
+        await interaction.followup.send(**v2(embed=emb), ephemeral=True)
         return
-    await interaction.followup.send(embed=emb, view=FixPermsConfirm(interaction.user.id, plan, role_map, chans),
+    await interaction.followup.send(**v2(embed=emb, view=FixPermsConfirm(interaction.user.id, plan, role_map, chans)),
                                     ephemeral=True)

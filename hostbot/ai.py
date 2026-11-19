@@ -21,7 +21,7 @@ from hostbot.core import (
     is_disabled_guild, is_trusted, is_whitelisted_guild, openrouter_client, save_db, user_cooldowns,
 )
 from hostbot.shared import (
-    DIV, GuardedView, add_footer_divider, dm_owners, log_action, safe_reply, send_notice,
+    DIV, GuardedView, V2View, add_footer_divider, dm_owners, log_action, message_text, safe_reply, send_notice, v2,
 )
 from hostbot import core
 
@@ -1031,14 +1031,14 @@ async def run_admin_flow(msg, txt):
                 add_footer_divider(emb)
                 emb.set_footer(text="Nothing was changed")
                 try:
-                    await prompt.edit(embed=emb, view=None)
+                    await prompt.edit(**v2(embed=emb, edit=True), allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
                     pass
                 return
             emb.description = emb.description.replace("## ⚠️ Confirm these actions", "## ⏳ Working on it")
             emb.set_footer(text="Running...")
             try:
-                await prompt.edit(embed=emb, view=None)
+                await prompt.edit(**v2(embed=emb, edit=True), allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
 
@@ -1072,7 +1072,7 @@ async def run_admin_flow(msg, txt):
         if prompt is not None:
             # Update the confirmation message in place instead of posting a new one.
             try:
-                await prompt.edit(embed=res, view=None)
+                await prompt.edit(**v2(embed=res, edit=True), allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 await safe_reply(msg, embed=res)
         else:
@@ -1336,9 +1336,12 @@ async def process_ai_queue():
 
                 gif_url = await fetch_gif(gif_query) if gif_query else None
                 if gif_url:
-                    emb = discord.Embed(color=0x2B2D31)  # same shade as the dark theme, so no visible bar
-                    emb.set_image(url=gif_url)
-                    await safe_reply(msg, ans or None, embed=emb)
+                    # V2: plain reply text with the GIF underneath, no card around it.
+                    lay = V2View(timeout=None)
+                    if ans:
+                        lay.add_item(discord.ui.TextDisplay(ans))
+                    lay.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(gif_url)))
+                    await safe_reply(msg, view=lay)
                 else:
                     await safe_reply(msg, ans or "lol")
         except Exception as e:
@@ -1373,7 +1376,7 @@ async def handle_ai_trigger(msg):
         return
     if msg.guild and not is_ai_user(msg.author, msg.guild.id):
         # Replying to one of our own notices must not trigger another one (no notice chains).
-        if is_reply and ref.embeds and (ref.embeds[0].title or "").startswith("🔒"):
+        if is_reply and ref.author == bot.user and "🔒 Members only" in message_text(ref):
             return
         await send_notice(msg, "🔒 Members only", "AI chat is for **VIP** and **Staff** roles.", key="lock")
         return

@@ -13,8 +13,9 @@ from hostbot.core import (
 from hostbot.hosts import (
     check_and_announce_achievements, check_host, trial_state,
 )
+from hostbot import shared
 from hostbot.shared import (
-    BRAND, DIV, GuardedView, add_event_role, add_footer_divider, build_embed, event_in_guild, event_log,
+    BRAND, DIV, GuardedView, add_event_role, add_footer_divider, event_in_guild, event_log, post_event_messages, v2,
     find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip, log_action,
     new_event_key, parse_time, process_waitlist, refresh_event_message, remove_event_role,
 )
@@ -237,8 +238,10 @@ class SwapModal(discord.ui.Modal, title="Propose Swap"):
 
         emb = discord.Embed(title="🔄 Swap Request", description=f"<@{interaction.user.id}> wants to swap with <@{t_id}>!\n\nGives: **{u_c}**\nGets: **{t_c}**", color=0xF1C40F)
         view = SwapAcceptView(self.key, interaction.user.id, t_id, u_c, t_c)
+        view.emb = emb
         try:
-            view.message = await swap_ch.send(content=f"<@{t_id}>", embed=emb, view=view)
+            view.message = await swap_ch.send(**v2(f"<@{t_id}>", embed=emb, view=view),
+                                              allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=t_id)]))
         except discord.HTTPException as e:
             print("swap post failed:", e)
             await interaction.response.send_message("I can't post in the swap channel (check my permissions).", ephemeral=True)
@@ -256,16 +259,21 @@ class SwapAcceptView(GuardedView):
         self.s_c = s_c
         self.t_c = t_c
         self.message = None
+        self.emb = None
 
-    async def on_timeout(self):
+    def _finish(self, title, color):
+        """Disable the buttons and restyle the card."""
         for child in self.children:
             child.disabled = True
-        if self.message and self.message.embeds:
-            emb = self.message.embeds[0]
-            emb.color = 0x95A5A6
-            emb.title = "⌛ Swap Expired"
+        self.emb.color = color
+        self.emb.title = title
+        return v2(f"<@{self.t_id}>", embed=self.emb, view=self, edit=True)
+
+    async def on_timeout(self):
+        if self.message and self.emb:
             try:
-                await self.message.edit(embed=emb, view=self)
+                await self.message.edit(**self._finish("⌛ Swap Expired", 0x95A5A6),
+                                        allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
 
@@ -298,13 +306,8 @@ class SwapAcceptView(GuardedView):
         info["swaps_completed"] = int(info.get("swaps_completed", 0)) + 1
         save_db(db)
 
-        for child in self.children: 
-            child.disabled = True
-
-        emb = interaction.message.embeds[0]
-        emb.color = 0x2ECC71
-        emb.title = "✅ Swap Completed"
-        await interaction.response.edit_message(embed=emb, view=self)
+        await interaction.response.edit_message(**self._finish("✅ Swap Completed", 0x2ECC71),
+                                                allowed_mentions=discord.AllowedMentions.none())
         self.stop()
         await refresh_event_message(info, interaction.guild)
         await event_log(interaction.guild, info, "swap", f"<@{self.s_id}> and <@{self.t_id}> swapped **{self.s_c}** ↔ **{self.t_c}**")
@@ -315,13 +318,8 @@ class SwapAcceptView(GuardedView):
             await interaction.response.send_message("Not your offer.", ephemeral=True)
             return
 
-        for child in self.children: 
-            child.disabled = True
-
-        emb = interaction.message.embeds[0]
-        emb.color = 0xE74C3C
-        emb.title = "❌ Swap Declined"
-        await interaction.response.edit_message(embed=emb, view=self)
+        await interaction.response.edit_message(**self._finish("❌ Swap Declined", 0xE74C3C),
+                                                allowed_mentions=discord.AllowedMentions.none())
         self.stop()
         info = db["events"].get(self.key)
         if info:
@@ -539,7 +537,8 @@ class HostActionsView(GuardedView):
             if info.get("helpers"):
                 emb.add_field(name="🤝 Helpers", value=", ".join(f"<@{i}>" for i in info["helpers"]), inline=False)
             try:
-                stats_msg = await s_ch.send(embed=emb, view=RateBtnView())
+                stats_msg = await s_ch.send(**v2(embed=emb, view=RateBtnView()),
+                                            allowed_mentions=discord.AllowedMentions.none())
                 info["rate_msg"] = stats_msg.id
                 save_db(db)
             except discord.HTTPException as e:
@@ -625,6 +624,9 @@ class EventButtonsView(GuardedView):
 
         await interaction.response.send_message("Host Panel:", view=HostActionsView(key), ephemeral=True)
 
+shared.EVENT_BUTTONS = EventButtonsView  # the banner puts these buttons inside its last card
+
+
 async def ev_autocomplete(interaction: discord.Interaction, curr: str):
     ch = []
     for k, v in db["events"].items():
@@ -679,16 +681,13 @@ async def create_ev(interaction: discord.Interaction, name: str, starts_in: str,
     st = trial_state(interaction.guild_id, interaction.user.id)
     db["events"][key]["trial"] = bool(st and st.get("status") == "trial")
 
-    embs = build_embed(name, db["events"][key], interaction.guild)
     try:
-        msg = await target.send(embeds=embs, view=EventButtonsView())
+        await post_event_messages(target, db["events"][key])
     except discord.HTTPException as e:
         del db["events"][key]
         print("event post failed:", e)
         await interaction.followup.send("I can't post in that channel (check my permissions).", ephemeral=True)
         return
-
-    db["events"][key]["message_ids"] = [msg.id]
     save_db(db)
 
     await interaction.followup.send(f"Event created in {target.mention}.", ephemeral=True)
@@ -971,7 +970,7 @@ async def blacklist_list(interaction: discord.Interaction):
     emb = discord.Embed(description=f"# ⛔ Blacklist · {len(ids)}\n{DIV}\n{body}", color=0xE74C3C)
     add_footer_divider(emb)
     emb.set_footer(text=BRAND)
-    await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(**v2(embed=emb), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ==========================================
@@ -1072,7 +1071,7 @@ async def warnings_cmd(interaction: discord.Interaction, user: discord.User):
         f"**Active:** {len(active)}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days) · **All time:** {len(allw)}\n{DIV}\n{body}"))
     add_footer_divider(emb)
     emb.set_footer(text=BRAND)
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
 
 
 @bot.tree.command(name="unwarn", description="Remove a player's most recent warning")
