@@ -910,6 +910,10 @@ ADMIN_ACTIONS = {
     "purge": act_purge, "send_message": act_send_message,
 }
 
+# Actions whose result is obvious in the channel: no "Done" message, and the request is cleaned up too.
+QUIET_ACTIONS = {"purge", "send_message"}
+DONE_MESSAGE_SECONDS = 8   # other fully successful results delete themselves after this long
+
 # ---------- planning / confirmation / execution ----------
 def needs_confirm(a):
     act = a.get("action")
@@ -1043,6 +1047,7 @@ async def run_admin_flow(msg, txt):
                 pass
 
         ok_count = 0
+        done_names = []
         for name, a in runnable:
             handler = ADMIN_ACTIONS[name]
             try:
@@ -1059,6 +1064,8 @@ async def run_admin_flow(msg, txt):
                 await dm_owners(f"⚠️ **AI admin action `{name}` crashed**\nServer: {msg.guild.name}\nError: `{type(e).__name__}: {str(e)[:500]}`", key="admin_action_crash")
             lines.append(f"{'✅' if ok else '❌'} {text}")
             ok_count += 1 if ok else 0
+            if ok:
+                done_names.append(name)
 
         if ok_count == len(plan):
             title, color = "✅ Done", 0x2ECC71
@@ -1069,14 +1076,26 @@ async def run_admin_flow(msg, txt):
         res = discord.Embed(description=f"## {title}\n{DIV}\n" + "\n".join(lines)[:3800], color=color)
         add_footer_divider(res)
         res.set_footer(text=f"Requested by {msg.author.display_name}")
-        if prompt is not None:
+        all_ok = ok_count == len(plan) and ok_count > 0
+        if all_ok and all(n in QUIET_ACTIONS for n in done_names):
+            # e.g. a purge: the result is visible, so leave nothing behind (not even the request).
+            for m in (prompt, msg):
+                if m is not None:
+                    try:
+                        await m.delete()
+                    except discord.HTTPException:
+                        pass
+        elif prompt is not None:
             # Update the confirmation message in place instead of posting a new one.
             try:
                 await prompt.edit(**v2(embed=res, edit=True), allowed_mentions=discord.AllowedMentions.none())
+                if all_ok:
+                    await prompt.delete(delay=DONE_MESSAGE_SECONDS)
             except discord.HTTPException:
-                await safe_reply(msg, embed=res)
+                await safe_reply(msg, embed=res, delete_after=DONE_MESSAGE_SECONDS if all_ok else None)
         else:
-            await safe_reply(msg, embed=res)
+            # A fully successful result tidies itself up; errors and partial results stay visible.
+            await safe_reply(msg, embed=res, delete_after=DONE_MESSAGE_SECONDS if all_ok else None)
 
         if ok_count or any(l.startswith("🔇") for l in lines):
             await log_action(msg.guild, "AI Admin Action",
