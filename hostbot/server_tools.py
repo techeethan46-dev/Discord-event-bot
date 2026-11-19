@@ -10,7 +10,7 @@ from hostbot.core import ALLOWED_USER_IDS, BOT_OWNER_IDS, bot, db, get_config, i
 from hostbot.hosts import ACHIEVEMENT_DEFS, ensure_achievement_roles
 from hostbot.shared import (
     DIV, GuardedView, add_footer_divider, emergency_rate_limit_shutdown, has_host_role,
-    is_server_admin, log_action,
+    is_server_admin, log_action, v2,
 )
 from hostbot import core
 
@@ -221,9 +221,9 @@ class SetupWizard(GuardedView):
         self.note = note
         self.rebuild()
         if interaction.response.is_done():
-            await interaction.edit_original_response(embed=self.embed(), view=self)
+            await interaction.edit_original_response(**v2(embed=self.embed(), view=self, edit=True))
         else:
-            await interaction.response.edit_message(embed=self.embed(), view=self)
+            await interaction.response.edit_message(**v2(embed=self.embed(), view=self, edit=True))
 
 def _setup_saved(st, extra=""):
     return f"✅ **{st['title']}** saved." + (f"\n{extra}" if extra else "")
@@ -299,7 +299,7 @@ class SetupNav(discord.ui.Button):
             emb = discord.Embed(color=0x2ECC71, description=(
                 f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
                 "Run **/setup** any time to change something."))
-            await interaction.response.edit_message(embed=emb, view=None)
+            await interaction.response.edit_message(**v2(embed=emb, edit=True))
             view.stop()
 
 class SetupJump(discord.ui.Select):
@@ -317,7 +317,7 @@ async def setup_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     wizard = SetupWizard(interaction.guild, interaction.user.id)
-    await interaction.response.send_message(embed=wizard.embed(), view=wizard, ephemeral=True)
+    await interaction.response.send_message(**v2(embed=wizard.embed(), view=wizard), ephemeral=True)
 # ==========================================
 # /talk — controlled bot voice message
 # ==========================================
@@ -363,7 +363,7 @@ async def punish_ping_spam(interaction):
     add_footer_divider(emb)
     emb.set_footer(text=f"Requested by {member.display_name}")
     try:
-        await channel.send(content=member.mention, embed=emb,
+        await channel.send(**v2(member.mention, embed=emb),
                            allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
     except discord.HTTPException:
         pass
@@ -398,7 +398,7 @@ async def log_talk_usage(guild, author, channel, message, pings=False):
     add_footer_divider(embed)
     embed.set_footer(text=f"Host Assistant · {guild.name}")
     try:
-        await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await log_channel.send(**v2(embed=embed), allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         print("/talk log failed:", e)
 

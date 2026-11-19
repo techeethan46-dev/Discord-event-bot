@@ -29,3 +29,8 @@ Biggest file is ai.py (~1,400 lines). To change one thing, share only that file.
 If you add a new file with commands, add its name to the import line in main.py.
 Values that change while the bot runs (bot_muted, RATE_LIMIT_TRIGGERED, ai_worker_task)
 live in core.py and are used as core.X from other files.
+
+All cards are Discord Components V2 messages: build them as a discord.Embed and send with
+`**v2(embed=..., view=...)` from shared.py (add `edit=True` when editing). Dividers become real
+separator lines, buttons/menus go inside the card. Event banners split into several messages
+at ~3800 characters (shared.build_event_layouts / refresh_event_message).

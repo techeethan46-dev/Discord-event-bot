@@ -10,7 +10,7 @@ from discord import app_commands
 from hostbot.core import BOT_OWNER_IDS, _bg_tasks, bot, db, get_config, is_trusted, save_db
 from hostbot.shared import (
     BRAND, DIV, GuardedView, add_footer_divider, event_in_guild, is_authorized_manager,
-    is_server_admin,
+    is_server_admin, v2,
 )
 
 # ==========================================
@@ -256,11 +256,12 @@ async def check_and_announce_achievements(guild, host_id, channel=None):
     if channel:
         try:
             await channel.send(
-                embed=discord.Embed(
+                allowed_mentions=discord.AllowedMentions.none(),
+                **v2(embed=discord.Embed(
                     title="🏆 Achievement Unlocked",
                     description=f"<@{host_id}> earned:\n\n" + "\n".join(lines),
                     color=0xF1C40F
-                )
+                ))
             )
         except discord.HTTPException:
             pass
@@ -342,12 +343,12 @@ def build_host_profile_embed(guild, member):
 @app_commands.guild_only()
 async def host_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    await interaction.response.send_message(embed=build_host_profile_embed(interaction.guild, member), ephemeral=True)
+    await interaction.response.send_message(**v2(embed=build_host_profile_embed(interaction.guild, member)), ephemeral=True)
 
 @bot.tree.command(name="me", description="View your Host Assistant profile")
 @app_commands.guild_only()
 async def me_profile_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_host_profile_embed(interaction.guild, interaction.user), ephemeral=True)
+    await interaction.response.send_message(**v2(embed=build_host_profile_embed(interaction.guild, interaction.user)), ephemeral=True)
 
 @bot.tree.command(name="achievements", description="View a host's achievement collection")
 @app_commands.guild_only()
@@ -375,7 +376,7 @@ async def achievements_cmd(interaction: discord.Interaction, member: discord.Mem
     )
     add_footer_divider(emb)
     emb.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENT_DEFS)} unlocked · Host Assistant")
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
 
 @bot.tree.command(name="disable_server", description="Disable Host Assistant in a server")
 @app_commands.describe(server_id="The Discord server ID to disable")
@@ -478,7 +479,7 @@ async def analytics_cmd(interaction: discord.Interaction, period: app_commands.C
     emb.add_field(name="🔥 Top Hosts", value="\n".join(top) or "No completed events in this period.", inline=False)
     add_footer_divider(emb)
     emb.set_footer(text="Historical analytics are calculated from completed event records.")
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
 
 
 # ==========================================
@@ -672,8 +673,9 @@ async def refresh_trial_log(rev):
     if not channel:
         return False
     try:
-        message = await channel.fetch_message(log_message["id"])
-        await message.edit(embed=trial_log_embed(rev), view=make_trial_log_view(rev))
+        await channel.get_partial_message(log_message["id"]).edit(
+            **v2(embed=trial_log_embed(rev), view=make_trial_log_view(rev), edit=True),
+            allowed_mentions=discord.AllowedMentions.none())
         return True
     except discord.NotFound:
         rev.pop("trial_log_msg", None)
@@ -691,7 +693,8 @@ async def spawn_trial_log(guild, rev):
         print("trial log skipped: no dedicated Trial Logs channel configured in /setup")
         return False
     try:
-        message = await channel.send(embed=trial_log_embed(rev), view=make_trial_log_view(rev))
+        message = await channel.send(**v2(embed=trial_log_embed(rev), view=make_trial_log_view(rev)),
+                                     allowed_mentions=discord.AllowedMentions.none())
         rev["trial_log_msg"] = {"ch": channel.id, "id": message.id}
         save_db(db)
         return True
@@ -714,7 +717,7 @@ class TrialLogCategorySelect(discord.ui.Select):
             return
         review["log_view"] = {"cat": self.values[0], "page": 0}
         save_db(db)
-        await interaction.response.edit_message(embed=trial_log_embed(review), view=make_trial_log_view(review))
+        await interaction.response.edit_message(**v2(embed=trial_log_embed(review), view=make_trial_log_view(review), edit=True))
 
 
 class TrialLogPageButton(discord.ui.Button):
@@ -733,7 +736,7 @@ class TrialLogPageButton(discord.ui.Button):
         category, page, pages, _ = trial_log_state(review)
         review["log_view"] = {"cat": category, "page": max(0, min(pages - 1, page + self.direction))}
         save_db(db)
-        await interaction.response.edit_message(embed=trial_log_embed(review), view=make_trial_log_view(review))
+        await interaction.response.edit_message(**v2(embed=trial_log_embed(review), view=make_trial_log_view(review), edit=True))
 
 
 class TrialLogView(GuardedView):
@@ -748,12 +751,15 @@ def make_trial_log_view(rev):
     category, page, pages, _ = trial_log_state(rev)
     return TrialLogView(category, page, pages)
 
-async def refresh_trial_message(rev, **kwargs):
+async def refresh_trial_message(rev, embed, buttons=True):
+    """Redraw the trial vote card. buttons=False once voting has closed."""
     ch = bot.get_channel(rev["channel_id"])
     if not ch:
         return False
     try:
-        await ch.get_partial_message(int(rev["message_id"])).edit(**kwargs)
+        await ch.get_partial_message(int(rev["message_id"])).edit(
+            **v2(embed=embed, view=TrialVoteView() if buttons else None, edit=True),
+            allowed_mentions=discord.AllowedMentions.none())
         return True
     except discord.HTTPException as e:
         print("trial message edit failed:", e)
@@ -781,7 +787,7 @@ async def _finish_trial_closure(rev_id):
     rev = db["trials"].get(rev_id)
     if not rev:
         return
-    await refresh_trial_message(rev, embed=trial_open_embed(rev), view=None)
+    await refresh_trial_message(rev, trial_open_embed(rev), buttons=False)
     await refresh_trial_log(rev)
 
 
@@ -816,7 +822,8 @@ async def maybe_open_trial_review(guild, info):
         "logs": [], "log_view": {"cat": "all", "page": 0},
     }
     try:
-        msg = await ch.send(embed=trial_open_embed(rev), view=TrialVoteView())
+        msg = await ch.send(**v2(embed=trial_open_embed(rev), view=TrialVoteView()),
+                            allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         print("trial review post failed:", e)
         return "I couldn't post the vote there. Check my permissions in the review channel."
@@ -862,8 +869,8 @@ class TrialWhyModal(discord.ui.Modal):
                                         f"{c['emoji']} **{c['label']}** · {c['meaning']}\nYour vote has been recorded and is final.")
         add_footer_divider(emb)
         emb.set_footer(text="Your vote is final · your reason is recorded in the Trial Logs")
-        await interaction.response.send_message(embed=emb, ephemeral=True)
-        await refresh_trial_message(rev, embed=trial_open_embed(rev))
+        await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
+        await refresh_trial_message(rev, trial_open_embed(rev), buttons=rev.get("status") != "closed")
         await refresh_trial_log(rev)
 
 class TrialVoteView(GuardedView):
@@ -941,7 +948,7 @@ async def trial_appoint(interaction: discord.Interaction, member: discord.Member
         add_footer_divider(emb)
         emb.set_footer(text=BRAND)
         try:
-            await ch.send(embed=emb)
+            await ch.send(**v2(embed=emb), allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             pass
     await interaction.followup.send(f"🎓 {member.mention} is now on trial. Their next event will be a trial event. When it ends, use `/trial review` to open the vote.", ephemeral=True)

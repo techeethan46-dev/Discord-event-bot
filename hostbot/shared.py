@@ -118,13 +118,18 @@ async def send_notice(msg, title, text, ttl=10, key="notice", every=60):
     if len(_notice_last) > 500:
         _notice_last.clear()
     _notice_last[k] = now
-    emb = discord.Embed(title=title, description=text, color=0x2B2D31)
+    emb = discord.Embed(description=f"### {title}\n{text}", color=0x2B2D31)
     emb.set_footer(text=BRAND)
     return await safe_reply(msg, embed=emb, delete_after=ttl)
 
 async def safe_reply(msg, content=None, **kwargs):
     """Reply without ever raising (a dead worker = a dead AI chat) and without live pings."""
     kwargs.setdefault("allowed_mentions", SAFE_MENTIONS)
+    if "embed" in kwargs or "embeds" in kwargs or isinstance(kwargs.get("view"), discord.ui.LayoutView):
+        # Cards are always sent as Components V2 (text goes inside the card).
+        kwargs.update(v2(content, embed=kwargs.pop("embed", None), embeds=kwargs.pop("embeds", None),
+                         view=kwargs.pop("view", None)))
+        content = None
     try:
         return await msg.reply(content, **kwargs)
     except discord.HTTPException as e:
@@ -139,22 +144,6 @@ async def safe_reply(msg, content=None, **kwargs):
             else:
                 print("safe_reply failed:", e2)
             return None
-
-async def refresh_event_message(info, guild=None, remove_view=False):
-    ch = bot.get_channel(info.get("channel_id"))
-    ids = info.get("message_ids") or []
-    if not ch or not ids:
-        return False
-    try:
-        msg = await ch.fetch_message(ids[0])
-        kwargs = {"embeds": build_embed(info["display_name"], info, guild or ch.guild)}
-        if remove_view:
-            kwargs["view"] = None
-        await msg.edit(**kwargs)
-        return True
-    except discord.HTTPException as e:
-        print("refresh_event_message failed:", e)
-        return False
 
 async def add_event_role(guild, uid):
     r_id = get_config(guild.id).get("event_role")
@@ -204,7 +193,7 @@ async def log_action(guild, title, desc, color=0x3498DB, channel_key=None):
     if channel:
         emb = discord.Embed(description=f"## 📝 {title}\n{DIV}\n{desc}", color=color)
         try: 
-            await channel.send(embed=emb)
+            await channel.send(**v2(embed=emb), allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException: 
             pass
 
@@ -222,92 +211,457 @@ def add_footer_divider(embed, minimum_length=280):
         embed.description = description.rstrip() + f"\n{DIV}"
     return embed
 BRAND = "AbyssalNoob1 is the Best"
-EMBED_CHUNK = 2600  # keeps two embeds safely under Discord's 6000-character message cap
-_PART = "\x00PART\x00"
 
-def build_embed(name, info, guild=None):
+
+# ==========================================
+# COMPONENTS V2
+# Every card the bot sends is a Components V2 message: a Container with the colored side line,
+# real separator lines instead of the old text divider, small grey footers, avatars beside the
+# text, and buttons/menus inside the card. Cards are still described with discord.Embed (handy
+# to build), and v2() turns them into the V2 layout right before sending or editing.
+# ==========================================
+V2_TEXT_LIMIT = 4000      # Discord's limit for all text in one V2 message
+V2_COMPONENT_LIMIT = 40   # ...and for the number of components
+
+
+def _sep(big=False):
+    return discord.ui.Separator(spacing=discord.SeparatorSpacing.large if big else discord.SeparatorSpacing.small)
+
+
+def _split_on_div(text):
+    """Split text at the old divider lines; each chunk becomes its own block between separators."""
+    chunks, cur = [], []
+    for line in (text or "").split("\n"):
+        if line.strip() == DIV:
+            chunks.append("\n".join(cur).strip("\n"))
+            cur = []
+        else:
+            cur.append(line)
+    chunks.append("\n".join(cur).strip("\n"))
+    return [c for c in chunks if c.strip()]
+
+
+def _fields_text(fields):
+    """Embed fields as text: inline ones as compact 'name · value' lines, others as a small heading + text."""
+    blocks, inline = [], []
+    for f in fields:
+        if f.inline:
+            inline.append(f"{f.name} · {f.value}" if f.name.strip() not in ("", "​") else f.value)
+            continue
+        if inline:
+            blocks.append("\n".join(inline))
+            inline = []
+        blocks.append(f"**{f.name}**\n{f.value}" if f.name.strip() not in ("", "​") else f.value)
+    if inline:
+        blocks.append("\n".join(inline))
+    return [b for b in blocks if b.strip()]
+
+
+def embed_container(e, rows=()):
+    """One discord.Embed -> one V2 Container (plus optional ActionRows placed at the bottom of the card)."""
+    color = e.colour.value if e.colour else None
+    c = discord.ui.Container(accent_colour=color)
+    head = []
+    if e.author and e.author.name:
+        head.append(f"-# {e.author.name}")
+    if e.title:
+        head.append(f"## {e.title}")
+    blocks = _split_on_div(e.description)
+    if head:
+        if blocks and not blocks[0].lstrip().startswith("#"):
+            blocks[0] = "\n".join(head) + "\n" + blocks[0]
+        else:
+            blocks.insert(0, "\n".join(head))
+    field_blocks = _fields_text(e.fields)
+
+    thumb = e.thumbnail.url if e.thumbnail and e.thumbnail.url else None
+    first = True
+    for b in blocks:
+        if not first:
+            c.add_item(_sep())
+        if first and thumb:
+            c.add_item(discord.ui.Section(discord.ui.TextDisplay(b), accessory=discord.ui.Thumbnail(thumb)))
+            thumb = None
+        else:
+            c.add_item(discord.ui.TextDisplay(b))
+        first = False
+    if field_blocks:
+        if not first:
+            c.add_item(_sep())
+        text = "\n\n".join(field_blocks)
+        if thumb:
+            c.add_item(discord.ui.Section(discord.ui.TextDisplay(text), accessory=discord.ui.Thumbnail(thumb)))
+        else:
+            c.add_item(discord.ui.TextDisplay(text))
+        first = False
+    if e.image and e.image.url:
+        c.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(e.image.url)))
+        first = False
+    rows = list(rows)
+    if rows:
+        if not first:
+            c.add_item(_sep())
+        for r in rows:
+            c.add_item(r)
+    foot = []
+    if e.footer and e.footer.text:
+        foot.append(e.footer.text)
+    if e.timestamp:
+        foot.append(f"<t:{int(e.timestamp.timestamp())}:f>")
+    if foot:
+        c.add_item(_sep())
+        c.add_item(discord.ui.TextDisplay("-# " + "  ·  ".join(foot)))
+    return c
+
+
+def _rows_from_view(view):
+    """Put a classic View's buttons/selects into ActionRows, keeping their row order."""
+    if view is None:
+        return []
+    groups = {}
+    for item in view.children:
+        groups.setdefault(item.row if item.row is not None else 99, []).append(item)
+    rows = []
+    for _, items in sorted(groups.items()):
+        cur = []
+        for item in items:
+            is_select = not isinstance(item, discord.ui.Button)
+            if is_select or len(cur) >= 5:
+                if cur:
+                    rows.append(discord.ui.ActionRow(*cur))
+                cur = []
+            if is_select:
+                rows.append(discord.ui.ActionRow(item))
+            else:
+                cur.append(item)
+        if cur:
+            rows.append(discord.ui.ActionRow(*cur))
+    return rows
+
+
+class V2View(discord.ui.LayoutView):
+    """The V2 layout around a classic View: the classic View keeps its buttons, callbacks, checks,
+    timeout and wait(), this class only carries the layout Discord shows."""
+
+    def __init__(self, inner=None, timeout=None):
+        super().__init__(timeout=inner.timeout if inner is not None else timeout)
+        self._inner = inner
+        if inner is not None:
+            inner_stop = inner.stop
+            outer = self
+
+            def stop():
+                inner_stop()
+                discord.ui.LayoutView.stop(outer)
+            inner.stop = stop
+            inner._v2 = self
+
+    def __getattr__(self, name):
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+    async def interaction_check(self, interaction):
+        if self._inner is not None:
+            return await self._inner.interaction_check(interaction)
+        return not await disabled_guild_response(interaction)
+
+    async def on_timeout(self):
+        if self._inner is not None:
+            await self._inner.on_timeout()
+            self._inner.stop()
+
+    async def on_error(self, interaction, error, item):
+        if self._inner is not None:
+            return await self._inner.on_error(interaction, error, item)
+        return await super().on_error(interaction, error, item)
+
+
+def _plain_container(text, color=None):
+    c = discord.ui.Container(accent_colour=color)
+    for i, b in enumerate(_split_on_div(text) or [text]):
+        if i:
+            c.add_item(_sep())
+        c.add_item(discord.ui.TextDisplay(b))
+    return c
+
+
+def build_layout(content=None, embeds=(), view=None, color=None):
+    """Make the LayoutView for a message. Buttons/menus of `view` go inside the last card."""
+    lay = getattr(view, "_v2", None) if view is not None else None
+    if lay is None or not isinstance(lay, V2View):
+        lay = V2View(view) if view is not None else V2View(timeout=None)
+    else:
+        lay.clear_items()
+    rows = _rows_from_view(view)
+    if content:
+        if embeds:
+            lay.add_item(discord.ui.TextDisplay(content))
+        else:
+            lay.add_item(_plain_container(content, color))
+            for r in rows:
+                lay.add_item(r)
+            return lay
+    embeds = list(embeds)
+    for i, e in enumerate(embeds):
+        lay.add_item(embed_container(e, rows if i == len(embeds) - 1 else ()))
+    if not embeds and rows:
+        for r in rows:
+            lay.add_item(r)
+    return lay
+
+
+def v2(content=None, *, embed=None, embeds=None, view=None, edit=False, color=None):
+    """Keyword arguments for send()/edit()/send_message()/edit_message() that render as Components V2.
+    With edit=True the old content/embeds are cleared too, which also turns an old-style message into V2."""
+    if embed is not None:
+        embeds = [embed]
+    if isinstance(view, discord.ui.LayoutView) and not embeds and not content:
+        lay = view   # already a hand-built V2 layout
+    else:
+        lay = build_layout(content, embeds or [], view, color)
+    kw = {"view": lay}
+    if edit:
+        kw.update(content=None, embeds=[])
+    return kw
+
+
+def message_text(msg):
+    """All text of a message: content, embed titles/descriptions and V2 text blocks."""
+    out = [msg.content or ""]
+    for e in msg.embeds:
+        out += [e.title or "", e.description or ""]
+    stack = list(getattr(msg, "components", []) or [])
+    while stack:
+        c = stack.pop()
+        if getattr(c, "content", None):
+            out.append(c.content)
+        stack.extend(getattr(c, "children", []) or [])
+        acc = getattr(c, "accessory", None)
+        if acc is not None:
+            stack.append(acc)
+    return "\n".join(out)
+
+
+def card_text(title, body="", color=None, footer=None):
+    """Quick one-card message: a heading, body text (old dividers become separators) and a footer."""
+    e = discord.Embed(description=(f"## {title}\n{DIV}\n{body}" if body else f"## {title}"), color=color)
+    if footer:
+        e.set_footer(text=footer)
+    return e
+EVENT_PART_LIMIT = 3800   # split the banner into another message before Discord's 4000-character V2 limit
+EVENT_BUTTONS = None      # set by events.py: returns the persistent Claim/Swap/Leave/Host buttons view
+
+
+def _event_state(info):
+    now = int(time.time())
+    start, end = info["start_time"], info["end_time"]
+    if info.get("concluded"):
+        return "🔒", 0xE74C3C, "🔒 Concluded"
+    if now >= end:
+        return "⚔️", 0xF1C40F, f"⚔️ Live · reservations closed <t:{end}:R>"
+    if now < start:
+        return "🕒", 0x3498DB, f"🕒 Opens <t:{start}:R>"
+    return "🚩", 0x2ECC71, f"🟢 Open · closes <t:{end}:R>"
+
+
+def event_blocks(name, info):
+    """The banner as (kind, text) blocks in display order. 'lines' blocks can be split between messages."""
     start, end = info["start_time"], info["end_time"]
     host, cohost = info["host_id"], info.get("cohost_id")
     res = info["reservations"]
     wait = info.get("waitlist", [])
     sps = info.get("superpowers", [])
     helpers = info.get("helpers", [])
-    max_p = info.get("max_players", 0)
-    now = int(time.time())
 
     sp_set = {s.title() for s in sps}
     sp_lines, reg_lines = [], []
     for country, u in res.items():
-        uid = u["discord_id"]
-        line = f"• **{country}** · `{u['roblox']}` · <@{uid}>"
+        line = f"• **{country}** · `{u['roblox']}` · <@{u['discord_id']}>"
         (sp_lines if country.title() in sp_set else reg_lines).append(line)
 
-    if info.get("concluded"):
-        emoji, color, status = "🔒", 0xE74C3C, "🔒 Concluded"
-    elif now >= end:
-        emoji, color, status = "⚔️", 0xF1C40F, f"⚔️ Live · reservations closed <t:{end}:R>"
-    elif now < start:
-        emoji, color, status = "🕒", 0x3498DB, f"🕒 Opens <t:{start}:R>"
-    else:
-        emoji, color, status = "🚩", 0x2ECC71, f"🟢 Open · closes <t:{end}:R>"
-
-    # Headings (not the embed title) so the name and status render large.
+    emoji, _, status = _event_state(info)
     h_str = f"<@{host}>" + (f" & <@{cohost}>" if cohost else "")
-    head = (f"# {emoji} {name}{_PART}\n## {status}{SECTION_SEP}"
-            f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
+    sched = (f"### 🗓️ Schedule\n• **Starts:** <t:{start}:f>\n• **Ends:** <t:{end}:f>\n• **Host:** {h_str}")
     if info.get("trial"):
-        head += "\n• **🎓 Trial event:** players can leave feedback on this trial host"
+        sched += "\n• **🎓 Trial event:** players can leave feedback on this trial host"
     if helpers:
-        head += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
-    head += SECTION_SEP
+        sched += "\n• **Helpers:** " + ", ".join(f"<@{i}>" for i in helpers[:15])
 
-    sp_sec = ""
+    blocks = [("head", f"# {emoji} {name}\n## {status}"), ("text", sched)]
     if sps:
         unclaimed = [s for s in sps if s.title() not in res]
         body = "\n".join(sp_lines)
         if unclaimed:
             body += ("\n" if body else "") + "*Available:* " + ", ".join(f"**{s}**" for s in unclaimed)
-        sp_sec = f"### ⭐ Superpowers\n{body}{SECTION_SEP}"
-
-    wait_sec = ""
+        blocks.append(("text", f"### ⭐ Superpowers\n{body}"))
+    blocks.append(("lines", (f"### 📋 Reservations ({len(reg_lines)})", reg_lines or ["*No reservations yet*"])))
     if wait:
         w_lines = [f"• **{w['country']}** · <@{w['discord_id']}>" for w in wait[:5]]
         more = f"\n*+{len(wait) - 5} more*" if len(wait) > 5 else ""
-        wait_sec = f"### ⏳ Waitlist ({len(wait)})\n" + "\n".join(w_lines) + more
+        blocks.append(("bottom", f"### ⏳ Waitlist ({len(wait)})\n" + "\n".join(w_lines) + more))
+    return blocks
 
-    chunks = []
-    cur = head + sp_sec + f"### 📋 Reservations ({len(reg_lines)})\n"
-    if not reg_lines:
-        cur += "*No reservations yet*"
-    shown = 0
-    for ln in reg_lines:
-        if len(cur) + len(ln) + 1 > EMBED_CHUNK:
-            if chunks:  # max two embeds per message
-                break
-            chunks.append(cur.rstrip("\n"))
-            cur = f"# {emoji} {name}{_PART}\n### 📋 Reservations (continued)\n"
-        cur += ln + "\n"
-        shown += 1
-    if shown < len(reg_lines):
-        cur += f"*…and {len(reg_lines) - shown} more*\n"
-    cur = cur.rstrip("\n")
-    if wait_sec:
-        if len(cur) + len(wait_sec) + 2 > EMBED_CHUNK and not chunks:
-            chunks.append(cur)
-            cur = f"# {emoji} {name}{_PART}\n" + wait_sec
-        else:
-            cur += "\n\n" + wait_sec
-    chunks.append(cur + SECTION_SEP.rstrip("\n"))  # closing line above the footer
-    chunks = [c[:EMBED_CHUNK + 250] for c in chunks]
 
-    n = len(chunks)
-    embs = []
-    for i, d in enumerate(chunks):
-        d = d.replace(_PART, f" · Part {i + 1}/{n}" if n > 1 else "")
-        embs.append(discord.Embed(color=color, description=d))
-    add_footer_divider(embs[-1])
-    embs[-1].set_footer(text=f"{len(res)}{f' / {max_p}' if max_p > 0 else ''} reservations · updated live · {BRAND}")
-    return embs
+def _pack_event(name, info):
+    """Pack the banner blocks into messages of at most EVENT_PART_LIMIT characters.
+    Returns a list of parts, each a list of text blocks (one block = one text area between separators)."""
+    blocks = event_blocks(name, info)
+    emoji = _event_state(info)[0]
+    max_p = info.get("max_players", 0)
+    footer = (f"-# {len(info['reservations'])}{f' / {max_p}' if max_p > 0 else ''} reservations"
+              f"  ·  updated live  ·  {BRAND}")
+    bottom = [t for k, t in blocks if k == "bottom"]
+    bottom_len = sum(len(t) for t in bottom) + len(footer)
+    parts, cur, size = [], [], 0
+
+    def new_part():
+        nonlocal cur, size
+        parts.append(cur)
+        cont = f"### {emoji} {name} · continued"
+        cur, size = [cont], len(cont)
+
+    for kind, text in blocks:
+        if kind == "bottom":
+            continue
+        if kind == "lines":
+            heading, lines = text
+            chunk = heading
+            for ln in lines:
+                if size + len(chunk) + len(ln) + 1 > EVENT_PART_LIMIT - 50:
+                    cur.append(chunk)
+                    new_part()
+                    chunk = "### 📋 Reservations (continued)"
+                chunk += "\n" + ln
+            cur.append(chunk)
+            size += len(chunk)
+            continue
+        if cur and size + len(text) > EVENT_PART_LIMIT - 50:
+            new_part()
+        cur.append(text)
+        size += len(text)
+    # The waitlist and footer always go on the LAST message, under the reservations.
+    if size + bottom_len > EVENT_PART_LIMIT - 50:
+        new_part()
+    cur.extend(bottom)
+    parts.append(cur)
+    if len(parts) > 1:
+        parts[0][0] = parts[0][0].replace(f"# {emoji} {name}", f"# {emoji} {name} · Part 1/{len(parts)}", 1)
+        for i in range(1, len(parts)):
+            parts[i][0] = f"### {emoji} {name} · Part {i + 1}/{len(parts)}"
+    parts[-1].append(footer)
+    return parts
+
+
+def build_event_layouts(info):
+    """One LayoutView per message. Buttons sit inside the last card (gone once the event is concluded)."""
+    name = info["display_name"]
+    color = _event_state(info)[1]
+    parts = _pack_event(name, info)
+    layouts = []
+    for i, blocks in enumerate(parts):
+        last = i == len(parts) - 1
+        buttons = EVENT_BUTTONS() if (last and EVENT_BUTTONS and not info.get("concluded")) else None
+        lay = V2View(buttons) if buttons else V2View(timeout=None)
+        c = discord.ui.Container(accent_colour=color)
+        body = [b for b in blocks if not b.startswith("-# ")]
+        foot = [b for b in blocks if b.startswith("-# ")]
+        for j, b in enumerate(body):
+            if j:
+                c.add_item(_sep())
+            c.add_item(discord.ui.TextDisplay(b))
+        if buttons:
+            c.add_item(_sep())
+            for r in _rows_from_view(buttons):
+                c.add_item(r)
+        for f in foot:
+            c.add_item(_sep())
+            c.add_item(discord.ui.TextDisplay(f))
+        lay.add_item(c)
+        layouts.append(lay)
+    return layouts
+
+
+def build_embed(name, info, guild=None):
+    """Kept for anything that still wants the banner text: one embed per message part."""
+    out = []
+    for blocks in _pack_event(name, info):
+        out.append(discord.Embed(color=_event_state(info)[1], description=f"\n{DIV}\n".join(blocks)))
+    return out
+
+
+_event_locks = {}
+
+
+async def post_event_messages(channel, info):
+    """Send every part of a banner as new messages and remember their IDs."""
+    ids = []
+    for lay in build_event_layouts(info):
+        m = await channel.send(view=lay, allowed_mentions=discord.AllowedMentions.none())
+        ids.append(m.id)
+    info["message_ids"] = ids
+    return ids
+
+
+async def refresh_event_message(info, guild=None, remove_view=False):
+    """Bring the banner up to date. It can grow into more messages (posted right under the last part)
+    or shrink (extra parts are deleted). If something else was posted in between, the whole banner
+    is re-posted so its parts always stay together."""
+    ch = bot.get_channel(info.get("channel_id"))
+    ids = list(info.get("message_ids") or [])
+    if not ch or not ids:
+        return False
+    lock = _event_locks.setdefault(id(info), asyncio.Lock())
+    async with lock:
+        layouts = build_event_layouts(info)
+        try:
+            needs_more = len(layouts) > len(ids)
+            if needs_more and ch.last_message_id not in (None, ids[-1]):
+                raise _Repost()
+            for i, lay in enumerate(layouts):
+                if i < len(ids):
+                    await ch.get_partial_message(ids[i]).edit(view=lay, content=None, embeds=[],
+                                                              allowed_mentions=discord.AllowedMentions.none())
+                else:
+                    m = await ch.send(view=lay, allowed_mentions=discord.AllowedMentions.none())
+                    ids.append(m.id)
+            for extra in ids[len(layouts):]:
+                try:
+                    await ch.get_partial_message(extra).delete()
+                except discord.HTTPException:
+                    pass
+            info["message_ids"] = ids[:len(layouts)]
+            save_db(db)
+            return True
+        except (_Repost, discord.HTTPException) as e:
+            # Re-post only when the parts got separated, a part was deleted, or Discord refused the
+            # edit (400, e.g. an old banner it won't convert). Other errors just retry next time.
+            if isinstance(e, discord.HTTPException) and not isinstance(e, discord.NotFound) and e.status != 400:
+                print("refresh_event_message failed:", e)
+                return False
+            # Re-post the whole banner together (also converts very old banners Discord won't edit).
+            try:
+                new_ids = []
+                for lay in layouts:
+                    m = await ch.send(view=lay, allowed_mentions=discord.AllowedMentions.none())
+                    new_ids.append(m.id)
+            except discord.HTTPException as e2:
+                print("refresh_event_message failed:", e2)
+                return False
+            for old in ids:
+                try:
+                    await ch.get_partial_message(old).delete()
+                except discord.HTTPException:
+                    pass
+            info["message_ids"] = new_ids
+            save_db(db)
+            return True
+
+
+class _Repost(Exception):
+    pass
+
 
 # ==========================================
 # PER-EVENT LOG EMBED (one live embed per event; the category dropdown + page buttons edit it in place)
@@ -382,7 +736,7 @@ class LogCatSelect(discord.ui.Select):
             return
         info["log_view"] = {"cat": self.values[0], "page": 0}
         save_db(db)
-        await interaction.response.edit_message(embed=build_log_embed(info), view=make_log_view(info))
+        await interaction.response.edit_message(**v2(embed=build_log_embed(info), view=make_log_view(info), edit=True))
 
 class LogPageButton(discord.ui.Button):
     def __init__(self, direction, disabled=True):
@@ -398,7 +752,7 @@ class LogPageButton(discord.ui.Button):
         cat, page, pages, _ = log_state(info)
         info["log_view"] = {"cat": cat, "page": max(0, min(pages - 1, page + self.direction))}
         save_db(db)
-        await interaction.response.edit_message(embed=build_log_embed(info), view=make_log_view(info))
+        await interaction.response.edit_message(**v2(embed=build_log_embed(info), view=make_log_view(info), edit=True))
 
 class GuardedView(discord.ui.View):
     """Base view that disables every button/select in disabled servers."""
@@ -425,14 +779,24 @@ async def refresh_log_message(info):
     if not ch:
         return False
     try:
-        m = await ch.fetch_message(lm["id"])
-        await m.edit(embed=build_log_embed(info), view=make_log_view(info))
+        await ch.get_partial_message(lm["id"]).edit(
+            **v2(embed=build_log_embed(info), view=make_log_view(info), edit=True),
+            allowed_mentions=discord.AllowedMentions.none())
         return True
     except discord.NotFound:
         info.pop("log_msg", None)  # message was deleted: respawn on the next entry
         save_db(db)
         return False
     except discord.HTTPException as e:
+        if e.status == 400:
+            # An old-style log Discord won't convert: replace it with a fresh V2 one.
+            try:
+                await ch.get_partial_message(lm["id"]).delete()
+            except discord.HTTPException:
+                pass
+            info.pop("log_msg", None)
+            save_db(db)
+            return False
         print("refresh_log_message failed:", e)
         return False
 
@@ -442,7 +806,8 @@ async def spawn_event_log(guild, info):
     if not ch:
         return False
     try:
-        m = await ch.send(embed=build_log_embed(info), view=make_log_view(info))
+        m = await ch.send(**v2(embed=build_log_embed(info), view=make_log_view(info)),
+                          allowed_mentions=discord.AllowedMentions.none())
         info["log_msg"] = {"ch": ch.id, "id": m.id}
         save_db(db)
         return True

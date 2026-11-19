@@ -7,7 +7,7 @@ import time
 
 from hostbot.core import bot, db, get_config, save_db
 from hostbot.hosts import event_player_count
-from hostbot.shared import BRAND, DIV, add_footer_divider
+from hostbot.shared import BRAND, DIV, add_footer_divider, v2
 
 # ==========================================
 # EVENT REMINDERS
@@ -173,7 +173,7 @@ async def post_weekly_summaries():
         if not ch or not emb:
             continue
         try:
-            await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+            await ch.send(**v2(embed=emb), allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as e:
             print("weekly summary failed:", e)
 

@@ -9,7 +9,7 @@ from discord import app_commands
 from hostbot.core import bot, db
 from hostbot.events import WARN_LIMIT, WARN_WINDOW_DAYS, active_warns
 from hostbot.routines import counted_events, event_players
-from hostbot.shared import BRAND, add_footer_divider
+from hostbot.shared import BRAND, add_footer_divider, v2
 
 
 def _day(ts):
@@ -94,5 +94,5 @@ def build_player_profile_embed(guild, member):
 @app_commands.describe(member="Whose profile to show (leave empty for your own)")
 async def player_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    await interaction.response.send_message(embed=build_player_profile_embed(interaction.guild, member),
+    await interaction.response.send_message(**v2(embed=build_player_profile_embed(interaction.guild, member)),
                                             ephemeral=True)
