@@ -18,6 +18,7 @@ hostbot/
   ai.py                 chatbot, /clearchat, Groq/OpenRouter, AI admin engine
   server_tools.py       /setup wizard and /talk
   panels.py             /panel (rules and announcements built from banner and card blocks)
+  afk.py                h!afk (same as Hard's r!afk): away status, [AFK] name tag, ping replies
   ui.py                 the shared look (cards, dividers, notices, mod log cards), ported from the Hard bot
   panel_data.py         <- your info panel text lives here
   players.py            /player profiles

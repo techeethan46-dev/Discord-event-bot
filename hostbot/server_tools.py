@@ -140,6 +140,8 @@ def setup_checks(guild, conf):
         out.append("⚠️ I need **Manage Roles** (event role + achievement roles + AI admin)")
     if not gp.manage_messages:
         out.append("⚠️ I need **Manage Messages** (cooldown cleanup + purge)")
+    if not gp.manage_nicknames:
+        out.append("⚠️ I need **Manage Nicknames** (the [AFK] tag in names)")
     return out or ["✅ Everything looks good"]
 
 class SetupAchievementRolesButton(discord.ui.Button):
