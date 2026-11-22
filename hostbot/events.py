@@ -14,6 +14,7 @@ from hostbot.hosts import (
     check_and_announce_achievements, check_host, trial_state,
 )
 from hostbot import shared
+from hostbot.ui import COLORS, card, divider, footnote, mod_log, msg, notice, notify, section, text, thumb
 from hostbot.shared import (
     BRAND, DIV, GuardedView, add_event_role, add_footer_divider, event_in_guild, event_log, post_event_messages, v2,
     find_active_event, find_event, is_authorized_manager, is_server_admin, is_vip, log_action,
@@ -903,16 +904,18 @@ bot.tree.add_command(blacklist_group)
                        duration="How long, like 3d or 12h (leave empty for permanent)")
 async def blacklist_add(interaction: discord.Interaction, user: discord.Member, reason: str = None, duration: str = None):
     if not is_server_admin(interaction.user):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only server admins can do that.", title="Not allowed"), ephemeral=True)
         return
     if user.bot:
-        await interaction.response.send_message("Bots don't join events.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Bots don't join events.", title="Can't do that"), ephemeral=True)
         return
     until = None
     if duration:
         secs = parse_time(duration)
         if not secs:
-            await interaction.response.send_message("I couldn't read that duration. Use things like `12h`, `3d`, `1d12h`.", ephemeral=True)
+            await interaction.response.send_message(
+                **notice("bad", "I couldn't read that duration. Use things like `12h`, `3d`, `1d12h`.", title="Can't do that"),
+                ephemeral=True)
             return
         until = int(time.time()) + secs
     reason = (reason or "").strip()[:200] or None
@@ -921,56 +924,68 @@ async def blacklist_add(interaction: discord.Interaction, user: discord.Member, 
 
     length = f"until <t:{until}:f> (<t:{until}:R>)" if until else "permanently"
     await interaction.response.send_message(
-        f"⛔ {user.mention} is {'now ' if not updating else 'still '}blacklisted {length}."
-        + (f"\n**Reason:** {reason}" if reason else ""), ephemeral=True)
+        **notice("ok", f"{user.mention} is {'now ' if not updating else 'still '}blacklisted {length}."
+                 + (f"\n-# Reason: {reason}" if reason else ""), title="Blacklisted"),
+        ephemeral=True)
     removed = await remove_from_active_events(interaction.guild, user.id)
     if removed:
         await interaction.followup.send(
-            "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
-    await log_action(interaction.guild, "Player Blacklisted",
-                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Length:** {length}"
-                     + (f"\n**Reason:** {reason}" if reason else ""), color=0xE74C3C)
+            **notice("info", "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed)),
+            ephemeral=True)
+    await mod_log(interaction.guild, "Blacklist", user, interaction.user, reason,
+                  extra=("Length", f"until <t:{until}:f>" if until else "permanent"))
 
 
 @blacklist_group.command(name="remove", description="Take a player off the blacklist")
 async def blacklist_remove(interaction: discord.Interaction, user: discord.User):
     if not is_server_admin(interaction.user):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only server admins can do that.", title="Not allowed"), ephemeral=True)
         return
     if user.id not in db["blacklists"].get(str(interaction.guild_id), []):
-        await interaction.response.send_message(f"{user.mention} isn't blacklisted.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", f"{user.mention} isn't blacklisted."), ephemeral=True)
         return
     unblacklist(interaction.guild_id, user.id)
     save_db(db)
-    await interaction.response.send_message(f"✅ {user.mention} can join events again.", ephemeral=True)
-    await log_action(interaction.guild, "Player Unblacklisted",
-                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}", color=0x2ECC71)
+    await interaction.response.send_message(
+        **notice("ok", f"{user.mention} can join events again.", title="Blacklist removed"), ephemeral=True)
+    await mod_log(interaction.guild, "Blacklist removed", user, interaction.user, "Taken off the blacklist")
+
+
+def _short_list(entries, limit=3000):
+    """Entries joined by blank lines, cut before the card gets too long. Returns (text, how many were left out)."""
+    out, size = [], 0
+    for e in entries:
+        if size + len(e) > limit:
+            break
+        out.append(e)
+        size += len(e) + 2
+    return "\n\n".join(out), len(entries) - len(out)
 
 
 @blacklist_group.command(name="list", description="See who is blacklisted and why")
 async def blacklist_list(interaction: discord.Interaction):
     if not is_authorized_manager(interaction.user):
-        await interaction.response.send_message("Managers only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only hosts and admins can do that.", title="Not allowed"), ephemeral=True)
         return
     ids = db["blacklists"].get(str(interaction.guild_id), [])
     meta = blacklist_info(interaction.guild_id)
-    lines = []
+    entries = []
     for uid in ids:
         m = meta.get(str(uid), {})
         until = m.get("until")
-        line = f"• <@{uid}> · " + (f"ends <t:{until}:R>" if until else "permanent")
-        if m.get("reason"):
-            line += f"\n  ↳ {m['reason']}"
+        detail = [m["reason"]] if m.get("reason") else []
         if m.get("by"):
-            line += f"\n  ↳ by <@{m['by']}> <t:{m.get('at', 0)}:R>"
-        lines.append(line)
-    body = "\n".join(lines) if lines else "*Nobody is blacklisted.*"
-    if len(body) > 3800:
-        body = body[:3800] + "\n*…and more*"
-    emb = discord.Embed(description=f"# ⛔ Blacklist · {len(ids)}\n{DIV}\n{body}", color=0xE74C3C)
-    add_footer_divider(emb)
-    emb.set_footer(text=BRAND)
-    await interaction.response.send_message(**v2(embed=emb), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            detail.append(f"by <@{m['by']}> <t:{m.get('at', 0)}:R>")
+        entries.append(f"<@{uid}> · " + (f"ends <t:{until}:R>" if until else "**permanent**")
+                       + (f"\n-# {' · '.join(detail)}" if detail else ""))
+    body, hidden = _short_list(entries)
+    await interaction.response.send_message(**msg(card(
+        COLORS["bad"] if ids else COLORS["ok"],
+        text("### ⛔ Blacklist", f"**{len(ids)}** player{'s' if len(ids) != 1 else ''} can't join events"),
+        divider(),
+        text(body or "✨ Nobody is blacklisted."),
+        footnote(f"…and {hidden} more.") if hidden else None,
+        footnote("Take someone off with /blacklist remove.") if ids else None)), ephemeral=True)
 
 
 # ==========================================
@@ -997,13 +1012,13 @@ def active_warns(guild_id, user_id):
 @app_commands.describe(user="Who to warn", reason="What they did")
 async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reason: str):
     if not is_authorized_manager(interaction.user):
-        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only hosts and admins can do that.", title="Not allowed"), ephemeral=True)
         return
-    if user.bot or user.id == interaction.user.id:
-        await interaction.response.send_message("You can't warn that person.", ephemeral=True)
-        return
-    if is_server_admin(user):
-        await interaction.response.send_message("Admins can't be warned.", ephemeral=True)
+    problem = ("You can't warn yourself." if user.id == interaction.user.id
+               else "You can't warn a bot." if user.bot
+               else "You can't warn a server admin." if is_server_admin(user) else None)
+    if problem:
+        await interaction.response.send_message(**notice("bad", problem, title="Can't do that"), ephemeral=True)
         return
     reason = reason.strip()[:200] or "No reason given"
     warn_list(interaction.guild_id, user.id).append({"reason": reason, "by": interaction.user.id, "at": int(time.time())})
@@ -1012,6 +1027,7 @@ async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reaso
     count = len(active)
 
     blacklisted = False
+    until = None
     if count >= WARN_LIMIT:
         for w in active:
             w["used"] = True  # these warnings are now "spent", the count starts again from 0
@@ -1024,74 +1040,77 @@ async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reaso
                           f"Reached {WARN_LIMIT} warnings in {WARN_WINDOW_DAYS} days", until)
         blacklisted = True
 
-    try:
-        await user.send(
-            f"⚠️ You were warned in **{interaction.guild.name}**.\n**Reason:** {reason}\n"
-            + (f"That was your {WARN_LIMIT}th warning in {WARN_WINDOW_DAYS} days, so you're blacklisted from events "
+    await notify(
+        user, interaction.guild, "You received a warning", reason, kind="bad" if blacklisted else "warn",
+        extra=(f"That was your **{WARN_LIMIT}th** warning in {WARN_WINDOW_DAYS} days, so you're blacklisted from events "
                f"for {WARN_BLACKLIST_DAYS} days." if blacklisted
                else f"Warnings: **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days. "
                     f"At {WARN_LIMIT} you get blacklisted from events for {WARN_BLACKLIST_DAYS} days."))
-    except discord.HTTPException:
-        pass
 
     if blacklisted:
-        await interaction.response.send_message(
-            f"⚠️ Warned {user.mention}. That's **{WARN_LIMIT}/{WARN_LIMIT}**, so they're now ⛔ blacklisted for "
-            f"{WARN_BLACKLIST_DAYS} days.", ephemeral=True)
+        await interaction.response.send_message(**notice(
+            "ok", f"{user.mention} reached **{WARN_LIMIT}/{WARN_LIMIT}** warnings, so they're blacklisted from events "
+                  f"for {WARN_BLACKLIST_DAYS} days.\n-# Reason: {reason}", title="Warning given"), ephemeral=True)
         removed = await remove_from_active_events(interaction.guild, user.id)
         if removed:
             await interaction.followup.send(
-                "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed), ephemeral=True)
+                **notice("info", "Also removed them from: " + ", ".join(f"**{e['display_name']}**" for e in removed)),
+                ephemeral=True)
     else:
-        await interaction.response.send_message(
-            f"⚠️ Warned {user.mention} · **{count}/{WARN_LIMIT}** in the last {WARN_WINDOW_DAYS} days.", ephemeral=True)
+        await interaction.response.send_message(**notice(
+            "ok", f"{user.mention} now has **{count}/{WARN_LIMIT}** warnings in the last {WARN_WINDOW_DAYS} days.\n"
+                  f"-# Reason: {reason}", title="Warning given"), ephemeral=True)
 
-    await log_action(interaction.guild, "Player Warned",
-                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Reason:** {reason}\n"
-                     f"**Warnings:** {count}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days)"
-                     + (f"\n⛔ **Blacklisted for {WARN_BLACKLIST_DAYS} days**" if blacklisted else ""),
-                     color=0xF1C40F)
+    await mod_log(interaction.guild, "Warn", user, interaction.user, reason,
+                  extra=("Warnings", f"{count}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days)"))
+    if blacklisted:
+        await mod_log(interaction.guild, "Blacklist", user, interaction.user,
+                      f"Reached {WARN_LIMIT} warnings in {WARN_WINDOW_DAYS} days",
+                      extra=("Length", f"until <t:{until}:f>"))
 
 
 @bot.tree.command(name="warnings", description="See a player's warnings")
 @app_commands.guild_only()
 async def warnings_cmd(interaction: discord.Interaction, user: discord.User):
     if not is_authorized_manager(interaction.user):
-        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only hosts and admins can do that.", title="Not allowed"), ephemeral=True)
         return
     allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
     active = active_warns(interaction.guild_id, user.id)
-    lines = []
+    entries = []
     for w in reversed(allw[-15:]):
-        tag = "" if w in active else " · *expired*" if not w.get("used") else " · *led to blacklist*"
-        lines.append(f"• <t:{w['at']}:d> · {w['reason']}\n  ↳ by <@{w['by']}>{tag}")
-    body = "\n".join(lines) or "*No warnings.*"
-    emb = discord.Embed(color=0xF1C40F, description=(
-        f"# ⚠️ Warnings · {user.display_name}\n{DIV}\n"
-        f"**Active:** {len(active)}/{WARN_LIMIT} (last {WARN_WINDOW_DAYS} days) · **All time:** {len(allw)}\n{DIV}\n{body}"))
-    add_footer_divider(emb)
-    emb.set_footer(text=BRAND)
-    await interaction.response.send_message(**v2(embed=emb), ephemeral=True)
+        tag = "" if w in active else " · expired" if not w.get("used") else " · led to a blacklist"
+        entries.append(f"**{w['reason']}**\n-# <t:{w['at']}:R> · by <@{w['by']}>{tag}")
+    body, hidden = _short_list(entries)
+    await interaction.response.send_message(**msg(card(
+        COLORS["warn"] if active else COLORS["ok"],
+        section(["### ⚠️ Warnings",
+                 f"{user.mention} has **{len(active)}/{WARN_LIMIT}** active warning{'s' if len(active) != 1 else ''}"
+                 f" · {len(allw)} all time"], thumb(user.display_avatar.url)),
+        divider(),
+        text(body or "✨ Clean record, nothing here."),
+        footnote(f"Showing the newest {len(entries) - hidden} of {len(allw)}.") if hidden or len(allw) > 15 else None,
+        footnote(f"Active = the last {WARN_WINDOW_DAYS} days · remove the latest one with /unwarn.") if allw else None)),
+        ephemeral=True)
 
 
 @bot.tree.command(name="unwarn", description="Remove a player's most recent warning")
 @app_commands.guild_only()
 async def unwarn_cmd(interaction: discord.Interaction, user: discord.User):
     if not is_authorized_manager(interaction.user):
-        await interaction.response.send_message("Hosts and admins only.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", "Only hosts and admins can do that.", title="Not allowed"), ephemeral=True)
         return
     allw = db.get("warns", {}).get(str(interaction.guild_id), {}).get(str(user.id), [])
     if not allw:
-        await interaction.response.send_message(f"{user.mention} has no warnings.", ephemeral=True)
+        await interaction.response.send_message(**notice("bad", f"{user.mention} has no warnings."), ephemeral=True)
         return
     w = allw.pop()
     save_db(db)
-    await interaction.response.send_message(
-        f"Removed {user.mention}'s latest warning (*{w['reason']}*). "
-        f"They now have **{len(active_warns(interaction.guild_id, user.id))}/{WARN_LIMIT}** active.", ephemeral=True)
-    await log_action(interaction.guild, "Warning Removed",
-                     f"**Player:** {user.mention}\n**By:** {interaction.user.mention}\n**Removed:** {w['reason']}",
-                     color=0xF1C40F)
+    await interaction.response.send_message(**notice(
+        "ok", f"Removed {user.mention}'s latest warning.\n-# {w['reason']} · they now have "
+              f"{len(active_warns(interaction.guild_id, user.id))}/{WARN_LIMIT} active", title="Warning removed"),
+        ephemeral=True)
+    await mod_log(interaction.guild, "Warning removed", user, interaction.user, f"Removed: {w['reason']}")
 
 
 def expire_blacklists():

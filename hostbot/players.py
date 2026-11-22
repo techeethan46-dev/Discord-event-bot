@@ -9,7 +9,7 @@ from discord import app_commands
 from hostbot.core import bot, db
 from hostbot.events import WARN_LIMIT, WARN_WINDOW_DAYS, active_warns
 from hostbot.routines import counted_events, event_players
-from hostbot.shared import BRAND, add_footer_divider, v2
+from hostbot.ui import COLORS, card, divider, footnote, msg, notice, section, text, thumb
 
 
 def _day(ts):
@@ -30,27 +30,25 @@ def _streaks(days):
     return current, best
 
 
-def build_player_profile_embed(guild, member):
+def build_player_profile_card(guild, member):
+    """The player profile in the same layout as a rank card: avatar, headline stat, then the details."""
     uid = member.id
     events = sorted((e for e in counted_events(guild.id) if uid in event_players(e)),
                     key=lambda e: e.get("concluded_at", 0))
     helped = sum(1 for e in counted_events(guild.id) if uid in {int(i) for i in e.get("helpers", [])})
-
-    emb = discord.Embed(title=f"🎮 {member.display_name} · Player Profile", color=0x2ECC71)
-    if member.display_avatar:
-        emb.set_thumbnail(url=member.display_avatar.url)
-
     warns = len(active_warns(guild.id, uid))
     blacklisted = uid in db["blacklists"].get(str(guild.id), [])
+    avatar = member.display_avatar.url if member.display_avatar else None
+    warn_line = f"⚠️ **{warns}/{WARN_LIMIT}** warnings · last {WARN_WINDOW_DAYS} days"
+    status_line = "⛔ **Blacklisted from events**" if blacklisted else None
+
     if not events:
-        emb.description = f"<@{uid}>\n\nNo events played yet. Claim a spot in the next one!"
-        if warns or blacklisted:
-            emb.add_field(name="⚠️ Warnings", value=f"**{warns}/{WARN_LIMIT}** · last {WARN_WINDOW_DAYS} days", inline=True)
-        if blacklisted:
-            emb.add_field(name="⛔ Status", value="**Blacklisted**", inline=True)
-        add_footer_divider(emb)
-        emb.set_footer(text=BRAND)
-        return emb
+        return card(COLORS["brand"],
+                    section([f"### {member.display_name}", "**No events played yet**",
+                             "-# Claim a spot in the next one!"], thumb(avatar)),
+                    divider(),
+                    text(warn_line, status_line),
+                    footnote("Join events to build your profile and your 🔥 streak"))
 
     month_ago = time.time() - 30 * 86400
     recent = sum(1 for e in events if e.get("concluded_at", 0) >= month_ago)
@@ -66,27 +64,29 @@ def build_player_profile_embed(guild, member):
                 if country.title() in sps:
                     superpower_games += 1
     hosts = collections.Counter(e.get("host_id") for e in events if e.get("host_id") != uid)
-
     first = events[0].get("concluded_at", 0)
-    emb.description = f"<@{uid}>\n\nPlaying since <t:{first}:D> · last game <t:{events[-1].get('concluded_at', 0)}:R>"
-    emb.add_field(name="🎪 Events Played", value=f"**{len(events)}**", inline=True)
-    emb.add_field(name="📅 Last 30 Days", value=f"**{recent}**", inline=True)
-    emb.add_field(name="🤝 Times Helped", value=f"**{helped}**", inline=True)
-    emb.add_field(name="🔥 Current Streak", value=f"**{current} day{'s' if current != 1 else ''}**", inline=True)
-    emb.add_field(name="🏅 Best Streak", value=f"**{best} day{'s' if best != 1 else ''}**", inline=True)
-    emb.add_field(name="⭐ Superpower Games", value=f"**{superpower_games}**", inline=True)
+    last = events[-1].get("concluded_at", 0)
+
+    lines = [
+        f"🔥 **{current}** day streak" + (f" · best {best}" if best > current else " · personal best!" if current else ""),
+        f"⭐ **{superpower_games}** superpower game{'s' if superpower_games != 1 else ''}"
+        f" · 🤝 helped **{helped}** time{'s' if helped != 1 else ''}",
+    ]
     if nations:
         (nation, n), = nations.most_common(1)
-        emb.add_field(name="🌍 Favourite Nation", value=f"**{nation}** · {n}×", inline=True)
+        lines.append(f"🌍 Favourite nation **{nation}** · {n}×")
     if hosts:
         (host, n), = hosts.most_common(1)
-        emb.add_field(name="🎤 Favourite Host", value=f"<@{host}> · {n} events", inline=True)
-    emb.add_field(name="⚠️ Warnings", value=f"**{warns}/{WARN_LIMIT}** · last {WARN_WINDOW_DAYS} days", inline=True)
-    if blacklisted:
-        emb.add_field(name="⛔ Status", value="**Blacklisted**", inline=True)
-    add_footer_divider(emb)
-    emb.set_footer(text=BRAND)
-    return emb
+        lines.append(f"🎤 Favourite host <@{host}> · {n} event{'s' if n != 1 else ''}")
+    lines += [warn_line, status_line]
+
+    return card(COLORS["brand"],
+                section([f"### {member.display_name}",
+                         f"**{len(events)} event{'s' if len(events) != 1 else ''} played** · {recent} in the last 30 days",
+                         f"-# Playing since <t:{first}:D> · last game <t:{last}:R>"], thumb(avatar)),
+                divider(),
+                text(lines),
+                footnote("Join events to grow your 🔥 streak"))
 
 
 @bot.tree.command(name="player", description="View a player's event profile")
@@ -94,5 +94,7 @@ def build_player_profile_embed(guild, member):
 @app_commands.describe(member="Whose profile to show (leave empty for your own)")
 async def player_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    await interaction.response.send_message(**v2(embed=build_player_profile_embed(interaction.guild, member)),
-                                            ephemeral=True)
+    if member.bot:
+        await interaction.response.send_message(**notice("warn", "🤖 Bots don't play events."), ephemeral=True)
+        return
+    await interaction.response.send_message(**msg(build_player_profile_card(interaction.guild, member)), ephemeral=True)

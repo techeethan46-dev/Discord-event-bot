@@ -17,7 +17,8 @@ hostbot/
                         server enable/disable, trial-host voting
   ai.py                 chatbot, /clearchat, Groq/OpenRouter, AI admin engine
   server_tools.py       /setup wizard and /talk
-  panels.py             /post_panel (builds the styled info messages)
+  panels.py             /panel (rules and announcements built from banner and card blocks)
+  ui.py                 the shared look (cards, dividers, notices, mod log cards), ported from the Hard bot
   panel_data.py         <- your info panel text lives here
   players.py            /player profiles
   routines.py           event reminders, weekly summary (own /setup channel), 90-day cleanup
