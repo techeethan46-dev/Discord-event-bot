@@ -12,6 +12,7 @@ from hostbot.shared import (
     DIV, GuardedView, add_footer_divider, emergency_rate_limit_shutdown, has_host_role,
     is_server_admin, log_action, v2,
 )
+from hostbot.ui import COLORS, card, divider, footnote, msg, notice, progress, rows, section, text, thumb
 from hostbot import core
 
 # ==========================================
@@ -53,6 +54,13 @@ SETUP_STEPS = [
 ]
 SETUP_COLOR = 0x5865F2
 
+# Steps are grouped into sections, each with its own colour and icon (like Hard's /setup).
+_SECTION_OF = {"role": "Roles", "channel": "Channels", "achievement": "Achievements"}
+for _st in SETUP_STEPS:
+    _st["section"] = _SECTION_OF[_st["kind"]]
+SECTION_COLORS = {"Roles": COLORS["brand"], "Channels": COLORS["info"], "Achievements": COLORS["ok"]}
+SECTION_ICONS = {"Roles": "🎭", "Channels": "📡", "Achievements": "🏆"}
+
 def _achievement_roles_ready(guild):
     conf = get_config(guild.id)
     role_map = conf.get("achievement_roles", {})
@@ -77,18 +85,29 @@ def _setup_step_configured(guild, st, conf):
         return ready == total and total > 0
     return bool(conf.get(st["key"]))
 
-def _setup_value(guild, st, conf):
+def _setup_state(guild, st, conf):
+    """(icon, value, required): value is None when nothing is set."""
     if st["kind"] == "achievement":
         ready, total = _achievement_roles_ready(guild)
-        if ready == total and total > 0:
-            return f"✅ **{ready}/{total} roles ready**"
-        return f"⚠️ **{ready}/{total} roles ready**"
+        return ("✅" if ready == total and total > 0 else "⚠️"), f"**{ready}/{total}** roles ready", False
     v = conf.get(st["key"])
     if not v:
-        return "⚠️ *not set*" if st["required"] else "➖ *not set*"
+        return ("⚠️" if st["required"] else "➖"), None, st["required"]
     if st["kind"] == "role":
-        return f"✅ <@&{v}>" if guild.get_role(v) else "⚠️ *role was deleted*"
-    return f"✅ <#{v}>" if guild.get_channel(v) else "⚠️ *channel was deleted*"
+        return ("✅", f"<@&{v}>", False) if guild.get_role(v) else ("⚠️", "*role was deleted*", False)
+    return ("✅", f"<#{v}>", False) if guild.get_channel(v) else ("⚠️", "*channel was deleted*", False)
+
+def _setup_current(guild, st, conf):
+    icon, value, required = _setup_state(guild, st, conf)
+    if value is None:
+        return f"{icon} Not set" + (" · required" if required else "")
+    return f"{icon} {value}"
+
+def _setup_line(guild, st, conf):
+    icon, value, required = _setup_state(guild, st, conf)
+    if value is None:
+        value = "*required, not set*" if required else "*not set*"
+    return f"{icon} **{st['title']}** · {value}"
 
 def setup_checks(guild, conf):
     me = guild.me
@@ -125,7 +144,7 @@ def setup_checks(guild, conf):
 
 class SetupAchievementRolesButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="🏆 Create / Sync Achievement Roles", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="Create / sync achievement roles", emoji="🏆", style=discord.ButtonStyle.success, row=0)
 
     async def callback(self, interaction):
         view = self.view
@@ -167,51 +186,63 @@ class SetupWizard(GuardedView):
             self.add_item(SetupNav("back"))
             self.add_item(SetupNav("finish"))
 
-    def embed(self):
+    def cards(self):
+        """The screen as cards: one step, or the summary with a separate checks card."""
         conf = get_config(self.guild.id)
         t = self.total
         if self.step < t:
             st = SETUP_STEPS[self.step]
-            bar = "▰" * (self.step + 1) + "▱" * (t - self.step - 1)
-            desc = f"# ⚙️ Setup · Step {self.step + 1} of {t}\n{bar}\n{DIV}\n"
-            if self.note:
-                desc += f"{self.note}\n\n"
-            desc += f"## {st['icon']} {st['title']}\n{st['desc']}\n\n**Current:** {_setup_value(self.guild, st, conf)}\n{DIV}"
-            emb = discord.Embed(color=SETUP_COLOR, description=desc)
-            add_footer_divider(emb)
-            emb.set_footer(text="Pick below · it saves instantly and moves to the next step")
-            return emb
+            foot = ("Existing roles are reused, so running this again never creates duplicates"
+                    if st["kind"] == "achievement" else "Pick below · it saves instantly and moves to the next step")
+            return [card(SECTION_COLORS[st["section"]],
+                         text(f"-# ⚙️ SETUP · {st['section'].upper()} · STEP {self.step + 1} OF {t}",
+                              progress(self.step + 1, t)),
+                         divider(),
+                         text(f"## {st['icon']} {st['title']}", st["desc"]),
+                         divider(line=False),
+                         text(f"**Current** · {_setup_current(self.guild, st, conf)}"),
+                         text(self.note) if self.note else None,
+                         divider(),
+                         rows(self),
+                         footnote(foot))]
 
-        roles = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
-                          for s in SETUP_STEPS if s["kind"] == "role")
-        chans = "\n".join(f"{s['icon']} **{s['title']}** · {_setup_value(self.guild, s, conf)}"
-                          for s in SETUP_STEPS if s["kind"] == "channel")
-        ready, total = _achievement_roles_ready(self.guild)
-        checks = "\n".join(setup_checks(self.guild, conf))
-        security = (
-            f"🤖 **AI access:** VIP + Staff + Administrators + Bot Owners\n"
-            f"🖼️ **Image vision:** Double Booster role only\n"
-            f"⚖️ **Trial decisions:** Reviewed and decided manually by your team\n"
-            f"💬 **/talk audit:** {'Configured' if conf.get('talk_log_channel') else 'Optional / not configured'}"
-        )
-        desc = (f"# ⚙️ Setup · Overview\n{'▰' * t}\n{DIV}\n"
-                f"### 🎭 Roles\n{roles}\n{DIV}\n"
-                f"### 🤖 AI & Security\n{security}\n{DIV}\n"
-                f"### 📡 Channels\n{chans}\n{DIV}\n"
-                f"### 🏆 Achievement Roles\n🏆 **Achievement roles** · **{ready}/{total} ready**\n{DIV}\n"
-                f"### 🔍 Checks\n{checks}\n{DIV}")
-        if self.note:
-            desc = self.note + "\n\n" + desc
-        emb = discord.Embed(color=SETUP_COLOR, description=desc[:4000])
-        add_footer_divider(emb)
-        emb.set_footer(text="Jump to any step with the menu · press Finish when you're done")
-        return emb
+        done = sum(1 for s_ in SETUP_STEPS if _setup_step_configured(self.guild, s_, conf))
+        by_section = {}
+        for st in SETUP_STEPS:
+            by_section.setdefault(st["section"], []).append(_setup_line(self.guild, st, conf))
+        security = [
+            "🤖 **AI access** · VIP + Staff + Administrators + Bot Owners",
+            "🖼️ **Image vision** · Double Booster role only",
+            "⚖️ **Trial decisions** · reviewed and decided manually by your team",
+            f"💬 **/talk audit** · {'configured' if conf.get('talk_log_channel') else 'optional, not configured'}",
+        ]
+        parts = []
+        for name, lines in by_section.items():
+            parts.append([divider(), text(f"### {SECTION_ICONS[name]} {name}", lines)])
+            if name == "Roles":
+                parts.append([divider(), text("### 🤖 AI & Security", security)])
+        icon = self.guild.icon.url if self.guild.icon else None
+        summary = card(COLORS["brand"],
+                       section(["-# ⚙️ SETUP · SUMMARY", f"## {self.guild.name}",
+                                f"{progress(done, t)}  **{done}/{t}** set"], thumb(icon)),
+                       text(self.note) if self.note else None,
+                       parts,
+                       divider(),
+                       rows(self),
+                       footnote("Change anything with the menu · press Finish when you're done"))
+        problems = [c for c in setup_checks(self.guild, conf) if c.startswith("⚠️")]
+        health = card(COLORS["warn"] if problems else COLORS["ok"],
+                      text(f"### 🔍 {len(problems)} thing{'s' if len(problems) != 1 else ''} to fix" if problems
+                           else "### 🔍 Checks",
+                           problems or ["✅ Everything looks good! The bot has all the access it needs."]))
+        return [summary, health]
 
     async def interaction_check(self, interaction):
         if not await super().interaction_check(interaction):
             return False
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("This panel belongs to someone else. Run /setup yourself.", ephemeral=True)
+            await interaction.response.send_message(
+                **notice("bad", "This panel belongs to someone else. Run `/setup` yourself."), ephemeral=True)
             return False
         return True
 
@@ -220,10 +251,11 @@ class SetupWizard(GuardedView):
             self.step = max(0, min(self.total, step))
         self.note = note
         self.rebuild()
+        payload = msg(*self.cards(), view=self, edit=True)
         if interaction.response.is_done():
-            await interaction.edit_original_response(**v2(embed=self.embed(), view=self, edit=True))
+            await interaction.edit_original_response(**payload)
         else:
-            await interaction.response.edit_message(**v2(embed=self.embed(), view=self, edit=True))
+            await interaction.response.edit_message(**payload)
 
 def _setup_saved(st, extra=""):
     return f"✅ **{st['title']}** saved." + (f"\n{extra}" if extra else "")
@@ -272,14 +304,14 @@ class SetupChannelPick(discord.ui.ChannelSelect):
         await view.go(interaction, step=view.step + 1, note=_setup_saved(self.st, extra))
 
 class SetupNav(discord.ui.Button):
-    LABELS = {"back": ("◀ Back", discord.ButtonStyle.secondary), "next": ("Next ▶", discord.ButtonStyle.primary),
-              "clear": ("Clear", discord.ButtonStyle.secondary), "finish": ("✅ Finish", discord.ButtonStyle.success)}
+    LABELS = {"back": ("Back", "◀️", discord.ButtonStyle.secondary), "next": ("Next", "▶️", discord.ButtonStyle.primary),
+              "clear": ("Clear", "🧹", discord.ButtonStyle.secondary), "finish": ("Finish", "✅", discord.ButtonStyle.success)}
 
     def __init__(self, kind, disabled=False, skip=False):
-        label, style = self.LABELS[kind]
+        label, emoji, style = self.LABELS[kind]
         if kind == "next" and skip:
-            label, style = "Skip ▶", discord.ButtonStyle.secondary
-        super().__init__(label=label, style=style, disabled=disabled, row=1)
+            label, style = "Skip", discord.ButtonStyle.secondary
+        super().__init__(label=label, emoji=emoji, style=style, disabled=disabled, row=1)
         self.kind = kind
 
     async def callback(self, interaction):
@@ -296,16 +328,18 @@ class SetupNav(discord.ui.Button):
         else:
             conf = get_config(view.guild.id)
             done = sum(1 for s in SETUP_STEPS if _setup_step_configured(view.guild, s, conf))
-            emb = discord.Embed(color=0x2ECC71, description=(
-                f"# ✅ Setup saved\n{DIV}\n{done} of {view.total} options configured.\n"
-                "Run **/setup** any time to change something."))
-            await interaction.response.edit_message(**v2(embed=emb, edit=True))
+            await interaction.response.edit_message(**msg(card(
+                COLORS["ok"],
+                text("## 🎉 You're all set!", f"Your settings are saved. **{done} of {view.total}** options are configured."),
+                divider(),
+                footnote("Run /setup again any time to change things")), edit=True))
             view.stop()
 
 class SetupJump(discord.ui.Select):
     def __init__(self):
-        opts = [discord.SelectOption(label=s["title"], value=str(i), emoji=s["icon"]) for i, s in enumerate(SETUP_STEPS)]
-        super().__init__(placeholder="Jump to a step...", options=opts, row=0)
+        opts = [discord.SelectOption(label=s["title"], description=s["section"], value=str(i), emoji=s["icon"])
+                for i, s in enumerate(SETUP_STEPS)]
+        super().__init__(placeholder="✏️ Change something…", options=opts, row=0)
 
     async def callback(self, interaction):
         await self.view.go(interaction, step=int(self.values[0]))
@@ -314,10 +348,14 @@ class SetupJump(discord.ui.Select):
 @app_commands.guild_only()
 async def setup_cmd(interaction: discord.Interaction):
     if not is_server_admin(interaction.user):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await interaction.response.send_message(
+            **notice("bad", "You need to be a server admin to change the setup.", title="Not allowed"), ephemeral=True)
         return
-    wizard = SetupWizard(interaction.guild, interaction.user.id)
-    await interaction.response.send_message(**v2(embed=wizard.embed(), view=wizard), ephemeral=True)
+    conf = get_config(interaction.guild_id)
+    # Start at the summary if the server was set up before, otherwise at step 1.
+    start = len(SETUP_STEPS) if any(conf.get(st["key"]) for st in SETUP_STEPS) else 0
+    wizard = SetupWizard(interaction.guild, interaction.user.id, step=start)
+    await interaction.response.send_message(**msg(*wizard.cards(), view=wizard), ephemeral=True)
 # ==========================================
 # /talk — controlled bot voice message
 # ==========================================

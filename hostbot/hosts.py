@@ -12,6 +12,8 @@ from hostbot.shared import (
     BRAND, DIV, GuardedView, add_footer_divider, event_in_guild, is_authorized_manager,
     is_server_admin, v2,
 )
+from hostbot.ui import COLORS, divider, footnote, notice, text, thumb
+from hostbot.ui import card as ui_card, msg as ui_msg, progress as ui_progress, section as ui_section
 
 # ==========================================
 # HOST ANALYTICS / PROFILES / ACHIEVEMENTS
@@ -291,8 +293,8 @@ def progress_bar(progress, size=12):
     return "▰" * filled + "▱" * (size - filled)
 
 
-def build_host_profile_embed(guild, member):
-    """Build the Host Assistant profile embed for a member."""
+def build_host_profile_card(guild, member):
+    """The host profile in the same layout as a rank card: avatar, level + progress bar, then the stats."""
     stats = db.get("hosts", {}).get(str(member.id), {})  # read-only: viewing must not create records
 
     total_events = int(stats.get("total_events", 0) or 0)
@@ -309,46 +311,43 @@ def build_host_profile_embed(guild, member):
     unlocked = set(state.get("unlocked", []))
     points = _achievement_points(unlocked)
     level, level_floor, level_next, level_progress = host_level_from_points(points)
-
-    embed = discord.Embed(
-        title=f"🎖️ {member.display_name} · Host Profile",
-        description=(f"<@{member.id}>\n\n"
-                     f"**Level {level} Host** · {points:,} achievement points\n"
-                     f"`{progress_bar(level_progress)}` **{round(level_progress * 100)}%**\n"
-                     f"{points - level_floor:,} / {level_next - level_floor:,} to Level {level + 1}"),
-        color=0x5865F2
-    )
-    if member.display_avatar:
-        embed.set_thumbnail(url=member.display_avatar.url)
-
     cohosted = sum(1 for e in db["events"].values()
                    if e.get("guild_id") == guild.id and e.get("cohost_id") == member.id
                    and e.get("concluded") and not e.get("cancelled"))
-    embed.add_field(name="📅 Events Hosted",
-                    value=f"**{total_events:,}**" + (f"\n+ {cohosted} co-hosted" if cohosted else ""), inline=True)
-    embed.add_field(name="👥 Players Hosted", value=f"**{total_players:,}**", inline=True)
-    embed.add_field(name="⭐ Average Rating", value=f"**{average_rating:.2f}/5**" if ratings else "**No ratings yet**", inline=True)
-    embed.add_field(
-        name="🏆 Achievements",
-        value=f"**{len(unlocked)}/{len(ACHIEVEMENT_DEFS)}** unlocked\n**{points:,}** points",
-        inline=True
+
+    return ui_card(
+        COLORS["brand"],
+        ui_section([
+            f"### {member.display_name}",
+            f"**Level {level} Host**" + ("" if total_events else " · new host"),
+            ui_progress(round(level_progress * 14), 14),
+            f"-# {points - level_floor:,} / {level_next - level_floor:,} points · {points:,} total",
+        ], thumb(member.display_avatar.url if member.display_avatar else None)),
+        divider(),
+        text(
+            f"📅 **{total_events:,}** event{'s' if total_events != 1 else ''} hosted"
+            + (f" · +{cohosted} co-hosted" if cohosted else ""),
+            f"👥 **{total_players:,}** players hosted",
+            f"⭐ **{average_rating:.2f}/5** average rating · {len(ratings):,} rating{'s' if len(ratings) != 1 else ''}"
+            if ratings else "⭐ No ratings yet",
+            f"🏆 **{len(unlocked)}/{len(ACHIEVEMENT_DEFS)}** achievements unlocked",
+        ),
+        footnote(f"Host Assistant · {guild.name}"),
     )
-    embed.add_field(name="📝 Ratings Received", value=f"**{len(ratings):,}**", inline=True)
-    embed.add_field(name="🎯 Host Status", value="**Active Host**" if total_events else "**New Host**", inline=True)
-    add_footer_divider(embed)
-    embed.set_footer(text=f"Host Assistant · {guild.name}")
-    return embed
 
 @bot.tree.command(name="host", description="View a host's profile")
 @app_commands.guild_only()
 async def host_profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    await interaction.response.send_message(**v2(embed=build_host_profile_embed(interaction.guild, member)), ephemeral=True)
+    if member.bot:
+        await interaction.response.send_message(**notice("warn", "🤖 Bots don't host events."), ephemeral=True)
+        return
+    await interaction.response.send_message(**ui_msg(build_host_profile_card(interaction.guild, member)), ephemeral=True)
 
 @bot.tree.command(name="me", description="View your Host Assistant profile")
 @app_commands.guild_only()
 async def me_profile_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(**v2(embed=build_host_profile_embed(interaction.guild, interaction.user)), ephemeral=True)
+    await interaction.response.send_message(**ui_msg(build_host_profile_card(interaction.guild, interaction.user)), ephemeral=True)
 
 @bot.tree.command(name="achievements", description="View a host's achievement collection")
 @app_commands.guild_only()
